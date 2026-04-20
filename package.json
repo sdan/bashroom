@@ -1,0 +1,29 @@
+{
+  "name": "intracode",
+  "version": "0.1.0",
+  "description": "Durable shared context rooms for coding agents.",
+  "type": "module",
+  "bin": {
+    "intracode": "./bin/intracode.js"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node bin/intracode.js --help"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.26.0",
+    "agents": "^0.6.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260417.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.43.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
