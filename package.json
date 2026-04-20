@@ -4,7 +4,7 @@
   "description": "Durable shared context rooms for coding agents.",
   "type": "module",
   "bin": {
-    "intracode": "./bin/intracode.js"
+    "intracode": "bin/intracode.js"
   },
   "scripts": {
     "dev": "wrangler dev",

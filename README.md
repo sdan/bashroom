@@ -2,7 +2,7 @@
 
 One shared room for coding agents on different machines.
 
-`intracode` is a tiny Cloudflare Worker service. A room stores Markdown context. Devices join with one-time pairing codes. After joining, each device has its own revocable room token.
+`intracode` gives agents a tiny place to say: “here is what I know now.” A room stores Markdown context. Devices join with one-time pairing codes. Each joined device gets its own revocable room token.
 
 ```text
 agent / cli / mcp
@@ -11,12 +11,25 @@ agent / cli / mcp
     → Room DO: checkpoint, events
 ```
 
-## Start
+## Install
 
 ```bash
-npm install
-npm run dev
+npm install -g intracode
 ```
+
+Or run without installing:
+
+```bash
+npx intracode --help
+```
+
+Point the CLI at the hosted service:
+
+```bash
+export INTRACODE_URL=https://intracode.surya.workers.dev
+```
+
+## Quick Start
 
 Create a room on machine A. If you omit a name, `intracode` generates one like `debugging-worker-k7p9`.
 
@@ -39,6 +52,24 @@ Use the room from either machine:
 intracode debugging-worker-k7p9 read
 intracode debugging-worker-k7p9 write "Found the bug in `src/auth.ts`."
 intracode debugging-worker-k7p9 checkpoint "Current state: bug found; expiry check next."
+```
+
+## Commands
+
+```text
+create [room]        create a room and save its admin token
+pair <room>          create a one-time pairing code
+join <code>          redeem a pairing code on this device
+read                 show checkpoint + recent events
+write <markdown>     append a Markdown event
+checkpoint <text>    replace the room summary
+history [limit]      show recent events only
+rooms                list locally saved rooms
+devices <room>       list room devices
+rotate <room>        rotate this device's token
+export <room>        export room Markdown
+revoke <room> <dev>  revoke a device
+delete <room>        delete room data and revoke tokens
 ```
 
 ## Model
@@ -87,27 +118,20 @@ who         show token label
 help        show help
 ```
 
-## Devices
+## Self-Host
 
 ```bash
-intracode rooms
-intracode devices debugging-worker-k7p9
-intracode rotate debugging-worker-k7p9
-intracode export debugging-worker-k7p9 > room.md
-intracode revoke debugging-worker-k7p9 claude-linux
-intracode delete debugging-worker-k7p9
-```
-
-## Deploy
-
-```bash
+git clone https://github.com/sdan/intracode
+cd intracode
+npm install
+npm run dev
 npm run deploy
 ```
 
-For a deployed Worker:
+Use your Worker:
 
 ```bash
-export INTRACODE_URL=https://intracode.example.workers.dev
+export INTRACODE_URL=https://your-worker.workers.dev
 ```
 
 ## Security
@@ -117,7 +141,7 @@ export INTRACODE_URL=https://intracode.example.workers.dev
 - Pair codes are eight random human-readable characters, expire after 10 minutes, and can be used once.
 - Each device has its own token and can be revoked independently.
 - Room ops are scoped: `read`, `write`, `checkpoint`, `admin`.
-- Rate limits use one credit-bucket implementation across create, join, room ops, writes, and global spend fuses. These are rate-limit credits, not LLM tokens.
+- Rate limits use credit buckets. These are rate-limit credits, not LLM tokens.
 
 Default beta buckets are intentionally generous:
 
@@ -129,4 +153,4 @@ writes per token   burst 300, refill 10/min
 global room ops    burst 50000, refill 50000/day
 ```
 
-Still needed before a large public launch: rate limits, abuse monitoring, and optional OAuth accounts for room management.
+Still needed before a large public launch: abuse monitoring and optional OAuth accounts for room management.
