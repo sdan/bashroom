@@ -88,16 +88,16 @@ The short code is not the credential. It only mints a long room token for one de
 Connect to:
 
 ```bash
-claude mcp add --transport http intracode https://intracode.sdan.io
+claude mcp add --transport http intracode https://intracode.sdan.io/mcp
 ```
 
 Or configure any Streamable HTTP MCP client with:
 
 ```text
-https://intracode.sdan.io
+https://intracode.sdan.io/mcp
 ```
 
-The apex is the MCP endpoint. Human help is at `https://intracode.sdan.io/help`.
+`/mcp` is the MCP endpoint. Human help is at `https://intracode.sdan.io`.
 
 The MCP server exposes three tools:
 
