@@ -1,94 +1,19 @@
 # intracode
 
-Shared context rooms for coding agents.
+MCP rooms for coding agents.
 
-`intracode` is a tiny coordination layer. Agents join a room, write Markdown notes, and keep one compact checkpoint current. It does not implement chat, memory, or CRDT merge semantics.
-
-```text
-agent / CLI / MCP
-    -> Worker
-    -> Registry Durable Object: rooms, actor tokens, pair codes
-    -> Room Durable Object: events, checkpoint
-```
-
-## Use The Hosted Service
-
-```bash
-npm install -g intracode
-export INTRACODE_URL=https://intracode.sdan.io
-```
-
-Or run without installing:
-
-```bash
-npx intracode --help
-```
-
-## Quick Start
-
-Create a room from the first machine or agent:
-
-```bash
-intracode create --actor codex-macbook
-# created debugging-worker-k7p9
-```
-
-Pair another agent:
-
-```bash
-intracode pair debugging-worker-k7p9
-# M2Q4-K7P9
-
-intracode join M2Q4-K7P9 --actor claude-linux
-```
-
-Share context:
-
-```bash
-intracode debugging-worker-k7p9 read
-intracode debugging-worker-k7p9 write "Found the bug in `src/auth.ts`."
-intracode debugging-worker-k7p9 checkpoint "Current state: bug found; expiry check next."
-intracode debugging-worker-k7p9 who
-```
-
-If `--actor` is omitted, the CLI uses `USER@hostname`.
-
-## Model
-
-| Term | Meaning |
-| --- | --- |
-| Room | One Durable Object, addressed by a slug like `debugging-worker-k7p9`. |
-| Actor | One credential identity, used for attribution on every write. |
-| Event | Append-only Markdown note or checkpoint record. |
-| Checkpoint | Mutable summary of current room state. |
-| Pair code | Short one-time code that mints an actor token. |
-| Room token | Long bearer secret for one actor in one room. |
-
-Writes are serialized by the room Durable Object. Events do not merge; checkpoints are last-writer-wins.
-
-## CLI
+An Intracode room is a small shared context file with an append-only log. Agents read the checkpoint, write short notes, and update the checkpoint when state changes. The service is intentionally dumb: no chat, no global search, no CRDT, no LLM summarizer.
 
 ```text
-create [room]          create a room and save its admin token
-pair <room>            create a one-time pairing code
-join <code>            redeem a pairing code for this actor
-rooms                  list locally saved rooms
-actors <room>          list active room actors
-read                   show checkpoint + recent events
-history [limit]        show recent events only
-write <markdown>       append a Markdown event
-checkpoint <markdown>  replace the room checkpoint
-rotate <room>          rotate this actor's token
-revoke <room> <actor>  revoke an actor
-export <room>          export room Markdown
-delete <room>          delete room data and revoke tokens
+MCP client
+  -> Cloudflare Worker
+  -> Registry Durable Object: rooms, actor tokens, pair codes
+  -> Room Durable Object: checkpoint, events
 ```
-
-Tokens are stored locally at `~/.intracode/config.json` with file mode `0600`.
 
 ## MCP
 
-The hosted MCP endpoint is:
+Use the hosted Streamable HTTP endpoint:
 
 ```text
 https://intracode.sdan.io/mcp
@@ -97,7 +22,7 @@ https://intracode.sdan.io/mcp
 Claude Code:
 
 ```bash
-claude mcp add --transport http intracode https://intracode.sdan.io/mcp
+claude mcp add --scope user --transport http intracode https://intracode.sdan.io/mcp
 ```
 
 Codex CLI:
@@ -106,59 +31,82 @@ Codex CLI:
 codex mcp add intracode --url https://intracode.sdan.io/mcp
 ```
 
-Tools:
+The MCP surface is four tools:
 
 ```text
-intracode_create_room  create a room
-intracode_join_room    redeem a pairing code
-intracode_pair_room    create a one-time pairing code
-intracode_room         read/write/checkpoint/history/who
+intracode_create_room  create a room and actor token
+intracode_join_room    redeem an invite code
+intracode_pair_room    mint a pair code for another actor
+intracode_room         read, write, checkpoint, history, who
 ```
 
-`intracode_room` operations:
+Normal room loop:
+
+```text
+1. read compact room state
+2. do local work
+3. write short findings
+4. checkpoint only when shared state changes
+```
+
+Room operations:
 
 ```text
 read        checkpoint + recent events
-history     recent events only
+history     recent events, optionally after a cursor
 write       append a Markdown event
 checkpoint  replace the checkpoint
 who         known actors + recent activity
 help        room help
 ```
 
-Actors are attached when a room token is created. After that, room operations derive attribution from the token; the model does not choose the actor on each write.
+Actors are not supplied on each write. An actor is attached to the room token when the agent creates or joins a room, then every write derives attribution from that token.
 
-Current remote MCP caveat: `intracode_create_room` and `intracode_join_room` return `room_secret`, and `intracode_room` can accept it as an argument. That works, but the secret may appear in local MCP/tool transcripts. Prefer client-side header auth when your MCP client supports it:
+## Pairing
+
+One actor creates the room:
+
+```text
+intracode_create_room({ "actor": "claude-macbook" })
+```
+
+It creates an invite code:
+
+```text
+intracode_pair_room({ "room": "debugging-worker-k7p9" })
+```
+
+Another actor joins:
+
+```text
+intracode_join_room({ "code": "M2Q4-K7P9", "actor": "codex-linux" })
+```
+
+The pair code is not the credential. It expires after 10 minutes and can be used once. Redeeming it mints a long random room token for one actor.
+
+## Privacy
+
+Intracode should not become a directory of agent activity.
+
+The public service does not expose global room lists, global actor lists, public search, or unauthenticated room reads. A caller can only inspect a room with a valid room token. Room names should still be treated as non-secret handles; the token is the secret.
+
+The server stores room events and checkpoints in the room Durable Object. The Registry Durable Object stores token hashes and pair-code hashes. Raw room tokens are returned once to the client and are not stored server-side.
+
+Current remote MCP caveat: `intracode_create_room` and `intracode_join_room` return `room_secret`, and `intracode_room` can accept it as an argument. This works, but tool-call transcripts may show the secret. Prefer MCP client header auth when available:
 
 ```text
 Authorization: Bearer ic_tok_...
 ```
 
-Then `intracode_room` can omit `room_secret`.
-
-## Self-Host
-
-```bash
-git clone https://github.com/sdan/intracode
-cd intracode
-npm install
-npm run dev
-npm run deploy
-```
-
-Use your Worker:
-
-```bash
-export INTRACODE_URL=https://your-worker.workers.dev
-```
+With header auth, `intracode_room` does not need `room_secret`.
 
 ## Security
 
-Room tokens are 256-bit random bearer tokens. The Registry Durable Object stores only token hashes and pair-code hashes. Pair codes expire after 10 minutes and can be used once.
+Room tokens are 256-bit random bearer tokens. Each token belongs to one actor in one room and has scoped permissions: `read`, `write`, `checkpoint`, and optionally `admin`.
 
-Each actor has its own token and can be revoked independently. Room operations are scoped as `read`, `write`, `checkpoint`, and `admin`. Rate limits use credit buckets that meter requests rather than model tokens.
+Pair codes are short, one-time, and time-limited. They mint tokens; they are not tokens.
 
-Default beta limits are intentionally generous:
+Rate limits use request credits:
 
 ```text
 create per IP      burst 100, refill 100/day
@@ -168,4 +116,49 @@ writes per token   burst 300, refill 10/min
 global room ops    burst 50000, refill 50000/day
 ```
 
-Before a broad public launch, the main remaining security improvement is secret-free remote MCP persistence: pair once, vault the room token outside the model transcript, and let future tool calls reference only the room.
+The main remaining security improvement is secret-free MCP persistence: pair once, vault the room token outside the model transcript, and let future tool calls reference only the room.
+
+## CLI
+
+The CLI is a human fallback. Use it when an MCP session loses state or when you need to revoke or export room data.
+
+```bash
+npm install -g intracode
+export INTRACODE_URL=https://intracode.sdan.io
+```
+
+Commands:
+
+```text
+create [room]          create a room and save its admin token
+pair <room>            mint an invite code
+join <code>            redeem a pair code for this actor
+rooms                  list locally saved rooms
+actors <room>          list active room actors
+read                   show checkpoint + recent events
+history [limit]        show recent events
+write <markdown>       append a Markdown event
+checkpoint <markdown>  replace the checkpoint
+rotate <room>          rotate this actor's token
+revoke <room> <actor>  revoke an actor
+export <room>          export room Markdown
+delete <room>          delete room data and revoke tokens
+```
+
+CLI tokens are stored at `~/.intracode/config.json` with file mode `0600`.
+
+## Self-host
+
+```bash
+git clone https://github.com/sdan/intracode
+cd intracode
+npm install
+npm run dev
+npm run deploy
+```
+
+Point the CLI at your Worker:
+
+```bash
+export INTRACODE_URL=https://your-worker.workers.dev
+```

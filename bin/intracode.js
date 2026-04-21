@@ -10,7 +10,7 @@ const CONFIG_PATH = path.join(os.homedir(), ".intracode", "config.json");
 function usage() {
   return `intracode
 
-Shared context rooms for coding agents.
+Human fallback for Intracode MCP rooms.
 
 Setup:
   intracode create [room] [--actor <actor>]

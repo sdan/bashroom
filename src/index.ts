@@ -15,7 +15,7 @@ type RoomRequest = {
   op?: RoomOp;
   body?: string;
   actor?: string;
-  actors?: string[];
+  knownActors?: string[];
   after?: number;
   limit?: number;
   format?: "compact" | "markdown";
@@ -154,11 +154,11 @@ export class Room extends DurableObject<Env> {
         const body = cleanBody(input.body);
         if (!body) return err("checkpoint requires body");
         const event = this.setCheckpoint(input.actor, body);
-        return ok("Updated checkpoint\n", event.id);
+        return ok(`Updated checkpoint #${event.id}\n`, event.id);
       }
 
       case "who":
-        return this.renderWho(input.actor, input.actors || []);
+        return this.renderWho(input.actor, input.knownActors || []);
 
       case "help":
         return ok(helpText());
@@ -330,17 +330,6 @@ export class Registry extends DurableObject<Env> {
         updated_at INTEGER NOT NULL
       );
     `);
-    this.migrateTokenOwnerColumn();
-  }
-
-  private migrateTokenOwnerColumn(): void {
-    const columns = this.ctx.storage.sql
-      .exec<{ name: string }>("PRAGMA table_info(tokens)")
-      .toArray()
-      .map((column) => column.name);
-    if (columns.includes("label") && !columns.includes("actor")) {
-      this.ctx.storage.sql.exec("ALTER TABLE tokens RENAME COLUMN label TO actor");
-    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -630,7 +619,7 @@ function createServer(env: Env, headerToken: string, ip: string): McpServer {
 
   server.tool(
     "intracode_create_room",
-    "Create a shared context room. Returns a room and room_secret. Keep room_secret private; pass it to intracode_room for future room operations.",
+    "Create a shared context room and actor token. Keep room_secret private; prefer Authorization header auth when your MCP client supports it.",
     {
       name: z.string().optional().describe("Optional room slug. Omit to generate a friendly slug like debugging-worker-k7p9."),
       actor: z.string().optional().describe("Actor name for attribution, for example claude-code. Omit to auto-generate one."),
@@ -643,16 +632,16 @@ function createServer(env: Env, headerToken: string, ip: string): McpServer {
         room_secret: result.token,
         actor: result.actor,
         scopes: result.scopes,
-        next: "Use intracode_room with this room and room_secret. Do not write room_secret into the room.",
+        next: "Use intracode_room with this room. Pass room_secret only if your MCP client cannot send Authorization headers.",
       });
     },
   );
 
   server.tool(
     "intracode_join_room",
-    "Redeem a one-time pairing code. Returns a room and room_secret. Keep room_secret private; pass it to intracode_room for future room operations.",
+    "Redeem a one-time pair code and mint an actor token. Keep room_secret private; prefer Authorization header auth when your MCP client supports it.",
     {
-      code: z.string().min(1).describe("One-time pairing code, for example M2Q4-K7P9."),
+      code: z.string().min(1).describe("One-time pair code, for example M2Q4-K7P9."),
       actor: z.string().optional().describe("Actor name for attribution, for example claude-code. Omit to auto-generate one."),
     },
     async ({ code, actor }) => {
@@ -663,14 +652,14 @@ function createServer(env: Env, headerToken: string, ip: string): McpServer {
         room_secret: result.token,
         actor: result.actor,
         scopes: result.scopes,
-        next: "Use intracode_room with this room and room_secret. Do not write room_secret into the room.",
+        next: "Use intracode_room with this room. Pass room_secret only if your MCP client cannot send Authorization headers.",
       });
     },
   );
 
   server.tool(
     "intracode_pair_room",
-    "Create a one-time pairing code for another actor to join a room. Requires an admin room_secret or Authorization bearer header. Prefer this over sharing room_secret.",
+    "Create a one-time pair code for another actor. Requires an admin room_secret or Authorization bearer header. Prefer pair codes over sharing room_secret.",
     {
       room: z.string().min(1).describe("Room name, for example debugging-worker-k7p9."),
       room_secret: z.string().optional().describe("Admin room secret returned by intracode_create_room. Not needed if the MCP connection has an Authorization bearer header with admin scope."),
@@ -685,18 +674,18 @@ function createServer(env: Env, headerToken: string, ip: string): McpServer {
         code: result.code,
         expires_at: result.expires_at,
         scopes: result.scopes,
-        next: "Share only this code with the other agent. Do not share room_secret.",
+        next: "Share only this one-time code with the other agent. Do not share room_secret.",
       });
     },
   );
 
   server.tool(
     "intracode_room",
-    "Read and write a durable Markdown context room shared by coding agents. Requires either a room_secret argument or an Authorization bearer header. Use op=read before work, op=write for discoveries, and op=checkpoint for compact summaries.",
+    "Read and write a durable Markdown context room. Requires room_secret or Authorization bearer header. Use compact reads, cursors, short writes, and checkpoints for shared state.",
     {
       room: z.string().min(1).describe("Room name, for example 'sdan/intracode/auth'."),
       room_secret: z.string().optional().describe("Room secret returned by intracode_create_room or intracode_join_room. Not needed if the MCP connection has an Authorization bearer header."),
-      op: z.enum(["read", "write", "checkpoint", "history", "who", "help"]).default("read").describe("Operation to run."),
+      op: z.enum(["read", "write", "checkpoint", "history", "who", "help"]).default("read").describe("Room operation."),
       body: z.string().optional().describe("Markdown body for write/checkpoint."),
       after: z.number().int().nonnegative().optional().describe("Only return events after this event id."),
       limit: z.number().int().positive().max(MAX_LIMIT).optional().describe("Maximum events to return. Defaults to 10."),
@@ -820,7 +809,7 @@ async function authedRoomOp(env: Env, token: string, room: string, input: RoomRe
   const auth = await verify(env, room, token, scopeForOp(op), ip);
   if (!auth.ok || !auth.actor) return err(auth.error || "unauthorized");
   const actors = op === "who" ? await roomActors(env, room, token, ip) : undefined;
-  return runRoomOp(env, room, { ...input, actor: auth.actor, actors });
+  return runRoomOp(env, room, { ...input, actor: auth.actor, knownActors: actors });
 }
 
 async function runRoomOp(env: Env, room: string, input: RoomRequest & { actor: string }): Promise<CommandResult> {
@@ -1022,9 +1011,9 @@ function toolJson(value: unknown, isError = false): { content: Array<{ type: "te
 }
 
 function helpText(): string {
-  return `intracode room ops\n\nread                  Show checkpoint and recent events\nhistory               Show recent events\nwrite                 Append a Markdown note; requires body\ncheckpoint            Replace checkpoint; requires body\nwho                   Show known actors and recent activity\nhelp                  Show this help\n`;
+  return `intracode room ops\n\nread                  Show checkpoint and recent events\nhistory               Show recent events, optionally after a cursor\nwrite                 Append a short Markdown note\ncheckpoint            Replace the shared checkpoint\nwho                   Show known actors and recent activity\nhelp                  Show this help\n`;
 }
 
 function httpHelpText(): string {
-  return `# intracode\n\nShared Markdown context rooms for coding agents.\n\nCreate a room, pair another actor with a one-time code, then read/write room context by sending a bearer token.\n`;
+  return `# intracode\n\nMCP rooms for coding agents.\n\nEndpoint: https://intracode.sdan.io/mcp\n\nRooms require bearer tokens. The public service does not expose global room or actor discovery.\n`;
 }
