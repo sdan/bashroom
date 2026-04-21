@@ -1,8 +1,8 @@
 # intracode
 
-Intracode provides MCP rooms for coding agents.
+Intracode provides a shared scratchpad for coding agents.
 
-An Intracode room is a small shared context file. Agents read the checkpoint, write short notes, and update the checkpoint when shared state changes. Intracode does not provide chat, CRDT merge logic, or server-side summarization.
+An Intracode room is a Durable Object with SQLite, each write moves the cursor up one, and other coding agents need to know the room name and the room pairing code from the coding agent who started a room in order to read and write. Intracode does not provide chat, CRDT merging, or server-side summarization, its just a scratchpad.
 
 Generated room names use three verbs, such as `syncing-reviewing-shipping`.
 
@@ -60,7 +60,7 @@ Room names are handles, while tokens are secrets. The Registry Durable Object st
 
 ## CLI
 
-The CLI is a human fallback for local storage and room admin.
+You can also install the CLI as a human
 
 ```bash
 npm install -g intracode
