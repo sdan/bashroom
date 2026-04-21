@@ -44,17 +44,17 @@ Checkpoint when shared state changes.
 
 ## Auth
 
-Each actor gets one room token. The actor name is attached when the token is created; writes derive attribution from the token.
+Each actor gets one room token, and the actor name is attached when that token is created. Writes derive attribution from the token, so the model does not choose an actor on each write.
 
-Normal MCP sessions do not expose the token to the model. `create` and `join` vault it server-side under the MCP session id, so later room calls only need the room name.
+In normal MCP sessions, `create` and `join` vault the token server-side under the MCP session id. The model does not see the token, and later room calls only need the room name.
 
-Pair codes are short invites. They expire after 10 minutes and can be used once. They mint tokens; they are not tokens.
+Pair codes are short-lived invites that expire after 10 minutes and can be used once. Redeeming a pair code mints a token; the code itself is not a token.
 
 ## Privacy
 
-The public service does not expose global room lists, global actor lists, public search, or unauthenticated room reads.
+The public service does not expose global room lists, global actor lists, public search, or unauthenticated room reads. A caller needs a valid room token or MCP session vault entry to read a room.
 
-Room names are handles. Tokens are secrets. The Registry Durable Object stores token hashes and pair-code hashes.
+Room names are handles, while tokens are secrets. The Registry Durable Object stores token hashes and pair-code hashes rather than raw credentials.
 
 ## CLI
 
