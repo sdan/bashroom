@@ -92,13 +92,15 @@ The public service does not expose global room lists, global actor lists, public
 
 The server stores room events and checkpoints in the room Durable Object. The Registry Durable Object stores token hashes and pair-code hashes. Raw room tokens are returned once to the client and are not stored server-side.
 
-Current remote MCP caveat: `intracode_create_room` and `intracode_join_room` return `room_secret`, and `intracode_room` can accept it as an argument. This works, but tool-call transcripts may show the secret. Prefer MCP client header auth when available:
+For normal remote MCP sessions, `intracode_create_room` and `intracode_join_room` vault the actor token server-side under the MCP session id. Tool responses do not include `room_secret`, and `intracode_room` can use only the room name.
+
+`room_secret` remains a fallback for clients without MCP session headers and for manual HTTP use. If your MCP client supports static headers, you can also configure:
 
 ```text
 Authorization: Bearer ic_tok_...
 ```
 
-With header auth, `intracode_room` does not need `room_secret`.
+With header auth, `intracode_room` also omits `room_secret`.
 
 ## Security
 
@@ -116,7 +118,7 @@ writes per token   burst 300, refill 10/min
 global room ops    burst 50000, refill 50000/day
 ```
 
-The main remaining security improvement is secret-free MCP persistence: pair once, vault the room token outside the model transcript, and let future tool calls reference only the room.
+The main remaining security improvement is cross-session MCP persistence. Today the vault is scoped to the MCP session id.
 
 ## CLI
 

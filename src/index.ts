@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { createMcpHandler } from "agents/mcp";
+import { createMcpHandler, type TransportState } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -324,6 +324,22 @@ export class Registry extends DurableObject<Env> {
       );
     `);
     this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_tokens (
+        session_hash TEXT NOT NULL,
+        room TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (session_hash, room)
+      );
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS mcp_transport_states (
+        session_hash TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS rate_buckets (
         key TEXT PRIMARY KEY,
         credits REAL NOT NULL,
@@ -336,19 +352,28 @@ export class Registry extends DurableObject<Env> {
     const url = new URL(request.url);
     const body = request.method === "POST" ? await request.json<Record<string, unknown>>() : {};
 
+    if (request.method === "POST" && url.pathname === "/mcp-transport-get") {
+      return json({ state: await this.mcpTransportState(bearerFromUnknown(body.mcpSessionId)) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/mcp-transport-set") {
+      await this.setMcpTransportState(bearerFromUnknown(body.mcpSessionId), body.state);
+      return json({ ok: true });
+    }
+
     if (request.method === "POST" && url.pathname === "/create") {
       const ip = String(body.ip || "unknown");
       const limited = this.checkBucket(`create:ip:${ip}`, CREATE_IP_CAPACITY, CREATE_IP_REFILL) || this.checkBucket("create:global", CREATE_GLOBAL_CAPACITY, CREATE_GLOBAL_REFILL);
       if (limited) return json(limited, 429);
-      return json(await this.createRoom(String(body.room || ""), String(body.actor || defaultActor("actor"))));
+      return json(await this.createRoom(String(body.room || ""), String(body.actor || defaultActor("actor")), bearerFromUnknown(body.mcpSessionId)));
     }
 
     if (request.method === "POST" && url.pathname === "/verify") {
-      return json(await this.verify(String(body.room || ""), bearerFromUnknown(body.token), String(body.scope || "read") as Scope, String(body.ip || "unknown")));
+      return json(await this.authorize(String(body.room || ""), bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), String(body.scope || "read") as Scope, String(body.ip || "unknown")));
     }
 
     if (request.method === "POST" && url.pathname === "/pair") {
-      const auth = await this.verify(String(body.room || ""), bearerFromUnknown(body.token), "admin", String(body.ip || "unknown"));
+      const auth = await this.authorize(String(body.room || ""), bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
       return json(await this.createPairCode(String(body.room), parseScopes(body.scopes, ["read", "write", "checkpoint"])));
     }
@@ -357,17 +382,17 @@ export class Registry extends DurableObject<Env> {
       const ip = String(body.ip || "unknown");
       const limited = this.checkBucket(`join:ip:${ip}`, JOIN_IP_CAPACITY, JOIN_IP_REFILL) || this.checkBucket("join:global", JOIN_GLOBAL_CAPACITY, JOIN_GLOBAL_REFILL);
       if (limited) return json(limited, 429);
-      return json(await this.join(String(body.code || ""), String(body.actor || defaultActor("actor"))));
+      return json(await this.join(String(body.code || ""), String(body.actor || defaultActor("actor")), bearerFromUnknown(body.mcpSessionId)));
     }
 
     if (request.method === "POST" && url.pathname === "/actors") {
-      const auth = await this.verify(String(body.room || ""), bearerFromUnknown(body.token), "read", String(body.ip || "unknown"));
+      const auth = await this.authorize(String(body.room || ""), bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "read", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
       return json({ ok: true, actors: this.actors(String(body.room)) });
     }
 
     if (request.method === "POST" && url.pathname === "/revoke") {
-      const auth = await this.verify(String(body.room || ""), bearerFromUnknown(body.token), "admin", String(body.ip || "unknown"));
+      const auth = await this.authorize(String(body.room || ""), bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
       return json(this.revoke(String(body.room), String(body.actor || "")));
     }
@@ -387,7 +412,7 @@ export class Registry extends DurableObject<Env> {
     return json({ error: "not_found" }, 404);
   }
 
-  private async createRoom(room: string, actor: string): Promise<Record<string, unknown>> {
+  private async createRoom(room: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
     const cleanRoom = room.trim() ? sanitizeRoom(room) : this.generateRoomSlug();
     const cleanActor = sanitizeActor(actor);
     const existing = this.ctx.storage.sql.exec("SELECT room FROM rooms WHERE room = ?", cleanRoom).toArray()[0];
@@ -410,21 +435,45 @@ export class Registry extends DurableObject<Env> {
       scopes.join(","),
       now,
     );
+    await this.rememberSessionToken(mcpSessionId, cleanRoom, tokenHash, now);
 
     return { ok: true, room: cleanRoom, token, actor: cleanActor, scopes };
+  }
+
+  private async authorize(room: string, token: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
+    if (token) return this.verify(room, token, scope, ip);
+    if (mcpSessionId) return this.verifySession(room, mcpSessionId, scope, ip);
+    return { ok: false, error: "missing_token" };
   }
 
   private async verify(room: string, token: string, scope: Scope, ip: string): Promise<AuthResult> {
     const cleanRoom = sanitizeRoom(room);
     if (!token) return { ok: false, error: "missing_token" };
+    return this.verifyTokenHash(cleanRoom, await sha256(token), scope, ip);
+  }
 
+  private async verifySession(room: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
+    const cleanRoom = sanitizeRoom(room);
+    const row = this.ctx.storage.sql
+      .exec<{ token_hash: string }>(
+        `SELECT token_hash
+         FROM session_tokens
+         WHERE session_hash = ? AND room = ?`,
+        await sha256(mcpSessionId),
+        cleanRoom,
+      )
+      .toArray()[0];
+    if (!row) return { ok: false, error: "missing_session_token" };
+    return this.verifyTokenHash(cleanRoom, row.token_hash, scope, ip);
+  }
+
+  private verifyTokenHash(cleanRoom: string, tokenHash: string, scope: Scope, ip: string): AuthResult {
     const ipLimited = this.checkBucket(`verify:ip:${ip}`, VERIFY_IP_CAPACITY, VERIFY_IP_REFILL);
     if (ipLimited) return ipLimited;
 
     const globalLimited = this.checkBucket("ops:global", GLOBAL_OPS_CAPACITY, GLOBAL_OPS_REFILL);
     if (globalLimited) return globalLimited;
 
-    const tokenHash = await sha256(token);
     const tokenLimited = this.checkBucket(`ops:token:${tokenHash}`, ROOM_OPS_TOKEN_CAPACITY, ROOM_OPS_TOKEN_REFILL);
     if (tokenLimited) return tokenLimited;
 
@@ -454,6 +503,46 @@ export class Registry extends DurableObject<Env> {
     }
 
     return { ok: true, room: row.room, actor: row.actor, scopes, tokenId: row.token_id };
+  }
+
+  private async rememberSessionToken(mcpSessionId: string, room: string, tokenHash: string, createdAt: string): Promise<void> {
+    if (!mcpSessionId) return;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO session_tokens (session_hash, room, token_hash, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(session_hash, room) DO UPDATE SET
+         token_hash = excluded.token_hash,
+         created_at = excluded.created_at`,
+      await sha256(mcpSessionId),
+      room,
+      tokenHash,
+      createdAt,
+    );
+  }
+
+  private async mcpTransportState(mcpSessionId: string): Promise<unknown | undefined> {
+    if (!mcpSessionId) return undefined;
+    const row = this.ctx.storage.sql
+      .exec<{ state_json: string }>(
+        "SELECT state_json FROM mcp_transport_states WHERE session_hash = ?",
+        await sha256(mcpSessionId),
+      )
+      .toArray()[0];
+    return row ? JSON.parse(row.state_json) : undefined;
+  }
+
+  private async setMcpTransportState(mcpSessionId: string, state: unknown): Promise<void> {
+    if (!mcpSessionId) return;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO mcp_transport_states (session_hash, state_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_hash) DO UPDATE SET
+         state_json = excluded.state_json,
+         updated_at = excluded.updated_at`,
+      await sha256(mcpSessionId),
+      JSON.stringify(state),
+      new Date().toISOString(),
+    );
   }
 
   private checkBucket(key: string, maxCredits: number, creditsPerMs: number, cost = 1): AuthResult | null {
@@ -506,7 +595,7 @@ export class Registry extends DurableObject<Env> {
     return { ok: true, room: cleanRoom, code, expires_at: expiresAt, scopes };
   }
 
-  private async join(code: string, actor: string): Promise<Record<string, unknown>> {
+  private async join(code: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
     const cleanCode = code.trim();
     const cleanActor = sanitizeActor(actor);
     const codeHash = await sha256(cleanCode);
@@ -536,6 +625,7 @@ export class Registry extends DurableObject<Env> {
       row.scopes,
       now,
     );
+    await this.rememberSessionToken(mcpSessionId, row.room, tokenHash, now);
 
     return { ok: true, room: row.room, token, actor: cleanActor, scopes: row.scopes.split(",") };
   }
@@ -601,6 +691,7 @@ export class Registry extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM rooms WHERE room = ?", cleanRoom);
     this.ctx.storage.sql.exec("UPDATE tokens SET revoked_at = ? WHERE room = ? AND revoked_at IS NULL", now, cleanRoom);
     this.ctx.storage.sql.exec("UPDATE pair_codes SET used_at = ? WHERE room = ? AND used_at IS NULL", now, cleanRoom);
+    this.ctx.storage.sql.exec("DELETE FROM session_tokens WHERE room = ?", cleanRoom);
     return { ok: true, room: cleanRoom };
   }
 
@@ -614,46 +705,42 @@ export class Registry extends DurableObject<Env> {
   }
 }
 
-function createServer(env: Env, headerToken: string, ip: string): McpServer {
+function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: string): McpServer {
   const server = new McpServer({ name: "intracode", version: "0.1.0" });
 
   server.tool(
     "intracode_create_room",
-    "Create a shared context room and actor token. Keep room_secret private; prefer Authorization header auth when your MCP client supports it.",
+    "Create a shared context room and actor token. In normal MCP sessions, the token is vaulted server-side and not returned.",
     {
       name: z.string().optional().describe("Optional room slug. Omit to generate a friendly slug like debugging-worker-k7p9."),
       actor: z.string().optional().describe("Actor name for attribution, for example claude-code. Omit to auto-generate one."),
     },
     async ({ name, actor }) => {
-      const result = await registry(env, "/create", { room: name || "", actor: actor || defaultActor("mcp"), ip });
+      const result = await registry(env, "/create", { room: name || "", actor: actor || defaultActor("mcp"), mcpSessionId, ip });
       if (result.ok === false) return toolJson(result, true);
-      return toolJson({
+      return toolJson(mcpCredentialResponse({
         room: result.room,
-        room_secret: result.token,
         actor: result.actor,
         scopes: result.scopes,
-        next: "Use intracode_room with this room. Pass room_secret only if your MCP client cannot send Authorization headers.",
-      });
+      }, result.token, mcpSessionId));
     },
   );
 
   server.tool(
     "intracode_join_room",
-    "Redeem a one-time pair code and mint an actor token. Keep room_secret private; prefer Authorization header auth when your MCP client supports it.",
+    "Redeem a one-time pair code and mint an actor token. In normal MCP sessions, the token is vaulted server-side and not returned.",
     {
       code: z.string().min(1).describe("One-time pair code, for example M2Q4-K7P9."),
       actor: z.string().optional().describe("Actor name for attribution, for example claude-code. Omit to auto-generate one."),
     },
     async ({ code, actor }) => {
-      const result = await registry(env, "/join", { code, actor: actor || defaultActor("mcp"), ip });
+      const result = await registry(env, "/join", { code, actor: actor || defaultActor("mcp"), mcpSessionId, ip });
       if (result.ok === false) return toolJson(result, true);
-      return toolJson({
+      return toolJson(mcpCredentialResponse({
         room: result.room,
-        room_secret: result.token,
         actor: result.actor,
         scopes: result.scopes,
-        next: "Use intracode_room with this room. Pass room_secret only if your MCP client cannot send Authorization headers.",
-      });
+      }, result.token, mcpSessionId));
     },
   );
 
@@ -666,8 +753,8 @@ function createServer(env: Env, headerToken: string, ip: string): McpServer {
     },
     async ({ room, room_secret }) => {
       const token = room_secret || headerToken;
-      if (!token) return toolJson({ error: "missing_room_secret" }, true);
-      const result = await registry(env, "/pair", { room, token, ip });
+      if (!token && !mcpSessionId) return toolJson({ error: "missing_room_auth" }, true);
+      const result = await registry(env, "/pair", { room, token, mcpSessionId, ip });
       if (result.ok === false) return toolJson(result, true);
       return toolJson({
         room: result.room,
@@ -681,10 +768,10 @@ function createServer(env: Env, headerToken: string, ip: string): McpServer {
 
   server.tool(
     "intracode_room",
-    "Read and write a durable Markdown context room. Requires room_secret or Authorization bearer header. Use compact reads, cursors, short writes, and checkpoints for shared state.",
+    "Read and write a durable Markdown context room. Uses the MCP session vault, Authorization header, or room_secret fallback.",
     {
       room: z.string().min(1).describe("Room name, for example 'sdan/intracode/auth'."),
-      room_secret: z.string().optional().describe("Room secret returned by intracode_create_room or intracode_join_room. Not needed if the MCP connection has an Authorization bearer header."),
+      room_secret: z.string().optional().describe("Fallback room secret. Usually not needed because create/join vault the token in this MCP session."),
       op: z.enum(["read", "write", "checkpoint", "history", "who", "help"]).default("read").describe("Room operation."),
       body: z.string().optional().describe("Markdown body for write/checkpoint."),
       after: z.number().int().nonnegative().optional().describe("Only return events after this event id."),
@@ -693,8 +780,8 @@ function createServer(env: Env, headerToken: string, ip: string): McpServer {
     },
     async ({ room, room_secret, op, body, after, limit, format }) => {
       const token = room_secret || headerToken;
-      if (!token) return toolJson({ error: "missing_room_secret" }, true);
-      const result = await authedRoomOp(env, token, room, { op, body, after, limit, format }, ip);
+      if (!token && !mcpSessionId) return toolJson({ error: "missing_room_auth" }, true);
+      const result = await authedRoomOp(env, token, mcpSessionId, room, { op, body, after, limit, format }, ip);
       return {
         content: [{ type: "text", text: result.exitCode === 0 ? result.stdout : result.stderr }],
         isError: result.exitCode !== 0,
@@ -711,7 +798,10 @@ export default {
 
     if (url.pathname === "/mcp") {
       const token = bearerToken(request);
-      return createMcpHandler(createServer(env, token, clientIp(request)))(request, env, ctx);
+      return createMcpHandler(createServer(env, token, mcpSessionId(request), clientIp(request)), {
+        sessionIdGenerator: () => crypto.randomUUID(),
+        storage: mcpTransportStorage(env, request),
+      })(request, env, ctx);
     }
 
     if (url.pathname === "/api/rooms" && request.method === "POST") {
@@ -774,7 +864,7 @@ async function handleRoomAdmin(request: Request, env: Env, url: URL, ip: string)
   }
 
   if (request.method === "GET" && action === "export") {
-    const auth = await verify(env, room, token, "read", ip);
+    const auth = await verify(env, room, token, "", "read", ip);
     if (!auth.ok) return json(auth, 401);
     return text(await roomControlText(env, room, "/export"));
   }
@@ -791,24 +881,24 @@ async function handleRoomHttp(request: Request, env: Env, url: URL, ip: string):
     const op = (url.searchParams.get("op") || "read") as RoomOp;
     const after = parseCursor(url.searchParams.get("after"));
     const limit = parseLimit(url.searchParams.get("limit"));
-    const result = await authedRoomOp(env, token, room, { op, after, limit }, ip);
+    const result = await authedRoomOp(env, token, "", room, { op, after, limit }, ip);
     return result.exitCode === 0 ? text(result.stdout) : json({ error: result.stderr }, 403);
   }
 
   if (request.method === "POST") {
     const input = await request.json<RoomRequest>();
-    const result = await authedRoomOp(env, token, room, input, ip);
+    const result = await authedRoomOp(env, token, "", room, input, ip);
     return json(result, result.exitCode === 0 ? 200 : 403);
   }
 
   return json({ error: "method_not_allowed" }, 405);
 }
 
-async function authedRoomOp(env: Env, token: string, room: string, input: RoomRequest, ip: string): Promise<CommandResult> {
+async function authedRoomOp(env: Env, token: string, mcpSessionId: string, room: string, input: RoomRequest, ip: string): Promise<CommandResult> {
   const op = input.op || "read";
-  const auth = await verify(env, room, token, scopeForOp(op), ip);
+  const auth = await verify(env, room, token, mcpSessionId, scopeForOp(op), ip);
   if (!auth.ok || !auth.actor) return err(auth.error || "unauthorized");
-  const actors = op === "who" ? await roomActors(env, room, token, ip) : undefined;
+  const actors = op === "who" ? await roomActors(env, room, token, mcpSessionId, ip) : undefined;
   return runRoomOp(env, room, { ...input, actor: auth.actor, knownActors: actors });
 }
 
@@ -837,8 +927,8 @@ async function roomControlText(env: Env, room: string, path: string): Promise<st
   return response.text();
 }
 
-async function verify(env: Env, room: string, token: string, scope: Scope, ip: string): Promise<AuthResult> {
-  return registry(env, "/verify", { room, token, scope, ip }) as Promise<AuthResult>;
+async function verify(env: Env, room: string, token: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
+  return registry(env, "/verify", { room, token, mcpSessionId, scope, ip }) as Promise<AuthResult>;
 }
 
 async function registry(env: Env, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -851,8 +941,25 @@ async function registry(env: Env, path: string, body: Record<string, unknown>): 
   return response.json();
 }
 
-async function roomActors(env: Env, room: string, token: string, ip: string): Promise<string[] | undefined> {
-  const result = await registry(env, "/actors", { room, token, ip });
+function mcpTransportStorage(env: Env, request: Request) {
+  const requestSessionId = mcpSessionId(request);
+  return {
+    get: async (): Promise<TransportState | undefined> => {
+      if (!requestSessionId) return undefined;
+      const result = await registry(env, "/mcp-transport-get", { mcpSessionId: requestSessionId });
+      return result.state as TransportState | undefined;
+    },
+    set: async (state: TransportState) => {
+      const stateSessionId = state.sessionId || "";
+      const sessionId = stateSessionId || requestSessionId;
+      if (!sessionId) return;
+      await registry(env, "/mcp-transport-set", { mcpSessionId: sessionId, state });
+    },
+  };
+}
+
+async function roomActors(env: Env, room: string, token: string, mcpSessionId: string, ip: string): Promise<string[] | undefined> {
+  const result = await registry(env, "/actors", { room, token, mcpSessionId, ip });
   return Array.isArray(result.actors) ? result.actors.filter((actor): actor is string => typeof actor === "string") : undefined;
 }
 
@@ -927,6 +1034,10 @@ function uniqueActors(actors: string[]): string[] {
 function bearerToken(request: Request): string {
   const header = request.headers.get("authorization") || "";
   return header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
+}
+
+function mcpSessionId(request: Request): string {
+  return request.headers.get("mcp-session-id") || "";
 }
 
 function clientIp(request: Request): string {
@@ -1007,6 +1118,23 @@ function toolJson(value: unknown, isError = false): { content: Array<{ type: "te
   return {
     content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
     isError,
+  };
+}
+
+function mcpCredentialResponse(base: Record<string, unknown>, roomSecret: unknown, mcpSessionId: string): Record<string, unknown> {
+  if (mcpSessionId) {
+    return {
+      ...base,
+      credential: "stored_in_mcp_session",
+      next: "Use intracode_room with this room. Do not pass room_secret in normal MCP session calls.",
+    };
+  }
+
+  return {
+    ...base,
+    room_secret: roomSecret,
+    credential: "returned_as_room_secret",
+    next: "Pass room_secret to intracode_room or configure it as an Authorization bearer header.",
   };
 }
 
