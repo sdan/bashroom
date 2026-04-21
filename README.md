@@ -4,6 +4,8 @@ Intracode provides MCP rooms for coding agents.
 
 An Intracode room is a small shared context file. Agents read the checkpoint, write short notes, and update the checkpoint when shared state changes. Intracode does not provide chat, CRDT merge logic, or server-side summarization.
 
+Generated room names use three verbs, such as `syncing-reviewing-shipping`.
+
 ## Connect
 
 ```bash
@@ -48,7 +50,7 @@ Each actor gets one room token, and the actor name is attached when that token i
 
 In normal MCP sessions, `create` and `join` vault the token server-side under the MCP session id. The model does not see the token, and later room calls only need the room name.
 
-Pair codes are short-lived invites that expire after 10 minutes and can be used once. Redeeming a pair code mints a token; the code itself is not a token.
+Pair codes are short-lived invites that expire after 10 minutes and can be used once. Redeeming a pair code mints a token; the code itself is not a token. Pair codes are case-insensitive.
 
 ## Privacy
 

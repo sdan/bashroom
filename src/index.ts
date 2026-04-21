@@ -101,8 +101,6 @@ const SLUG_VERBS = [
   "waddling", "wandering", "warping", "whirlpooling", "whirring", "whisking", "wibbling", "working",
   "wrangling", "zesting", "zigzagging",
 ];
-const SLUG_NOUNS = ["worker", "room", "auth", "token", "checkpoint", "event", "schema", "request", "diff", "build", "agent", "actor", "context", "router", "stack", "log"];
-
 export class Room extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -619,7 +617,7 @@ export class Registry extends DurableObject<Env> {
   }
 
   private async join(code: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
-    const cleanCode = code.trim();
+    const cleanCode = normalizePairCode(code);
     const cleanActor = sanitizeActor(actor);
     const codeHash = await sha256(cleanCode);
     const row = this.ctx.storage.sql
@@ -720,7 +718,7 @@ export class Registry extends DurableObject<Env> {
 
   private generateRoomSlug(): string {
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      const slug = `${choice(SLUG_VERBS)}-${choice(SLUG_NOUNS)}-${randomSuffix(4)}`;
+      const slug = `${choice(SLUG_VERBS)}-${choice(SLUG_VERBS)}-${choice(SLUG_VERBS)}`;
       const existing = this.ctx.storage.sql.exec("SELECT room FROM rooms WHERE room = ?", slug).toArray()[0];
       if (!existing) return slug;
     }
@@ -735,7 +733,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
     "intracode_create_room",
     "Create a shared context room and actor token. In normal MCP sessions, the token is vaulted server-side and not returned.",
     {
-      name: z.string().optional().describe("Optional room slug. Omit to generate a friendly slug like debugging-worker-k7p9."),
+      name: z.string().optional().describe("Optional room slug. Omit to generate a three-verb slug like syncing-reviewing-shipping."),
       actor: z.string().optional().describe("Actor name for attribution, for example claude-code. Omit to auto-generate one."),
     },
     async ({ name, actor }) => {
@@ -771,7 +769,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
     "intracode_pair_room",
     "Create a one-time pair code for another actor. Requires an admin room_secret or Authorization bearer header. Prefer pair codes over sharing room_secret.",
     {
-      room: z.string().min(1).describe("Room name, for example debugging-worker-k7p9."),
+      room: z.string().min(1).describe("Room name, for example syncing-reviewing-shipping."),
       room_secret: z.string().optional().describe("Admin room secret returned by intracode_create_room. Not needed if the MCP connection has an Authorization bearer header with admin scope."),
     },
     async ({ room, room_secret }) => {
@@ -1089,6 +1087,10 @@ function randomId(prefix: string): string {
 
 function randomPairCode(): string {
   return `${randomSuffix(4).toUpperCase()}-${randomSuffix(4).toUpperCase()}`;
+}
+
+function normalizePairCode(code: string): string {
+  return code.trim().toUpperCase();
 }
 
 function randomSuffix(length: number): string {
