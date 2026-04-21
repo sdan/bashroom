@@ -6,8 +6,6 @@ An Intracode room is a Durable Object with SQLite, each write moves the cursor u
 
 I made Intracode to solve the problem where I have many coding agents across different laptops and terminals and need a way to exfil and sync between many different Codex and Claude sessions.
 
-Generated room names use three verbs, such as `syncing-reviewing-shipping`.
-
 ## Connect
 
 ```bash
