@@ -77,7 +77,30 @@ const WRITE_TOKEN_REFILL = 10 / MINUTE_MS;
 const GLOBAL_OPS_CAPACITY = 50_000;
 const GLOBAL_OPS_REFILL = 50_000 / DAY_MS;
 const LAST_SEEN_WRITE_INTERVAL_MS = 5 * MINUTE_MS;
-const SLUG_VERBS = ["debugging", "tracing", "reviewing", "testing", "patching", "writing", "reading", "fixing", "pairing", "shipping", "checking", "building", "syncing", "verifying"];
+const SLUG_VERBS = [
+  "accomplishing", "actioning", "actualizing", "architecting", "baking", "beaming", "beboppin", "befuddling",
+  "billowing", "blanching", "bloviating", "boogieing", "boondoggling", "booping", "bootstrapping", "brewing",
+  "bunning", "burrowing", "calculating", "canoodling", "caramelizing", "cascading", "catapulting", "cerebrating",
+  "channeling", "choreographing", "churning", "coalescing", "cogitating", "combobulating", "composing", "computing",
+  "concocting", "considering", "contemplating", "cooking", "crafting", "creating", "crunching", "crystallizing",
+  "cultivating", "deciphering", "deliberating", "determining", "discombobulating", "doing", "doodling", "drizzling",
+  "ebbing", "effecting", "elucidating", "embellishing", "enchanting", "envisioning", "evaporating", "fermenting",
+  "finagling", "flowing", "flummoxing", "fluttering", "forging", "forming", "frolicking", "frosting",
+  "gallivanting", "galloping", "garnishing", "generating", "gesticulating", "germinating", "grooving", "gusting",
+  "harmonizing", "hashing", "hatching", "herding", "honking", "hullaballooing", "hyperspacing", "ideating",
+  "imagining", "improvising", "incubating", "inferring", "infusing", "ionizing", "jitterbugging", "julienning",
+  "kneading", "leavening", "levitating", "lollygagging", "manifesting", "marinating", "meandering", "metamorphosing",
+  "misting", "moonwalking", "moseying", "mulling", "mustering", "musing", "nebulizing", "nesting",
+  "noodling", "nucleating", "orbiting", "orchestrating", "osmosing", "perambulating", "percolating", "perusing",
+  "pollinating", "pondering", "pontificating", "pouncing", "precipitating", "prestidigitating", "processing", "proofing",
+  "propagating", "puttering", "puzzling", "quantumizing", "razzmatazzing", "recombobulating", "reticulating", "roosting",
+  "ruminating", "scampering", "schlepping", "scurrying", "seasoning", "shenaniganing", "shimmying", "simmering",
+  "skedaddling", "sketching", "slithering", "smooshing", "spelunking", "spinning", "sprouting", "stewing",
+  "sublimating", "swirling", "swooping", "symbioting", "synthesizing", "tempering", "thinking", "thundering",
+  "tinkering", "tomfoolering", "transfiguring", "transmuting", "twisting", "undulating", "unfurling", "vibing",
+  "waddling", "wandering", "warping", "whirlpooling", "whirring", "whisking", "wibbling", "working",
+  "wrangling", "zesting", "zigzagging",
+];
 const SLUG_NOUNS = ["worker", "room", "auth", "token", "checkpoint", "event", "schema", "request", "diff", "build", "agent", "actor", "context", "router", "stack", "log"];
 
 export class Room extends DurableObject<Env> {
