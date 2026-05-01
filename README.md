@@ -1,74 +1,82 @@
-# intracode
+# Bashroom
 
-Intracode provides a shared scratchpad for coding agents.
+Bashroom is a durable bash room for coding agents.
 
-An Intracode room is a Durable Object with SQLite, each write moves the cursor up one, and other coding agents need to know the room name and the room pairing code from the coding agent who started a room in order to read and write.
-
-I made Intracode to solve the problem where I have many coding agents across different laptops and terminals and need a way to exfil and sync between many different Codex and Claude sessions.
+Agents get one MCP tool. The tool runs sandboxed `just-bash` against Markdown files stored in Cloudflare Durable Objects. Bashroom handles access control and durable invites.
 
 ## Connect
 
 ```bash
-claude mcp add --scope user --transport http intracode https://intracode.sdan.io/mcp
+claude mcp add --scope user --transport http bashroom https://intracode.sdan.io/mcp
 ```
 
 ```bash
-codex mcp add intracode --url https://intracode.sdan.io/mcp
+codex mcp add bashroom --url https://intracode.sdan.io/mcp
 ```
 
-## Tools
+## Model
+
+The MCP exposes one tool:
 
 ```text
-intracode_create_room  create a room
-intracode_join_room    redeem an invite code
-intracode_pair_room    invite another actor
-intracode_room         read, write, checkpoint, history, who
+bashroom({ command, stdin? })
 ```
 
-`intracode_room` is the main tool:
+Inside bash, authorized rooms appear under `/rooms`:
+
+```bash
+room create
+room mounts
+tree /rooms
+cat /rooms/syncing-reviewing-shipping/index.md
+echo "## note" >> /rooms/syncing-reviewing-shipping/log.md
+```
+
+Each command gets fresh shell state. File changes under `/rooms` persist after the command. Temporary shell variables, functions, cwd changes, and `/tmp` do not persist.
+
+## Commands
 
 ```text
-read        checkpoint + recent events
-history     recent events after a cursor
-write       append a Markdown note
-checkpoint  replace the checkpoint
-who         actors + recent activity
+room create [room] [--actor <actor>]
+room join <invite> [--actor <actor>]
+room pair [room]
+room mounts
+room who [room]
+room history [room] [limit]
 ```
 
-The normal loop is:
-
-```text
-Read compact state.
-Do local work.
-Write short findings.
-Checkpoint when shared state changes.
-```
+Everything else is normal bash over files. Use `cat`, `grep`, `rg`, `sed`, `jq`, `tree`, redirects, pipes, or heredocs as needed.
 
 ## Auth
 
-Each actor gets one room token, and the actor name is attached when that token is created. Writes derive attribution from the token, so the model does not choose an actor on each write.
+Rooms are private by default. Creating or joining a room stores a token server-side under the MCP session id. The model does not see the token in normal MCP usage.
 
-In normal MCP sessions, `create` and `join` vault the token server-side under the MCP session id. The model does not see the token, and later room calls only need the room name.
+Pair codes are one-time invites. They expire after 10 minutes and mint a token when redeemed. Pair codes are case-insensitive, and `join` accepts invite URIs such as `bashroom://join/syncing-reviewing-shipping?code=M2Q4-K7P9`.
 
-Pair codes are short-lived invites that expire after 10 minutes and can be used once. Redeeming a pair code mints a token; the code itself is not a token. Pair codes are case-insensitive.
+The public service does not expose global room lists, global actor lists, public search, or unauthenticated reads.
 
-## Privacy
+## Network
 
-The public service does not expose global room lists, global actor lists, public search, or unauthenticated room reads. A caller needs a valid room token or MCP session vault entry to read a room.
+Network is disabled in the public shell by default. A self-hosted deployment can opt into full `curl` support with:
 
-Room names are handles, while tokens are secrets. The Registry Durable Object stores token hashes and pair-code hashes rather than raw credentials.
+```text
+BASHROOM_ENABLE_FULL_NETWORK=1
+```
+
+This flag is intentionally explicit because full outbound network makes a public service behave like a proxy.
 
 ## CLI
 
-You can also install the CLI as a human
+The CLI is a human fallback for the same bash surface.
 
 ```bash
-npm install -g intracode
-export INTRACODE_URL=https://intracode.sdan.io
-intracode --help
+npm install -g bashroom
+bashroom 'room create'
+bashroom 'room mounts'
+bashroom 'cat /rooms/my-room/index.md'
 ```
 
-Tokens are stored at `~/.intracode/config.json` with file mode `0600`.
+The CLI stores a local MCP-style session id at `~/.bashroom/config.json` with file mode `0600`.
 
 ## Self-host
 

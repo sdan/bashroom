@@ -1,45 +1,41 @@
 #!/usr/bin/env node
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const DEFAULT_URL = "http://127.0.0.1:8787";
-const CONFIG_PATH = path.join(os.homedir(), ".intracode", "config.json");
+const DEFAULT_URL = "https://intracode.sdan.io";
+const CONFIG_PATH = path.join(os.homedir(), ".bashroom", "config.json");
 
 function usage() {
-  return `intracode
+  return `bashroom
 
-Human fallback for Intracode MCP rooms.
+Human fallback for Bashroom durable bash rooms.
 
-Setup:
-  intracode create [room] [--actor <actor>]
-  intracode pair <room>
-  intracode join <code> [--actor <actor>]
+Usage:
+  bashroom [--url <url>] <bash command>
+  bashroom [--url <url>] -- <bash command>
 
-Use:
-  intracode <room> read
-  intracode <room> history [limit]
-  intracode <room> write <markdown>
-  intracode <room> checkpoint <markdown>
-
-Manage:
-  intracode rooms
-  intracode actors <room>
-  intracode revoke <room> <actor>
-  intracode rotate <room>
-  intracode export <room>
-  intracode delete <room>
+Examples:
+  bashroom 'room create'
+  bashroom 'room mounts'
+  bashroom 'tree /rooms'
+  bashroom 'cat /rooms/my-room/index.md'
+  echo '# Notes' | bashroom 'cat > /rooms/my-room/notes.md'
 
 Environment:
-  INTRACODE_URL    Worker URL. Defaults to ${DEFAULT_URL}
-  INTRACODE_TOKEN  Override saved room token.
+  BASHROOM_URL    Worker URL. Defaults to ${DEFAULT_URL}
+  BASHROOM_TOKEN  Optional bearer token mount.
+
+State:
+  The CLI stores a local MCP-style session id at ${CONFIG_PATH}.
 `;
 }
 
 function parseArgs(argv) {
   const args = [...argv];
-  let baseUrl = process.env.INTRACODE_URL || DEFAULT_URL;
+  let baseUrl = process.env.BASHROOM_URL || process.env.INTRACODE_URL || DEFAULT_URL;
 
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === "--url") {
@@ -49,6 +45,7 @@ function parseArgs(argv) {
     }
   }
 
+  if (args[0] === "--") args.shift();
   return { baseUrl: baseUrl.replace(/\/$/, ""), args };
 }
 
@@ -56,7 +53,7 @@ function readConfig() {
   try {
     return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
   } catch {
-    return { rooms: {} };
+    return { sessions: {} };
   }
 }
 
@@ -65,32 +62,12 @@ function writeConfig(config) {
   fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 }
 
-function configKey(baseUrl, room) {
-  return `${baseUrl} ${room}`;
-}
-
-function saveRoom(baseUrl, room, token, actor) {
+function sessionId(baseUrl) {
   const config = readConfig();
-  config.rooms ||= {};
-  config.rooms[configKey(baseUrl, room)] = { url: baseUrl, room, token, actor };
+  config.sessions ||= {};
+  config.sessions[baseUrl] ||= crypto.randomUUID();
   writeConfig(config);
-}
-
-function roomToken(baseUrl, room) {
-  if (process.env.INTRACODE_TOKEN) return process.env.INTRACODE_TOKEN;
-  return readConfig().rooms?.[configKey(baseUrl, room)]?.token || "";
-}
-
-function defaultActor() {
-  return `${process.env.USER || "agent"}@${os.hostname()}`;
-}
-
-function flagValue(args, flag, fallback) {
-  const index = args.indexOf(flag);
-  if (index === -1) return fallback;
-  const value = args[index + 1];
-  args.splice(index, 2);
-  return value || fallback;
+  return config.sessions[baseUrl];
 }
 
 function readStdinIfAvailable() {
@@ -98,37 +75,24 @@ function readStdinIfAvailable() {
   return fs.readFileSync(0, "utf8").trimEnd();
 }
 
-function removeRoom(baseUrl, room) {
-  const config = readConfig();
-  delete config.rooms?.[configKey(baseUrl, room)];
-  writeConfig(config);
-}
-
-async function request(baseUrl, pathname, { method = "POST", token, body } = {}) {
-  const headers = { "content-type": "application/json" };
+async function runBash(baseUrl, command, stdin) {
+  const headers = {
+    "content-type": "application/json",
+    "mcp-session-id": sessionId(baseUrl),
+  };
+  const token = process.env.BASHROOM_TOKEN || process.env.INTRACODE_TOKEN;
   if (token) headers.authorization = `Bearer ${token}`;
 
-  const response = await fetch(`${baseUrl}${pathname}`, {
-    method,
+  const response = await fetch(`${baseUrl}/bash`, {
+    method: "POST",
     headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: JSON.stringify({ command, stdin }),
   });
 
   const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!response.ok || data.ok === false) {
-    throw new Error(data.error || response.statusText || "request failed");
-  }
-  return data;
-}
-
-async function roomRead(baseUrl, room, op, body, limit) {
-  const token = roomToken(baseUrl, room);
-  if (!token) throw new Error(`No token for ${room}. Run: intracode join <code>`);
-  return request(baseUrl, `/rooms/${encodeURIComponent(room)}`, {
-    token,
-    body: { op, body, limit },
-  });
+  const result = text ? JSON.parse(text) : {};
+  if (!response.ok && !result.stderr) throw new Error(result.error || response.statusText || "request failed");
+  return result;
 }
 
 async function main() {
@@ -139,106 +103,19 @@ async function main() {
     return;
   }
 
-  if ((args[0] === "room" && args[1] === "create") || args[0] === "create") {
-    const actor = flagValue(args, "--actor", defaultActor());
-    const room = args[0] === "create" ? args[1] : args[2];
-    const result = await request(baseUrl, "/api/rooms", { body: { room, actor } });
-    saveRoom(baseUrl, result.room, result.token, result.actor);
-    console.log(`created ${result.room}`);
-    console.log(`saved token for ${result.actor}`);
-    return;
-  }
-
-  if (args[0] === "pair") {
-    const room = args[1];
-    const token = roomToken(baseUrl, room);
-    const result = await request(baseUrl, `/api/rooms/${encodeURIComponent(room)}/pair`, { token, body: {} });
-    console.log(result.code);
-    console.log(`expires ${result.expires_at}`);
-    return;
-  }
-
-  if (args[0] === "join") {
-    const code = args[1];
-    const actor = flagValue(args, "--actor", defaultActor());
-    const result = await request(baseUrl, "/api/join", { body: { code, actor } });
-    saveRoom(baseUrl, result.room, result.token, result.actor);
-    console.log(`joined ${result.room}`);
-    console.log(`saved token for ${result.actor}`);
-    return;
-  }
-
-  if (args[0] === "actors") {
-    const room = args[1];
-    const result = await request(baseUrl, `/api/rooms/${encodeURIComponent(room)}/actors`, {
-      method: "GET",
-      token: roomToken(baseUrl, room),
-    });
-    for (const actor of result.actors) console.log(actor);
-    return;
-  }
-
-  if (args[0] === "rooms") {
-    const config = readConfig();
-    for (const entry of Object.values(config.rooms || {})) {
-      console.log(`${entry.room}\t${entry.actor}\t${entry.url}`);
-    }
-    return;
-  }
-
-  if (args[0] === "revoke") {
-    const room = args[1];
-    const actor = args[2];
-    await request(baseUrl, `/api/rooms/${encodeURIComponent(room)}/revoke`, {
-      token: roomToken(baseUrl, room),
-      body: { actor },
-    });
-    console.log(`revoked ${actor}`);
-    return;
-  }
-
-  if (args[0] === "rotate") {
-    const room = args[1];
-    const result = await request(baseUrl, `/api/rooms/${encodeURIComponent(room)}/rotate`, {
-      token: roomToken(baseUrl, room),
-      body: {},
-    });
-    saveRoom(baseUrl, result.room, result.token, result.actor);
-    console.log(`rotated ${result.room}`);
-    console.log(`saved token for ${result.actor}`);
-    return;
-  }
-
-  if (args[0] === "export") {
-    const room = args[1];
-    const token = roomToken(baseUrl, room);
-    if (!token) throw new Error(`No token for ${room}.`);
-    const response = await fetch(`${baseUrl}/api/rooms/${encodeURIComponent(room)}/export`, {
-      headers: { authorization: `Bearer ${token}` },
-    });
-    if (!response.ok) throw new Error(await response.text());
-    process.stdout.write(await response.text());
-    return;
-  }
-
-  if (args[0] === "delete") {
-    const room = args[1];
-    await request(baseUrl, `/api/rooms/${encodeURIComponent(room)}/delete`, {
-      token: roomToken(baseUrl, room),
-      body: {},
-    });
-    removeRoom(baseUrl, room);
-    console.log(`deleted ${room}`);
-    return;
-  }
-
-  const [room, rawOp = "read", ...opArgs] = args;
-  const op = rawOp === "note" ? "write" : rawOp;
   const stdin = readStdinIfAvailable();
-  const body = opArgs.join(" ").trim() || stdin || undefined;
-  const limit = op === "history" && opArgs[0] && /^\d+$/.test(opArgs[0]) ? Number(opArgs[0]) : undefined;
-  const result = await roomRead(baseUrl, room, op, limit ? undefined : body, limit);
-  process.stdout.write(result.stdout);
+  const command = args.join(" ");
+  const result = await runBash(baseUrl, command, stdin);
+
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.stderr.write(`[bashroom] exit=${result.exitCode ?? 0} changed=${result.changed ?? 0}`);
+  if (Array.isArray(result.changed_paths) && result.changed_paths.length) {
+    process.stderr.write(` ${result.changed_paths.join(" ")}`);
+  }
+  process.stderr.write("\n");
+
+  process.exitCode = result.exitCode || 0;
 }
 
 main().catch((error) => {

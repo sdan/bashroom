@@ -1,50 +1,58 @@
 import { DurableObject } from "cloudflare:workers";
 import { createMcpHandler, type TransportState } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Bash, InMemoryFs, defineCommand, type ExecResult, type InitialFiles } from "just-bash/browser";
 import { z } from "zod";
 
 type Env = {
   ROOMS: DurableObjectNamespace<Room>;
   REGISTRY: DurableObjectNamespace<Registry>;
+  BASHROOM_ENABLE_FULL_NETWORK?: string;
+  INTRACODE_ENABLE_FULL_NETWORK?: string;
 };
 
 type Scope = "read" | "write" | "checkpoint" | "admin";
-type RoomOp = "read" | "write" | "checkpoint" | "history" | "who" | "help";
 
-type RoomRequest = {
-  op?: RoomOp;
-  body?: string;
-  actor?: string;
-  knownActors?: string[];
-  after?: number;
-  limit?: number;
-  format?: "compact" | "markdown";
+type WikiFile = {
+  path: string;
+  content: string;
+  updated_at: string;
+  updated_by: string;
+  version: number;
 };
 
-type CommandResult = {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  cursor?: number;
-};
-
-type RoomEvent = {
+type AuditRow = {
   id: number;
   ts: string;
   actor: string;
   kind: string;
-  body_markdown: string;
+  path: string;
+  body: string;
 };
 
-type ActorActivity = {
+type Mount = {
+  wiki: string;
   actor: string;
-  last_event_id: number;
-  last_seen_at: string;
+  scopes: Scope[];
+};
+
+type FileChange = {
+  path: string;
+  content?: string;
+  deleted?: boolean;
+};
+
+type ShellResult = {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  changed: number;
+  changed_paths: string[];
 };
 
 type AuthResult = {
   ok: boolean;
-  room?: string;
+  wiki?: string;
   actor?: string;
   scopes?: Scope[];
   tokenId?: string;
@@ -52,10 +60,10 @@ type AuthResult = {
   retry_after_seconds?: number;
 };
 
-const DEFAULT_LIMIT = 10;
+const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
-const MAX_BODY_CHARS = 16_000;
-const MAX_BODY_CHARS_IN_READ = 600;
+const MAX_FILE_CHARS = 512_000;
+const MAX_COMMAND_CHARS = 32_000;
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -70,8 +78,8 @@ const JOIN_GLOBAL_CAPACITY = 50_000;
 const JOIN_GLOBAL_REFILL = 50_000 / DAY_MS;
 const VERIFY_IP_CAPACITY = 2_400;
 const VERIFY_IP_REFILL = 40 / 1000;
-const ROOM_OPS_TOKEN_CAPACITY = 1_200;
-const ROOM_OPS_TOKEN_REFILL = 20 / 1000;
+const OPS_TOKEN_CAPACITY = 1_200;
+const OPS_TOKEN_REFILL = 20 / 1000;
 const WRITE_TOKEN_CAPACITY = 300;
 const WRITE_TOKEN_REFILL = 10 / MINUTE_MS;
 const GLOBAL_OPS_CAPACITY = 50_000;
@@ -101,215 +109,151 @@ const SLUG_VERBS = [
   "waddling", "wandering", "warping", "whirlpooling", "whirring", "whisking", "wibbling", "working",
   "wrangling", "zesting", "zigzagging",
 ];
+
 export class Room extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS events (
+      CREATE TABLE IF NOT EXISTS files (
+        path TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL,
+        version INTEGER NOT NULL
+      );
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS audit (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts TEXT NOT NULL,
         actor TEXT NOT NULL,
         kind TEXT NOT NULL,
-        body_markdown TEXT NOT NULL
-      );
-    `);
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        updated_by TEXT NOT NULL
+        path TEXT NOT NULL,
+        body TEXT NOT NULL
       );
     `);
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const body = request.method === "POST" ? await readJson(request) : {};
 
-    if (request.method === "POST" && url.pathname === "/command") {
-      const input = await request.json<RoomRequest>();
-      const actor = sanitizeActor(input.actor || request.headers.get("x-intracode-actor") || "anonymous");
-      const result = this.runOp({ ...input, actor });
-      return json(result, result.exitCode === 0 ? 200 : 400);
+    if (url.pathname === "/snapshot") return json({ ok: true, files: this.snapshot() });
+
+    if (request.method === "POST" && url.pathname === "/seed") {
+      const actor = sanitizeActor(String(body.actor || "system"));
+      const wiki = sanitizeWiki(String(body.wiki || "wiki"));
+      return json(this.seed(wiki, actor));
     }
 
-    if (request.method === "POST" && url.pathname === "/export") {
-      return text(this.exportMarkdown());
+    if (request.method === "POST" && url.pathname === "/apply") {
+      const actor = sanitizeActor(String(body.actor || "actor"));
+      const command = String(body.command || "");
+      return json(this.apply(actor, parseChanges(body.changes), command));
+    }
+
+    if (request.method === "POST" && url.pathname === "/audit") {
+      return json({ ok: true, events: this.audit(parseLimit(body.limit)) });
     }
 
     if (request.method === "POST" && url.pathname === "/delete") {
-      this.ctx.storage.sql.exec("DELETE FROM events");
-      this.ctx.storage.sql.exec("DELETE FROM meta");
+      this.ctx.storage.sql.exec("DELETE FROM files");
+      this.ctx.storage.sql.exec("DELETE FROM audit");
       return json({ ok: true });
     }
 
-    return json({ error: "not_found" }, 404);
+    return json({ ok: false, error: "not_found" }, 404);
   }
 
-  private runOp(input: RoomRequest & { actor: string }): CommandResult {
-    const op = input.op || "read";
-
-    switch (op) {
-      case "read":
-        return this.renderRoom({
-          limit: parseLimit(input.limit),
-          after: input.after,
-          format: input.format || "compact",
-        });
-
-      case "history":
-        return this.renderHistory({
-          limit: parseLimit(input.limit),
-          after: input.after,
-          format: input.format || "compact",
-        });
-
-      case "write": {
-        const body = cleanBody(input.body);
-        if (!body) return err("write requires body");
-        const event = this.appendEvent(input.actor, "note", body);
-        return ok(`Wrote event #${event.id}\n`, event.id);
-      }
-
-      case "checkpoint": {
-        const body = cleanBody(input.body);
-        if (!body) return err("checkpoint requires body");
-        const event = this.setCheckpoint(input.actor, body);
-        return ok(`Updated checkpoint #${event.id}\n`, event.id);
-      }
-
-      case "who":
-        return this.renderWho(input.actor, input.knownActors || []);
-
-      case "help":
-        return ok(helpText());
-
-      default:
-        return err(`Unknown op: ${op}\n\n${helpText()}`);
-    }
-  }
-
-  private appendEvent(actor: string, kind: string, bodyMarkdown: string): RoomEvent {
-    const ts = new Date().toISOString();
-    this.ctx.storage.sql.exec(
-      "INSERT INTO events (ts, actor, kind, body_markdown) VALUES (?, ?, ?, ?)",
-      ts,
-      actor,
-      kind,
-      bodyMarkdown,
-    );
+  private snapshot(): WikiFile[] {
     return this.ctx.storage.sql
-      .exec<RoomEvent>("SELECT id, ts, actor, kind, body_markdown FROM events WHERE rowid = last_insert_rowid()")
-      .one();
-  }
-
-  private setCheckpoint(actor: string, bodyMarkdown: string): RoomEvent {
-    const ts = new Date().toISOString();
-    this.ctx.storage.sql.exec(
-      `INSERT INTO meta (key, value, updated_at, updated_by)
-       VALUES ('checkpoint', ?, ?, ?)
-       ON CONFLICT(key) DO UPDATE SET
-         value = excluded.value,
-         updated_at = excluded.updated_at,
-         updated_by = excluded.updated_by`,
-      bodyMarkdown,
-      ts,
-      actor,
-    );
-    return this.appendEvent(actor, "checkpoint", bodyMarkdown);
-  }
-
-  private getCheckpoint(): { value: string; updated_at: string; updated_by: string } | null {
-    return this.ctx.storage.sql
-      .exec<{ value: string; updated_at: string; updated_by: string }>(
-        "SELECT value, updated_at, updated_by FROM meta WHERE key = 'checkpoint'",
+      .exec<WikiFile>(
+        `SELECT path, content, updated_at, updated_by, version
+         FROM files
+         ORDER BY path ASC`,
       )
-      .toArray()[0] ?? null;
+      .toArray();
   }
 
-  private getEvents(input: { limit: number; after?: number }): RoomEvent[] {
-    if (input.after !== undefined) {
-      return this.ctx.storage.sql
-        .exec<RoomEvent>(
-          `SELECT id, ts, actor, kind, body_markdown
-           FROM events
-           WHERE id > ?
-           ORDER BY id ASC
-           LIMIT ?`,
-          input.after,
-          input.limit,
-        )
-        .toArray();
+  private seed(wiki: string, actor: string): Record<string, unknown> {
+    const now = new Date().toISOString();
+    const files: Record<string, string> = {
+      "README.md": `# ${wiki}\n\nThis is a Bashroom room. Agents maintain these files through durable bash.\n`,
+      "AGENTS.md": `# Bashroom Room\n\nUse Markdown files as shared state. Keep index.md current. Append important chronological updates to log.md.\n`,
+      "index.md": `# Index\n\n- README.md — room overview\n- log.md — chronological updates\n`,
+      "log.md": `# Log\n\n## [${now.slice(0, 10)}] create | ${wiki}\n\nCreated by ${actor}.\n`,
+    };
+
+    for (const [path, content] of Object.entries(files)) {
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO files (path, content, updated_at, updated_by, version)
+         VALUES (?, ?, ?, ?, 1)`,
+        path,
+        content,
+        now,
+        actor,
+      );
+    }
+    this.appendAudit(actor, "seed", "", `Seeded ${wiki}.`);
+    return { ok: true, wiki };
+  }
+
+  private apply(actor: string, changes: FileChange[], command: string): Record<string, unknown> {
+    const now = new Date().toISOString();
+    const applied: string[] = [];
+
+    for (const change of changes) {
+      const path = sanitizeFilePath(change.path);
+      if (change.deleted) {
+        this.ctx.storage.sql.exec("DELETE FROM files WHERE path = ?", path);
+        this.appendAudit(actor, "delete", path, compact(command || path));
+        applied.push(path);
+        continue;
+      }
+
+      const content = cleanFileContent(change.content || "");
+      this.ctx.storage.sql.exec(
+        `INSERT INTO files (path, content, updated_at, updated_by, version)
+         VALUES (?, ?, ?, ?, 1)
+         ON CONFLICT(path) DO UPDATE SET
+           content = excluded.content,
+           updated_at = excluded.updated_at,
+           updated_by = excluded.updated_by,
+           version = files.version + 1`,
+        path,
+        content,
+        now,
+        actor,
+      );
+      this.appendAudit(actor, "write", path, compact(command || content));
+      applied.push(path);
     }
 
+    return { ok: true, changed: applied.length, paths: applied };
+  }
+
+  private audit(limit: number): AuditRow[] {
     return this.ctx.storage.sql
-      .exec<RoomEvent>(
-        `SELECT id, ts, actor, kind, body_markdown
-         FROM events
+      .exec<AuditRow>(
+        `SELECT id, ts, actor, kind, path, body
+         FROM audit
          ORDER BY id DESC
          LIMIT ?`,
-        input.limit,
+        limit,
       )
       .toArray()
       .reverse();
   }
 
-  private renderRoom(input: { limit: number; after?: number; format: "compact" | "markdown" }): CommandResult {
-    const checkpoint = this.getCheckpoint();
-    const events = this.getEvents(input);
-    const checkpointText = checkpoint
-      ? `${checkpoint.value}\n\n_Updated by ${checkpoint.updated_by} at ${checkpoint.updated_at}_`
-      : "No checkpoint yet.";
-    const cursor = events.at(-1)?.id ?? input.after ?? 0;
-
-    return ok(
-      `# Intracode Room\n\n## Checkpoint\n${checkpointText}\n\n## Recent Events\n${this.renderEvents(events, input.format) || "No events yet."}\n\nnext_cursor: ${cursor}\n`,
-      cursor,
+  private appendAudit(actor: string, kind: string, path: string, body: string): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO audit (ts, actor, kind, path, body) VALUES (?, ?, ?, ?, ?)",
+      new Date().toISOString(),
+      actor,
+      kind,
+      path,
+      body,
     );
-  }
-
-  private renderHistory(input: { limit: number; after?: number; format: "compact" | "markdown" }): CommandResult {
-    const events = this.getEvents(input);
-    const cursor = events.at(-1)?.id ?? input.after ?? 0;
-    return ok(`${this.renderEvents(events, input.format) || "No events yet."}\n\nnext_cursor: ${cursor}\n`, cursor);
-  }
-
-  private renderWho(currentActor: string, actors: string[]): CommandResult {
-    const recent = this.ctx.storage.sql
-      .exec<ActorActivity>(
-        `SELECT actor, MAX(id) AS last_event_id, MAX(ts) AS last_seen_at
-         FROM events
-         GROUP BY actor
-         ORDER BY last_event_id DESC
-         LIMIT 50`,
-      )
-      .toArray();
-    const knownActors = uniqueActors([...actors, currentActor, ...recent.map((entry) => entry.actor)]);
-    const actorLines = knownActors.map((actor) => `- ${actor}${actor === currentActor ? " (current)" : ""}`).join("\n");
-    const activityLines = recent
-      .map((entry) => `- ${entry.actor} — event #${entry.last_event_id} at ${formatTimestamp(entry.last_seen_at)}`)
-      .join("\n");
-
-    return ok(`# Actors\n\n${actorLines || "No actors yet."}\n\n## Recent Activity\n${activityLines || "No events yet."}\n`);
-  }
-
-  private renderEvents(events: RoomEvent[], format: "compact" | "markdown"): string {
-    return events
-      .map((event) => {
-        const timestamp = formatTimestamp(event.ts);
-        const body = format === "compact" ? compact(event.body_markdown) : event.body_markdown;
-        return `- #${event.id} ${timestamp} **${event.actor}** _${event.kind}_: ${body}`;
-      })
-      .join("\n");
-  }
-
-  private exportMarkdown(): string {
-    const checkpoint = this.getCheckpoint();
-    const events = this.ctx.storage.sql
-      .exec<RoomEvent>("SELECT id, ts, actor, kind, body_markdown FROM events ORDER BY id ASC")
-      .toArray();
-    const checkpointText = checkpoint ? checkpoint.value : "No checkpoint.";
-    return `# Intracode Room Export\n\n## Checkpoint\n${checkpointText}\n\n## Events\n${this.renderEvents(events, "markdown") || "No events."}\n`;
   }
 }
 
@@ -317,13 +261,13 @@ export class Registry extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS rooms (
+      CREATE TABLE IF NOT EXISTS wikis (
         room TEXT PRIMARY KEY,
         created_at TEXT NOT NULL
       );
     `);
     this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS tokens (
+      CREATE TABLE IF NOT EXISTS wiki_tokens (
         token_hash TEXT PRIMARY KEY,
         token_id TEXT NOT NULL,
         room TEXT NOT NULL,
@@ -335,7 +279,7 @@ export class Registry extends DurableObject<Env> {
       );
     `);
     this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS pair_codes (
+      CREATE TABLE IF NOT EXISTS wiki_pair_codes (
         code_hash TEXT PRIMARY KEY,
         room TEXT NOT NULL,
         scopes TEXT NOT NULL,
@@ -345,7 +289,7 @@ export class Registry extends DurableObject<Env> {
       );
     `);
     this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS session_tokens (
+      CREATE TABLE IF NOT EXISTS wiki_session_tokens (
         session_hash TEXT NOT NULL,
         room TEXT NOT NULL,
         token_hash TEXT NOT NULL,
@@ -361,7 +305,7 @@ export class Registry extends DurableObject<Env> {
       );
     `);
     this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS rate_buckets (
+      CREATE TABLE IF NOT EXISTS credit_buckets (
         key TEXT PRIMARY KEY,
         credits REAL NOT NULL,
         updated_at INTEGER NOT NULL
@@ -371,7 +315,7 @@ export class Registry extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const body = request.method === "POST" ? await request.json<Record<string, unknown>>() : {};
+    const body = request.method === "POST" ? await readJson(request) : {};
 
     if (request.method === "POST" && url.pathname === "/mcp-transport-get") {
       return json({ state: await this.mcpTransportState(bearerFromUnknown(body.mcpSessionId)) });
@@ -386,57 +330,48 @@ export class Registry extends DurableObject<Env> {
       const ip = String(body.ip || "unknown");
       const limited = this.checkBucket(`create:ip:${ip}`, CREATE_IP_CAPACITY, CREATE_IP_REFILL) || this.checkBucket("create:global", CREATE_GLOBAL_CAPACITY, CREATE_GLOBAL_REFILL);
       if (limited) return json(limited, 429);
-      return json(await this.createRoom(String(body.room || ""), String(body.actor || defaultActor("actor")), bearerFromUnknown(body.mcpSessionId)));
-    }
-
-    if (request.method === "POST" && url.pathname === "/verify") {
-      return json(await this.authorize(String(body.room || ""), bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), String(body.scope || "read") as Scope, String(body.ip || "unknown")));
-    }
-
-    if (request.method === "POST" && url.pathname === "/pair") {
-      const auth = await this.authorize(String(body.room || ""), bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
-      if (!auth.ok) return json(auth, 401);
-      return json(await this.createPairCode(String(body.room), parseScopes(body.scopes, ["read", "write", "checkpoint"])));
+      return json(await this.createWiki(String(body.wiki || ""), String(body.actor || defaultActor("actor")), bearerFromUnknown(body.mcpSessionId)));
     }
 
     if (request.method === "POST" && url.pathname === "/join") {
       const ip = String(body.ip || "unknown");
       const limited = this.checkBucket(`join:ip:${ip}`, JOIN_IP_CAPACITY, JOIN_IP_REFILL) || this.checkBucket("join:global", JOIN_GLOBAL_CAPACITY, JOIN_GLOBAL_REFILL);
       if (limited) return json(limited, 429);
-      return json(await this.join(String(body.code || ""), String(body.actor || defaultActor("actor")), bearerFromUnknown(body.mcpSessionId)));
+      return json(await this.join(String(body.invite || body.code || ""), String(body.actor || defaultActor("actor")), bearerFromUnknown(body.mcpSessionId)));
+    }
+
+    if (request.method === "POST" && url.pathname === "/pair") {
+      const wiki = String(body.wiki || body.room || "");
+      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
+      if (!auth.ok) return json(auth, 401);
+      return json(await this.createPairCode(wiki, parseScopes(body.scopes, ["read", "write", "checkpoint"])));
+    }
+
+    if (request.method === "POST" && url.pathname === "/mounts") {
+      return json({ ok: true, mounts: await this.mounts(bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), String(body.ip || "unknown")) });
     }
 
     if (request.method === "POST" && url.pathname === "/actors") {
-      const auth = await this.authorize(String(body.room || ""), bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "read", String(body.ip || "unknown"));
+      const wiki = String(body.wiki || body.room || "");
+      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "read", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
-      return json({ ok: true, actors: this.actors(String(body.room)) });
-    }
-
-    if (request.method === "POST" && url.pathname === "/revoke") {
-      const auth = await this.authorize(String(body.room || ""), bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
-      if (!auth.ok) return json(auth, 401);
-      return json(this.revoke(String(body.room), String(body.actor || "")));
-    }
-
-    if (request.method === "POST" && url.pathname === "/rotate") {
-      const auth = await this.verify(String(body.room || ""), bearerFromUnknown(body.token), "read", String(body.ip || "unknown"));
-      if (!auth.ok || !auth.actor) return json(auth, 401);
-      return json(await this.rotate(String(body.room), bearerFromUnknown(body.token), auth.actor));
+      return json({ ok: true, actors: this.actors(wiki) });
     }
 
     if (request.method === "POST" && url.pathname === "/delete") {
-      const auth = await this.verify(String(body.room || ""), bearerFromUnknown(body.token), "admin", String(body.ip || "unknown"));
+      const wiki = String(body.wiki || body.room || "");
+      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
-      return json(this.deleteRoom(String(body.room)));
+      return json(this.deleteWiki(wiki));
     }
 
-    return json({ error: "not_found" }, 404);
+    return json({ ok: false, error: "not_found" }, 404);
   }
 
-  private async createRoom(room: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
-    const cleanRoom = room.trim() ? sanitizeRoom(room) : this.generateRoomSlug();
+  private async createWiki(wiki: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
+    const cleanWiki = wiki.trim() ? sanitizeWiki(wiki) : this.generateWikiSlug();
     const cleanActor = sanitizeActor(actor);
-    const existing = this.ctx.storage.sql.exec("SELECT room FROM rooms WHERE room = ?", cleanRoom).toArray()[0];
+    const existing = this.ctx.storage.sql.exec("SELECT room FROM wikis WHERE room = ?", cleanWiki).toArray()[0];
     if (existing) return { ok: false, error: "room_exists" };
 
     const now = new Date().toISOString();
@@ -445,57 +380,144 @@ export class Registry extends DurableObject<Env> {
     const tokenId = randomId("tok");
     const scopes: Scope[] = ["read", "write", "checkpoint", "admin"];
 
-    this.ctx.storage.sql.exec("INSERT INTO rooms (room, created_at) VALUES (?, ?)", cleanRoom, now);
+    this.ctx.storage.sql.exec("INSERT INTO wikis (room, created_at) VALUES (?, ?)", cleanWiki, now);
     this.ctx.storage.sql.exec(
-      `INSERT INTO tokens (token_hash, token_id, room, actor, scopes, created_at)
+      `INSERT INTO wiki_tokens (token_hash, token_id, room, actor, scopes, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
       tokenHash,
       tokenId,
-      cleanRoom,
+      cleanWiki,
       cleanActor,
       scopes.join(","),
       now,
     );
-    await this.rememberSessionToken(mcpSessionId, cleanRoom, tokenHash, now);
+    await this.rememberSessionToken(mcpSessionId, cleanWiki, tokenHash, now);
 
-    return { ok: true, room: cleanRoom, token, actor: cleanActor, scopes };
+    return { ok: true, wiki: cleanWiki, token, actor: cleanActor, scopes };
   }
 
-  private async authorize(room: string, token: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
-    if (token) return this.verify(room, token, scope, ip);
-    if (mcpSessionId) return this.verifySession(room, mcpSessionId, scope, ip);
+  private async join(invite: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
+    const cleanCode = normalizePairCode(invite);
+    const cleanActor = sanitizeActor(actor);
+    const codeHash = await sha256(cleanCode);
+    const row = this.ctx.storage.sql
+      .exec<{ room: string; scopes: string; expires_at: string; used_at: string | null }>(
+        "SELECT room, scopes, expires_at, used_at FROM wiki_pair_codes WHERE code_hash = ?",
+        codeHash,
+      )
+      .toArray()[0];
+
+    if (!row || row.used_at) return { ok: false, error: "invalid_code" };
+    if (Date.parse(row.expires_at) < Date.now()) return { ok: false, error: "expired_code" };
+
+    const now = new Date().toISOString();
+    const token = randomToken();
+    const tokenHash = await sha256(token);
+    const tokenId = randomId("tok");
+
+    this.ctx.storage.sql.exec("UPDATE wiki_pair_codes SET used_at = ? WHERE code_hash = ?", now, codeHash);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO wiki_tokens (token_hash, token_id, room, actor, scopes, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      tokenHash,
+      tokenId,
+      row.room,
+      cleanActor,
+      row.scopes,
+      now,
+    );
+    await this.rememberSessionToken(mcpSessionId, row.room, tokenHash, now);
+
+    return { ok: true, wiki: row.room, token, actor: cleanActor, scopes: row.scopes.split(",") };
+  }
+
+  private async createPairCode(wiki: string, scopes: Scope[]): Promise<Record<string, unknown>> {
+    const cleanWiki = sanitizeWiki(wiki);
+    const code = randomPairCode();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + PAIR_CODE_TTL_MS).toISOString();
+
+    this.ctx.storage.sql.exec(
+      `INSERT INTO wiki_pair_codes (code_hash, room, scopes, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      await sha256(code),
+      cleanWiki,
+      scopes.join(","),
+      now.toISOString(),
+      expiresAt,
+    );
+
+    return { ok: true, wiki: cleanWiki, code, invite: inviteUri(cleanWiki, code), expires_at: expiresAt, scopes };
+  }
+
+  private async mounts(token: string, mcpSessionId: string, ip: string): Promise<Mount[]> {
+    const byWiki = new Map<string, Mount>();
+
+    if (token) {
+      const tokenHash = await sha256(token);
+      const row = this.ctx.storage.sql
+        .exec<{ room: string }>("SELECT room FROM wiki_tokens WHERE token_hash = ? AND revoked_at IS NULL", tokenHash)
+        .toArray()[0];
+      if (row) {
+        const auth = this.verifyTokenHash(row.room, tokenHash, "read", ip);
+        if (auth.ok && auth.wiki && auth.actor && auth.scopes) byWiki.set(auth.wiki, { wiki: auth.wiki, actor: auth.actor, scopes: auth.scopes });
+      }
+    }
+
+    if (mcpSessionId) {
+      const rows = this.ctx.storage.sql
+        .exec<{ room: string; token_hash: string }>(
+          `SELECT st.room, st.token_hash
+           FROM wiki_session_tokens st
+           JOIN wiki_tokens t ON t.token_hash = st.token_hash
+           WHERE st.session_hash = ? AND t.revoked_at IS NULL
+           ORDER BY st.room ASC`,
+          await sha256(mcpSessionId),
+        )
+        .toArray();
+
+      for (const row of rows) {
+        const auth = this.verifyTokenHash(row.room, row.token_hash, "read", ip);
+        if (auth.ok && auth.wiki && auth.actor && auth.scopes) byWiki.set(auth.wiki, { wiki: auth.wiki, actor: auth.actor, scopes: auth.scopes });
+      }
+    }
+
+    return [...byWiki.values()].sort((left, right) => mountPath(left.wiki).localeCompare(mountPath(right.wiki)));
+  }
+
+  private async authorize(wiki: string, token: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
+    if (token) return this.verify(sanitizeWiki(wiki), token, scope, ip);
+    if (mcpSessionId) return this.verifySession(sanitizeWiki(wiki), mcpSessionId, scope, ip);
     return { ok: false, error: "missing_token" };
   }
 
-  private async verify(room: string, token: string, scope: Scope, ip: string): Promise<AuthResult> {
-    const cleanRoom = sanitizeRoom(room);
+  private async verify(wiki: string, token: string, scope: Scope, ip: string): Promise<AuthResult> {
     if (!token) return { ok: false, error: "missing_token" };
-    return this.verifyTokenHash(cleanRoom, await sha256(token), scope, ip);
+    return this.verifyTokenHash(wiki, await sha256(token), scope, ip);
   }
 
-  private async verifySession(room: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
-    const cleanRoom = sanitizeRoom(room);
+  private async verifySession(wiki: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
     const row = this.ctx.storage.sql
       .exec<{ token_hash: string }>(
         `SELECT token_hash
-         FROM session_tokens
+         FROM wiki_session_tokens
          WHERE session_hash = ? AND room = ?`,
         await sha256(mcpSessionId),
-        cleanRoom,
+        wiki,
       )
       .toArray()[0];
     if (!row) return { ok: false, error: "missing_session_token" };
-    return this.verifyTokenHash(cleanRoom, row.token_hash, scope, ip);
+    return this.verifyTokenHash(wiki, row.token_hash, scope, ip);
   }
 
-  private verifyTokenHash(cleanRoom: string, tokenHash: string, scope: Scope, ip: string): AuthResult {
+  private verifyTokenHash(wiki: string, tokenHash: string, scope: Scope, ip: string): AuthResult {
     const ipLimited = this.checkBucket(`verify:ip:${ip}`, VERIFY_IP_CAPACITY, VERIFY_IP_REFILL);
     if (ipLimited) return ipLimited;
 
     const globalLimited = this.checkBucket("ops:global", GLOBAL_OPS_CAPACITY, GLOBAL_OPS_REFILL);
     if (globalLimited) return globalLimited;
 
-    const tokenLimited = this.checkBucket(`ops:token:${tokenHash}`, ROOM_OPS_TOKEN_CAPACITY, ROOM_OPS_TOKEN_REFILL);
+    const tokenLimited = this.checkBucket(`ops:token:${tokenHash}`, OPS_TOKEN_CAPACITY, OPS_TOKEN_REFILL);
     if (tokenLimited) return tokenLimited;
 
     if (scope === "write" || scope === "checkpoint") {
@@ -506,48 +528,70 @@ export class Registry extends DurableObject<Env> {
     const row = this.ctx.storage.sql
       .exec<{ token_id: string; room: string; actor: string; scopes: string; last_seen_at: string | null; revoked_at: string | null }>(
         `SELECT token_id, room, actor, scopes, last_seen_at, revoked_at
-         FROM tokens
+         FROM wiki_tokens
          WHERE token_hash = ?`,
         tokenHash,
       )
       .toArray()[0];
 
     if (!row || row.revoked_at) return { ok: false, error: "invalid_token" };
-    if (row.room !== cleanRoom) return { ok: false, error: "wrong_room" };
+    if (row.room !== wiki) return { ok: false, error: "wrong_room" };
 
     const scopes = row.scopes.split(",") as Scope[];
     if (!hasScope(scopes, scope)) return { ok: false, error: "insufficient_scope" };
 
     const now = Date.now();
     if (!row.last_seen_at || now - Date.parse(row.last_seen_at) > LAST_SEEN_WRITE_INTERVAL_MS) {
-      this.ctx.storage.sql.exec("UPDATE tokens SET last_seen_at = ? WHERE token_hash = ?", new Date(now).toISOString(), tokenHash);
+      this.ctx.storage.sql.exec("UPDATE wiki_tokens SET last_seen_at = ? WHERE token_hash = ?", new Date(now).toISOString(), tokenHash);
     }
 
-    return { ok: true, room: row.room, actor: row.actor, scopes, tokenId: row.token_id };
+    return { ok: true, wiki: row.room, actor: row.actor, scopes, tokenId: row.token_id };
   }
 
-  private async rememberSessionToken(mcpSessionId: string, room: string, tokenHash: string, createdAt: string): Promise<void> {
+  private async rememberSessionToken(mcpSessionId: string, wiki: string, tokenHash: string, createdAt: string): Promise<void> {
     if (!mcpSessionId) return;
     this.ctx.storage.sql.exec(
-      `INSERT INTO session_tokens (session_hash, room, token_hash, created_at)
+      `INSERT INTO wiki_session_tokens (session_hash, room, token_hash, created_at)
        VALUES (?, ?, ?, ?)
        ON CONFLICT(session_hash, room) DO UPDATE SET
          token_hash = excluded.token_hash,
          created_at = excluded.created_at`,
       await sha256(mcpSessionId),
-      room,
+      wiki,
       tokenHash,
       createdAt,
     );
   }
 
+  private actors(wiki: string): string[] {
+    const cleanWiki = sanitizeWiki(wiki);
+    return this.ctx.storage.sql
+      .exec<{ actor: string }>(
+        `SELECT actor
+         FROM wiki_tokens
+         WHERE room = ? AND revoked_at IS NULL
+         GROUP BY actor
+         ORDER BY MIN(created_at) ASC`,
+        cleanWiki,
+      )
+      .toArray()
+      .map((row) => row.actor);
+  }
+
+  private deleteWiki(wiki: string): Record<string, unknown> {
+    const cleanWiki = sanitizeWiki(wiki);
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec("DELETE FROM wikis WHERE room = ?", cleanWiki);
+    this.ctx.storage.sql.exec("UPDATE wiki_tokens SET revoked_at = ? WHERE room = ? AND revoked_at IS NULL", now, cleanWiki);
+    this.ctx.storage.sql.exec("UPDATE wiki_pair_codes SET used_at = ? WHERE room = ? AND used_at IS NULL", now, cleanWiki);
+    this.ctx.storage.sql.exec("DELETE FROM wiki_session_tokens WHERE room = ?", cleanWiki);
+    return { ok: true, wiki: cleanWiki };
+  }
+
   private async mcpTransportState(mcpSessionId: string): Promise<unknown | undefined> {
     if (!mcpSessionId) return undefined;
     const row = this.ctx.storage.sql
-      .exec<{ state_json: string }>(
-        "SELECT state_json FROM mcp_transport_states WHERE session_hash = ?",
-        await sha256(mcpSessionId),
-      )
+      .exec<{ state_json: string }>("SELECT state_json FROM mcp_transport_states WHERE session_hash = ?", await sha256(mcpSessionId))
       .toArray()[0];
     return row ? JSON.parse(row.state_json) : undefined;
   }
@@ -569,16 +613,11 @@ export class Registry extends DurableObject<Env> {
   private checkBucket(key: string, maxCredits: number, creditsPerMs: number, cost = 1): AuthResult | null {
     const now = Date.now();
     const existing = this.ctx.storage.sql
-      .exec<{ credits: number; updated_at: number }>("SELECT credits, updated_at FROM rate_buckets WHERE key = ?", key)
+      .exec<{ credits: number; updated_at: number }>("SELECT credits, updated_at FROM credit_buckets WHERE key = ?", key)
       .toArray()[0];
 
     if (!existing) {
-      this.ctx.storage.sql.exec(
-        "INSERT INTO rate_buckets (key, credits, updated_at) VALUES (?, ?, ?)",
-        key,
-        maxCredits - cost,
-        now,
-      );
+      this.ctx.storage.sql.exec("INSERT INTO credit_buckets (key, credits, updated_at) VALUES (?, ?, ?)", key, maxCredits - cost, now);
       return null;
     }
 
@@ -593,133 +632,14 @@ export class Registry extends DurableObject<Env> {
       };
     }
 
-    this.ctx.storage.sql.exec("UPDATE rate_buckets SET credits = ?, updated_at = ? WHERE key = ?", credits - cost, now, key);
+    this.ctx.storage.sql.exec("UPDATE credit_buckets SET credits = ?, updated_at = ? WHERE key = ?", credits - cost, now, key);
     return null;
   }
 
-  private async createPairCode(room: string, scopes: Scope[]): Promise<Record<string, unknown>> {
-    const cleanRoom = sanitizeRoom(room);
-    const code = randomPairCode();
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + PAIR_CODE_TTL_MS).toISOString();
-
-    this.ctx.storage.sql.exec(
-      `INSERT INTO pair_codes (code_hash, room, scopes, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      await sha256(code),
-      cleanRoom,
-      scopes.join(","),
-      now.toISOString(),
-      expiresAt,
-    );
-
-    return { ok: true, room: cleanRoom, code, expires_at: expiresAt, scopes };
-  }
-
-  private async join(code: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
-    const cleanCode = normalizePairCode(code);
-    const cleanActor = sanitizeActor(actor);
-    const codeHash = await sha256(cleanCode);
-    const row = this.ctx.storage.sql
-      .exec<{ room: string; scopes: string; expires_at: string; used_at: string | null }>(
-        "SELECT room, scopes, expires_at, used_at FROM pair_codes WHERE code_hash = ?",
-        codeHash,
-      )
-      .toArray()[0];
-
-    if (!row || row.used_at) return { ok: false, error: "invalid_code" };
-    if (Date.parse(row.expires_at) < Date.now()) return { ok: false, error: "expired_code" };
-
-    const now = new Date().toISOString();
-    const token = randomToken();
-    const tokenHash = await sha256(token);
-    const tokenId = randomId("tok");
-
-    this.ctx.storage.sql.exec("UPDATE pair_codes SET used_at = ? WHERE code_hash = ?", now, codeHash);
-    this.ctx.storage.sql.exec(
-      `INSERT INTO tokens (token_hash, token_id, room, actor, scopes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      tokenHash,
-      tokenId,
-      row.room,
-      cleanActor,
-      row.scopes,
-      now,
-    );
-    await this.rememberSessionToken(mcpSessionId, row.room, tokenHash, now);
-
-    return { ok: true, room: row.room, token, actor: cleanActor, scopes: row.scopes.split(",") };
-  }
-
-  private actors(room: string): string[] {
-    const cleanRoom = sanitizeRoom(room);
-    return this.ctx.storage.sql
-      .exec<{ actor: string }>(
-        `SELECT actor
-         FROM tokens
-         WHERE room = ? AND revoked_at IS NULL
-         GROUP BY actor
-         ORDER BY MIN(created_at) ASC`,
-        cleanRoom,
-      )
-      .toArray()
-      .map((row) => row.actor);
-  }
-
-  private revoke(room: string, actor: string): Record<string, unknown> {
-    const cleanRoom = sanitizeRoom(room);
-    const cleanActor = sanitizeActor(actor);
-    this.ctx.storage.sql.exec(
-      "UPDATE tokens SET revoked_at = ? WHERE room = ? AND actor = ? AND revoked_at IS NULL",
-      new Date().toISOString(),
-      cleanRoom,
-      cleanActor,
-    );
-    return { ok: true, room: cleanRoom, revoked: cleanActor };
-  }
-
-  private async rotate(room: string, oldToken: string, actor: string): Promise<Record<string, unknown>> {
-    const cleanRoom = sanitizeRoom(room);
-    const oldHash = await sha256(oldToken);
-    const row = this.ctx.storage.sql
-      .exec<{ actor: string; scopes: string }>("SELECT actor, scopes FROM tokens WHERE token_hash = ? AND room = ? AND revoked_at IS NULL", oldHash, cleanRoom)
-      .toArray()[0];
-    if (!row) return { ok: false, error: "invalid_token" };
-
-    const token = randomToken();
-    const tokenHash = await sha256(token);
-    const tokenId = randomId("tok");
-    const now = new Date().toISOString();
-
-    this.ctx.storage.sql.exec("UPDATE tokens SET revoked_at = ? WHERE token_hash = ?", now, oldHash);
-    this.ctx.storage.sql.exec(
-      `INSERT INTO tokens (token_hash, token_id, room, actor, scopes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      tokenHash,
-      tokenId,
-      cleanRoom,
-      actor || row.actor,
-      row.scopes,
-      now,
-    );
-
-    return { ok: true, room: cleanRoom, token, actor: actor || row.actor, scopes: row.scopes.split(",") };
-  }
-
-  private deleteRoom(room: string): Record<string, unknown> {
-    const cleanRoom = sanitizeRoom(room);
-    const now = new Date().toISOString();
-    this.ctx.storage.sql.exec("DELETE FROM rooms WHERE room = ?", cleanRoom);
-    this.ctx.storage.sql.exec("UPDATE tokens SET revoked_at = ? WHERE room = ? AND revoked_at IS NULL", now, cleanRoom);
-    this.ctx.storage.sql.exec("UPDATE pair_codes SET used_at = ? WHERE room = ? AND used_at IS NULL", now, cleanRoom);
-    this.ctx.storage.sql.exec("DELETE FROM session_tokens WHERE room = ?", cleanRoom);
-    return { ok: true, room: cleanRoom };
-  }
-
-  private generateRoomSlug(): string {
+  private generateWikiSlug(): string {
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const slug = `${choice(SLUG_VERBS)}-${choice(SLUG_VERBS)}-${choice(SLUG_VERBS)}`;
-      const existing = this.ctx.storage.sql.exec("SELECT room FROM rooms WHERE room = ?", slug).toArray()[0];
+      const existing = this.ctx.storage.sql.exec("SELECT room FROM wikis WHERE room = ?", slug).toArray()[0];
       if (!existing) return slug;
     }
     return `room-${randomSuffix(12)}`;
@@ -727,84 +647,19 @@ export class Registry extends DurableObject<Env> {
 }
 
 function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: string): McpServer {
-  const server = new McpServer({ name: "intracode", version: "0.1.0" });
+  const server = new McpServer({ name: "bashroom", version: "0.2.0" });
 
   server.tool(
-    "intracode_create_room",
-    "Create a shared context room and actor token. In normal MCP sessions, the token is vaulted server-side and not returned.",
+    "bashroom",
+    "Run bash against durable Bashroom files. Use `room help` inside bash for create, join, pair, mounts, who, and history.",
     {
-      name: z.string().optional().describe("Optional room slug. Omit to generate a three-verb slug like syncing-reviewing-shipping."),
-      actor: z.string().optional().describe("Actor name for attribution, for example claude-code. Omit to auto-generate one."),
+      command: z.string().min(1).max(MAX_COMMAND_CHARS).describe("Bash command to run, for example: room mounts; cat /rooms/my-room/index.md"),
+      stdin: z.string().optional().describe("Optional standard input for the command."),
     },
-    async ({ name, actor }) => {
-      const result = await registry(env, "/create", { room: name || "", actor: actor || defaultActor("mcp"), mcpSessionId, ip });
-      if (result.ok === false) return toolJson(result, true);
-      return toolJson(mcpCredentialResponse({
-        room: result.room,
-        actor: result.actor,
-        scopes: result.scopes,
-      }, result.token, mcpSessionId));
-    },
-  );
-
-  server.tool(
-    "intracode_join_room",
-    "Redeem a one-time pair code and mint an actor token. In normal MCP sessions, the token is vaulted server-side and not returned.",
-    {
-      code: z.string().min(1).describe("One-time pair code, for example M2Q4-K7P9."),
-      actor: z.string().optional().describe("Actor name for attribution, for example claude-code. Omit to auto-generate one."),
-    },
-    async ({ code, actor }) => {
-      const result = await registry(env, "/join", { code, actor: actor || defaultActor("mcp"), mcpSessionId, ip });
-      if (result.ok === false) return toolJson(result, true);
-      return toolJson(mcpCredentialResponse({
-        room: result.room,
-        actor: result.actor,
-        scopes: result.scopes,
-      }, result.token, mcpSessionId));
-    },
-  );
-
-  server.tool(
-    "intracode_pair_room",
-    "Create a one-time pair code for another actor. Requires an admin room_secret or Authorization bearer header. Prefer pair codes over sharing room_secret.",
-    {
-      room: z.string().min(1).describe("Room name, for example syncing-reviewing-shipping."),
-      room_secret: z.string().optional().describe("Admin room secret returned by intracode_create_room. Not needed if the MCP connection has an Authorization bearer header with admin scope."),
-    },
-    async ({ room, room_secret }) => {
-      const token = room_secret || headerToken;
-      if (!token && !mcpSessionId) return toolJson({ error: "missing_room_auth" }, true);
-      const result = await registry(env, "/pair", { room, token, mcpSessionId, ip });
-      if (result.ok === false) return toolJson(result, true);
-      return toolJson({
-        room: result.room,
-        code: result.code,
-        expires_at: result.expires_at,
-        scopes: result.scopes,
-        next: "Share only this one-time code with the other agent. Do not share room_secret.",
-      });
-    },
-  );
-
-  server.tool(
-    "intracode_room",
-    "Read and write a durable Markdown context room. Uses the MCP session vault, Authorization header, or room_secret fallback.",
-    {
-      room: z.string().min(1).describe("Room name, for example 'sdan/intracode/auth'."),
-      room_secret: z.string().optional().describe("Fallback room secret. Usually not needed because create/join vault the token in this MCP session."),
-      op: z.enum(["read", "write", "checkpoint", "history", "who", "help"]).default("read").describe("Room operation."),
-      body: z.string().optional().describe("Markdown body for write/checkpoint."),
-      after: z.number().int().nonnegative().optional().describe("Only return events after this event id."),
-      limit: z.number().int().positive().max(MAX_LIMIT).optional().describe("Maximum events to return. Defaults to 10."),
-      format: z.enum(["compact", "markdown"]).optional().describe("compact truncates long event bodies. Defaults to compact."),
-    },
-    async ({ room, room_secret, op, body, after, limit, format }) => {
-      const token = room_secret || headerToken;
-      if (!token && !mcpSessionId) return toolJson({ error: "missing_room_auth" }, true);
-      const result = await authedRoomOp(env, token, mcpSessionId, room, { op, body, after, limit, format }, ip);
+    async ({ command, stdin }) => {
+      const result = await runShell(env, headerToken, mcpSessionId, ip, command, stdin || "");
       return {
-        content: [{ type: "text", text: result.exitCode === 0 ? result.stdout : result.stderr }],
+        content: [{ type: "text", text: formatShellResult(result) }],
         isError: result.exitCode !== 0,
       };
     },
@@ -825,131 +680,310 @@ export default {
       })(request, env, ctx);
     }
 
-    if (url.pathname === "/api/rooms" && request.method === "POST") {
-      const input = await request.json<{ room?: string; actor?: string }>();
-      return json(await registry(env, "/create", { ...input, ip: clientIp(request) }));
+    if (url.pathname === "/bash" && request.method === "POST") {
+      const input = await readJson(request);
+      const result = await runShell(env, bearerToken(request), mcpSessionId(request), clientIp(request), String(input.command || ""), String(input.stdin || ""));
+      return json(result, result.exitCode === 0 ? 200 : 400);
     }
 
-    if (url.pathname === "/api/join" && request.method === "POST") {
-      const input = await request.json<{ code?: string; actor?: string }>();
-      return json(await registry(env, "/join", { ...input, ip: clientIp(request) }));
-    }
+    if (url.pathname === "/" || url.pathname === "/help") return text(httpHelpText());
 
-    if (url.pathname.startsWith("/api/rooms/")) {
-      return handleRoomAdmin(request, env, url, clientIp(request));
-    }
-
-    if (url.pathname.startsWith("/rooms/")) {
-      return handleRoomHttp(request, env, url, clientIp(request));
-    }
-
-    if (url.pathname === "/" || url.pathname === "/help") {
-      return text(httpHelpText());
-    }
-
-    return json({ error: "not_found" }, 404);
+    return json({ ok: false, error: "not_found" }, 404);
   },
 };
 
-async function handleRoomAdmin(request: Request, env: Env, url: URL, ip: string): Promise<Response> {
-  const parts = url.pathname.slice("/api/rooms/".length).split("/");
-  const action = parts.pop();
-  const room = decodeURIComponent(parts.join("/"));
-  const token = bearerToken(request);
-  if (!token) return json({ error: "missing_token" }, 401);
+async function runShell(env: Env, headerToken: string, mcpSessionId: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
+  const initialMounts = await registry(env, "/mounts", { token: headerToken, mcpSessionId, ip });
+  const mounts = normalizeMounts(initialMounts.mounts);
+  const before = new Map<string, Map<string, string>>();
+  const fs = new InMemoryFs(initialShellFiles(mounts));
 
-  if (request.method === "POST" && action === "pair") {
-    const input: { scopes?: string[] } = await request.json<{ scopes?: string[] }>().catch(() => ({}));
-    return json(await registry(env, "/pair", { room, token, scopes: input.scopes, ip }));
-  }
+  await fs.mkdir("/rooms", { recursive: true });
+  await fs.mkdir("/tmp", { recursive: true });
+  for (const mount of mounts) await loadMount(env, fs, mount, mounts, before);
 
-  if (request.method === "GET" && action === "actors") {
-    return json(await registry(env, "/actors", { room, token, ip }));
-  }
+  const addMount = async (mount: Mount): Promise<void> => {
+    const existing = mounts.find((entry) => entry.wiki === mount.wiki);
+    if (existing) {
+      existing.actor = mount.actor;
+      existing.scopes = mount.scopes;
+    } else {
+      mounts.push(mount);
+      mounts.sort((left, right) => mountPath(left.wiki).localeCompare(mountPath(right.wiki)));
+    }
+    await loadMount(env, fs, mount, mounts, before);
+  };
 
-  if (request.method === "POST" && action === "revoke") {
-    const input = await request.json<{ actor?: string }>();
-    return json(await registry(env, "/revoke", { room, token, actor: input.actor, ip }));
-  }
+  const bash = new Bash({
+    fs,
+    cwd: "/",
+    customCommands: [defineCommand("room", (args) => roomCommand(env, fs, mounts, before, addMount, headerToken, mcpSessionId, ip, args))],
+    executionLimits: {
+      maxCommandCount: 2_000,
+      maxLoopIterations: 5_000,
+      maxCallDepth: 50,
+      maxStringLength: 2_000_000,
+      maxArrayElements: 20_000,
+      maxGlobOperations: 50_000,
+      maxAwkIterations: 10_000,
+      maxSedIterations: 10_000,
+      maxJqIterations: 10_000,
+      maxSubstitutionDepth: 30,
+      maxHeredocSize: 1_000_000,
+    },
+    defenseInDepth: true,
+    network: env.BASHROOM_ENABLE_FULL_NETWORK === "1" || env.INTRACODE_ENABLE_FULL_NETWORK === "1"
+      ? { dangerouslyAllowFullInternetAccess: true, maxRedirects: 5, timeoutMs: 10_000, maxResponseSize: 1_000_000 }
+      : undefined,
+  });
 
-  if (request.method === "POST" && action === "rotate") {
-    const result = await registry(env, "/rotate", { room, token, ip });
-    return json(result, result.ok === false ? 401 : 200);
-  }
-
-  if (request.method === "POST" && action === "delete") {
-    const result = await registry(env, "/delete", { room, token, ip });
-    if (result.ok === false) return json(result, 401);
-    await roomControl(env, room, "/delete");
-    return json(result);
-  }
-
-  if (request.method === "GET" && action === "export") {
-    const auth = await verify(env, room, token, "", "read", ip);
-    if (!auth.ok) return json(auth, 401);
-    return text(await roomControlText(env, room, "/export"));
-  }
-
-  return json({ error: "not_found" }, 404);
+  const exec = await bash.exec(command.slice(0, MAX_COMMAND_CHARS), { cwd: "/", stdin });
+  const persisted = await persistMounts(env, fs, mounts, before, command);
+  return {
+    stdout: exec.stdout,
+    stderr: [exec.stderr, persisted.stderr].filter(Boolean).join(""),
+    exitCode: exec.exitCode === 0 ? persisted.exitCode : exec.exitCode,
+    changed: persisted.changed,
+    changed_paths: persisted.changed_paths,
+  };
 }
 
-async function handleRoomHttp(request: Request, env: Env, url: URL, ip: string): Promise<Response> {
-  const room = decodeURIComponent(url.pathname.slice("/rooms/".length));
-  const token = bearerToken(request);
-  if (!token) return json({ error: "missing_token" }, 401);
+async function roomCommand(
+  env: Env,
+  fs: InMemoryFs,
+  mounts: Mount[],
+  before: Map<string, Map<string, string>>,
+  addMount: (mount: Mount) => Promise<void>,
+  headerToken: string,
+  mcpSessionId: string,
+  ip: string,
+  args: string[],
+): Promise<ExecResult> {
+  const [subcommand = "help", ...rest] = args;
 
-  if (request.method === "GET") {
-    const op = (url.searchParams.get("op") || "read") as RoomOp;
-    const after = parseCursor(url.searchParams.get("after"));
-    const limit = parseLimit(url.searchParams.get("limit"));
-    const result = await authedRoomOp(env, token, "", room, { op, after, limit }, ip);
-    return result.exitCode === 0 ? text(result.stdout) : json({ error: result.stderr }, 403);
+  try {
+    if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") return cmdOk(roomHelp());
+
+    if (subcommand === "mounts") {
+      if (!mounts.length) return cmdOk("No mounted rooms.\n\nRun: room create\nOr:  room join <invite>\n");
+      return cmdOk(mounts.map((mount) => `${mountPath(mount.wiki)}\t${mount.actor}\t${mount.scopes.join(",")}`).join("\n") + "\n");
+    }
+
+    if (subcommand === "create") {
+      const parsed = parseCommandFlags(rest);
+      const result = await registry(env, "/create", { wiki: parsed.positionals[0] || "", actor: parsed.actor || defaultActor("mcp"), mcpSessionId, ip });
+      if (result.ok === false) return cmdErr(String(result.error || "create_failed"));
+      const mount = resultMount(result);
+      await seedWiki(env, mount.wiki, mount.actor);
+      await addMount(mount);
+      return cmdOk(`created ${mount.wiki}\nmounted ${mountPath(mount.wiki)}\n`);
+    }
+
+    if (subcommand === "join") {
+      const parsed = parseCommandFlags(rest);
+      const invite = parsed.positionals[0];
+      if (!invite) return cmdErr("usage: room join <invite> [--actor <actor>]\n");
+      const result = await registry(env, "/join", { invite, actor: parsed.actor || defaultActor("mcp"), mcpSessionId, ip });
+      if (result.ok === false) return cmdErr(String(result.error || "join_failed"));
+      const mount = resultMount(result);
+      await addMount(mount);
+      return cmdOk(`joined ${mount.wiki}\nmounted ${mountPath(mount.wiki)}\n`);
+    }
+
+    if (subcommand === "pair") {
+      const wiki = resolveWikiArg(rest[0], mounts);
+      if (!wiki.ok) return cmdErr(wiki.error);
+      const result = await registry(env, "/pair", { wiki: wiki.value, token: headerToken, mcpSessionId, ip });
+      if (result.ok === false) return cmdErr(String(result.error || "pair_failed"));
+      return cmdOk(`${result.invite}\ncode ${result.code}\nexpires ${result.expires_at}\n`);
+    }
+
+    if (subcommand === "who") {
+      const wiki = resolveWikiArg(rest[0], mounts);
+      if (!wiki.ok) return cmdErr(wiki.error);
+      const result = await registry(env, "/actors", { wiki: wiki.value, token: headerToken, mcpSessionId, ip });
+      if (result.ok === false) return cmdErr(String(result.error || "who_failed"));
+      return cmdOk(`${(Array.isArray(result.actors) ? result.actors : []).join("\n")}\n`);
+    }
+
+    if (subcommand === "history") {
+      const wiki = resolveWikiArg(rest[0], mounts);
+      if (!wiki.ok) return cmdErr(wiki.error);
+      const events = await wikiAudit(env, wiki.value, parseLimit(rest[1]));
+      const output = events.map((event) => {
+        const path = String(event.path || "");
+        return `#${event.id} ${event.ts} ${event.actor} ${event.kind}${path ? ` ${path}` : ""}: ${event.body}`;
+      }).join("\n");
+      return cmdOk(output ? `${output}\n` : "No history.\n");
+    }
+
+    return cmdErr(`unknown room subcommand: ${subcommand}\n\n${roomHelp()}`);
+  } catch (error) {
+    return cmdErr(`${error instanceof Error ? error.message : String(error)}\n`);
+  } finally {
+    await fs.mkdir("/rooms", { recursive: true }).catch(() => undefined);
   }
-
-  if (request.method === "POST") {
-    const input = await request.json<RoomRequest>();
-    const result = await authedRoomOp(env, token, "", room, input, ip);
-    return json(result, result.exitCode === 0 ? 200 : 403);
-  }
-
-  return json({ error: "method_not_allowed" }, 405);
 }
 
-async function authedRoomOp(env: Env, token: string, mcpSessionId: string, room: string, input: RoomRequest, ip: string): Promise<CommandResult> {
-  const op = input.op || "read";
-  const auth = await verify(env, room, token, mcpSessionId, scopeForOp(op), ip);
-  if (!auth.ok || !auth.actor) return err(auth.error || "unauthorized");
-  const actors = op === "who" ? await roomActors(env, room, token, mcpSessionId, ip) : undefined;
-  return runRoomOp(env, room, { ...input, actor: auth.actor, knownActors: actors });
+async function loadMount(env: Env, fs: InMemoryFs, mount: Mount, mounts: Mount[], before: Map<string, Map<string, string>>): Promise<void> {
+  await fs.mkdir(mountPath(mount.wiki), { recursive: true });
+  const snapshot = await wikiSnapshot(env, mount.wiki);
+  for (const file of snapshot) {
+    const fullPath = `${mountPath(mount.wiki)}/${file.path}`;
+    await fs.writeFile(fullPath, file.content);
+  }
+  before.set(mount.wiki, await mountedFiles(fs, mount.wiki, mounts));
 }
 
-async function runRoomOp(env: Env, room: string, input: RoomRequest & { actor: string }): Promise<CommandResult> {
-  const id = env.ROOMS.idFromName(sanitizeRoom(room));
+async function persistMounts(env: Env, fs: InMemoryFs, mounts: Mount[], before: Map<string, Map<string, string>>, command: string): Promise<Omit<ShellResult, "stdout">> {
+  const changedPaths: string[] = [];
+  let stderr = "";
+  let exitCode = 0;
+
+  for (const mount of mounts) {
+    const previous = before.get(mount.wiki) || new Map<string, string>();
+    const current = await mountedFiles(fs, mount.wiki, mounts);
+    const changes = diffFiles(previous, current);
+    if (!changes.length) continue;
+
+    if (!hasScope(mount.scopes, "write")) {
+      stderr += `bashroom: ${mount.wiki}: write permission denied\n`;
+      exitCode = 1;
+      continue;
+    }
+
+    const result = await applyWikiChanges(env, mount.wiki, mount.actor, changes, command);
+    if (result.ok === false) {
+      stderr += `bashroom: ${mount.wiki}: ${result.error || "persist failed"}\n`;
+      exitCode = 1;
+      continue;
+    }
+    changedPaths.push(...changes.map((change) => `${mountPath(mount.wiki)}/${change.path}`));
+  }
+
+  return { stderr, exitCode, changed: changedPaths.length, changed_paths: changedPaths };
+}
+
+async function mountedFiles(fs: InMemoryFs, wiki: string, mounts: Mount[]): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  const prefix = `${mountPath(wiki)}/`;
+  for (const fullPath of fs.getAllPaths()) {
+    if (!fullPath.startsWith(prefix)) continue;
+    if (ownerForPath(fullPath, mounts) !== wiki) continue;
+    const stat = await fs.stat(fullPath).catch(() => undefined);
+    if (!stat?.isFile) continue;
+    const relativePath = sanitizeFilePath(fullPath.slice(prefix.length));
+    files.set(relativePath, await fs.readFile(fullPath));
+  }
+  return files;
+}
+
+function diffFiles(previous: Map<string, string>, current: Map<string, string>): FileChange[] {
+  const changes: FileChange[] = [];
+  for (const [path, content] of current) {
+    if (previous.get(path) !== content) changes.push({ path, content });
+  }
+  for (const path of previous.keys()) {
+    if (!current.has(path)) changes.push({ path, deleted: true });
+  }
+  return changes;
+}
+
+function ownerForPath(path: string, mounts: Mount[]): string | undefined {
+  let owner: string | undefined;
+  let bestLength = -1;
+  for (const mount of mounts) {
+    const prefix = `${mountPath(mount.wiki)}/`;
+    if (path.startsWith(prefix) && prefix.length > bestLength) {
+      owner = mount.wiki;
+      bestLength = prefix.length;
+    }
+  }
+  return owner;
+}
+
+function initialShellFiles(mounts: Mount[]): InitialFiles {
+  const mountList = mounts.length
+    ? mounts.map((mount) => `- ${mountPath(mount.wiki)} (${mount.actor})`).join("\n")
+    : "No mounted rooms yet.";
+  return {
+    "/README.md": `# Bashroom Shell\n\nDurable bash rooms for coding agents.\n\n${mountList}\n\nRun room help.\n`,
+  };
+}
+
+function normalizeMounts(value: unknown): Mount[] {
+  if (!Array.isArray(value)) return [];
+  const mounts: Mount[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const wiki = typeof record.wiki === "string" ? sanitizeWiki(record.wiki) : "";
+    const actor = typeof record.actor === "string" ? sanitizeActor(record.actor) : "actor";
+    const scopes = parseScopes(record.scopes, ["read"]);
+    if (wiki) mounts.push({ wiki, actor, scopes });
+  }
+  return mounts;
+}
+
+function resultMount(result: Record<string, unknown>): Mount {
+  return {
+    wiki: sanitizeWiki(String(result.wiki || "")),
+    actor: sanitizeActor(String(result.actor || "actor")),
+    scopes: parseScopes(result.scopes, ["read"]),
+  };
+}
+
+function resolveWikiArg(value: string | undefined, mounts: Mount[]): { ok: true; value: string } | { ok: false; error: string } {
+  if (value) return { ok: true, value: wikiFromPathOrName(value) };
+  if (mounts.length === 1) return { ok: true, value: mounts[0].wiki };
+  return { ok: false, error: "usage: pass a room name or mount path\n" };
+}
+
+function wikiFromPathOrName(value: string): string {
+  const clean = value.startsWith("/rooms/") ? value.slice("/rooms/".length) : value;
+  return sanitizeWiki(clean);
+}
+
+function parseCommandFlags(args: string[]): { actor?: string; positionals: string[] } {
+  const positionals = [...args];
+  let actor: string | undefined;
+  for (let index = 0; index < positionals.length; index += 1) {
+    if (positionals[index] === "--actor") {
+      actor = sanitizeActor(positionals[index + 1] || "");
+      positionals.splice(index, 2);
+      index -= 1;
+    }
+  }
+  return { actor, positionals };
+}
+
+async function wikiSnapshot(env: Env, wiki: string): Promise<WikiFile[]> {
+  const result = await roomControl(env, wiki, "/snapshot");
+  return Array.isArray(result.files) ? result.files.filter(isWikiFile) : [];
+}
+
+async function seedWiki(env: Env, wiki: string, actor: string): Promise<void> {
+  await roomControl(env, wiki, "/seed", { wiki, actor });
+}
+
+async function applyWikiChanges(env: Env, wiki: string, actor: string, changes: FileChange[], command: string): Promise<Record<string, unknown>> {
+  return roomControl(env, wiki, "/apply", { actor, changes, command });
+}
+
+async function wikiAudit(env: Env, wiki: string, limit: number): Promise<Array<Record<string, unknown>>> {
+  const result = await roomControl(env, wiki, "/audit", { limit });
+  return Array.isArray(result.events) ? result.events as Array<Record<string, unknown>> : [];
+}
+
+async function roomControl(env: Env, wiki: string, path: string, body?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const id = env.ROOMS.idFromName(sanitizeWiki(wiki));
   const stub = env.ROOMS.get(id);
-  const response = await stub.fetch("https://room.local/command", {
+  const response = await stub.fetch(`https://wiki.local${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(input),
+    body: JSON.stringify(body || {}),
   });
   return response.json();
-}
-
-async function roomControl(env: Env, room: string, path: string): Promise<Record<string, unknown>> {
-  const id = env.ROOMS.idFromName(sanitizeRoom(room));
-  const stub = env.ROOMS.get(id);
-  const response = await stub.fetch(`https://room.local${path}`, { method: "POST" });
-  return response.json();
-}
-
-async function roomControlText(env: Env, room: string, path: string): Promise<string> {
-  const id = env.ROOMS.idFromName(sanitizeRoom(room));
-  const stub = env.ROOMS.get(id);
-  const response = await stub.fetch(`https://room.local${path}`, { method: "POST" });
-  return response.text();
-}
-
-async function verify(env: Env, room: string, token: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
-  return registry(env, "/verify", { room, token, mcpSessionId, scope, ip }) as Promise<AuthResult>;
 }
 
 async function registry(env: Env, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -979,19 +1013,27 @@ function mcpTransportStorage(env: Env, request: Request) {
   };
 }
 
-async function roomActors(env: Env, room: string, token: string, mcpSessionId: string, ip: string): Promise<string[] | undefined> {
-  const result = await registry(env, "/actors", { room, token, mcpSessionId, ip });
-  return Array.isArray(result.actors) ? result.actors.filter((actor): actor is string => typeof actor === "string") : undefined;
+function parseChanges(value: unknown): FileChange[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => {
+    const record = entry && typeof entry === "object" ? entry as Record<string, unknown> : {};
+    return {
+      path: String(record.path || ""),
+      content: typeof record.content === "string" ? record.content : undefined,
+      deleted: record.deleted === true,
+    };
+  });
 }
 
-function scopeForOp(op: RoomOp): Scope {
-  if (op === "write") return "write";
-  if (op === "checkpoint") return "checkpoint";
-  return "read";
+async function readJson(request: Request): Promise<Record<string, unknown>> {
+  const value = await request.json().catch(() => ({}));
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-function hasScope(scopes: Scope[], required: Scope): boolean {
-  return scopes.includes("admin") || scopes.includes(required);
+function isWikiFile(value: unknown): value is WikiFile {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.path === "string" && typeof record.content === "string";
 }
 
 function parseScopes(value: unknown, fallback: Scope[]): Scope[] {
@@ -1000,29 +1042,32 @@ function parseScopes(value: unknown, fallback: Scope[]): Scope[] {
   return scopes.length ? scopes : fallback;
 }
 
-function parseLimit(value: string | number | null | undefined): number {
+function hasScope(scopes: Scope[], required: Scope): boolean {
+  return scopes.includes("admin") || scopes.includes(required);
+}
+
+function parseLimit(value: unknown): number {
   if (!value) return DEFAULT_LIMIT;
-  const parsed = typeof value === "number" ? value : Number.parseInt(value, 10);
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_LIMIT;
   return Math.min(parsed, MAX_LIMIT);
 }
 
-function parseCursor(value: string | null | undefined): number | undefined {
-  if (!value) return undefined;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
-  return parsed;
+function cleanFileContent(value: string): string {
+  return value.slice(0, MAX_FILE_CHARS);
 }
 
-function cleanBody(body: string | undefined): string | undefined {
-  const value = body?.trim();
-  if (!value) return undefined;
-  return value.slice(0, MAX_BODY_CHARS);
-}
-
-function sanitizeRoom(room: string): string {
-  const value = room.trim().replace(/^\/+|\/+$/g, "");
+function sanitizeWiki(wiki: string): string {
+  const value = wiki.trim().replace(/^\/+|\/+$/g, "");
   if (!/^[a-zA-Z0-9._/-]{1,160}$/.test(value)) throw new Error("invalid room");
+  if (value.split("/").some((segment) => !segment || segment === "." || segment === "..")) throw new Error("invalid room");
+  return value;
+}
+
+function sanitizeFilePath(path: string): string {
+  const value = path.trim().replace(/^\/+/, "");
+  if (!value || value.length > 512 || value.includes("\0")) throw new Error("invalid file path");
+  if (value.split("/").some((segment) => !segment || segment === "." || segment === "..")) throw new Error("invalid file path");
   return value;
 }
 
@@ -1030,26 +1075,13 @@ function sanitizeActor(actor: string): string {
   return actor.trim().replace(/[^a-zA-Z0-9@._-]/g, "_").slice(0, 80) || "actor";
 }
 
+function mountPath(wiki: string): string {
+  return `/rooms/${sanitizeWiki(wiki)}`;
+}
+
 function compact(value: string): string {
   const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= MAX_BODY_CHARS_IN_READ) return normalized;
-  return `${normalized.slice(0, MAX_BODY_CHARS_IN_READ - 1)}…`;
-}
-
-function formatTimestamp(value: string): string {
-  return value.replace("T", " ").replace(/\.\d{3}Z$/, "Z");
-}
-
-function uniqueActors(actors: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const actor of actors) {
-    const cleanActor = sanitizeActor(actor);
-    if (seen.has(cleanActor)) continue;
-    seen.add(cleanActor);
-    result.push(cleanActor);
-  }
-  return result;
+  return normalized.length <= 600 ? normalized : `${normalized.slice(0, 599)}…`;
 }
 
 function bearerToken(request: Request): string {
@@ -1089,8 +1121,23 @@ function randomPairCode(): string {
   return `${randomSuffix(4).toUpperCase()}-${randomSuffix(4).toUpperCase()}`;
 }
 
-function normalizePairCode(code: string): string {
-  return code.trim().toUpperCase();
+function inviteUri(wiki: string, code: string): string {
+  return `bashroom://join/${encodeURIComponent(wiki)}?code=${encodeURIComponent(code)}`;
+}
+
+function normalizePairCode(invite: string): string {
+  const value = invite.trim();
+  if (!value.includes("://")) return value.toUpperCase();
+
+  try {
+    const url = new URL(value);
+    const code = url.searchParams.get("code") || url.hash.slice(1);
+    if (code) return code.trim().toUpperCase();
+  } catch {
+    return value.toUpperCase();
+  }
+
+  return value.toUpperCase();
 }
 
 function randomSuffix(length: number): string {
@@ -1117,12 +1164,18 @@ async function sha256(value: string): Promise<string> {
   return base64url(new Uint8Array(hash));
 }
 
-function ok(stdout: string, cursor?: number): CommandResult {
-  return { stdout, stderr: "", exitCode: 0, cursor };
+function cmdOk(stdout: string): ExecResult {
+  return { stdout, stderr: "", exitCode: 0 };
 }
 
-function err(stderr: string): CommandResult {
+function cmdErr(stderr: string): ExecResult {
   return { stdout: "", stderr, exitCode: 1 };
+}
+
+function formatShellResult(result: ShellResult): string {
+  const output = `${result.stdout}${result.stderr ? `${result.stderr}` : ""}`;
+  const paths = result.changed_paths.length ? ` ${result.changed_paths.join(" ")}` : "";
+  return `${output}${output && !output.endsWith("\n") ? "\n" : ""}[bashroom] exit=${result.exitCode} changed=${result.changed}${paths}\n`;
 }
 
 function json(value: unknown, status = 200): Response {
@@ -1139,34 +1192,32 @@ function text(value: string, status = 200): Response {
   });
 }
 
-function toolJson(value: unknown, isError = false): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
-  return {
-    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
-    isError,
-  };
-}
+function roomHelp(): string {
+  return `Bashroom commands
 
-function mcpCredentialResponse(base: Record<string, unknown>, roomSecret: unknown, mcpSessionId: string): Record<string, unknown> {
-  if (mcpSessionId) {
-    return {
-      ...base,
-      credential: "stored_in_mcp_session",
-      next: "Use intracode_room with this room. Do not pass room_secret in normal MCP session calls.",
-    };
-  }
+room create [room] [--actor <actor>]
+room join <invite> [--actor <actor>]
+room pair [room]
+room mounts
+room who [room]
+room history [room] [limit]
 
-  return {
-    ...base,
-    room_secret: roomSecret,
-    credential: "returned_as_room_secret",
-    next: "Pass room_secret to intracode_room or configure it as an Authorization bearer header.",
-  };
-}
-
-function helpText(): string {
-  return `intracode room ops\n\nread                  Show checkpoint and recent events\nhistory               Show recent events, optionally after a cursor\nwrite                 Append a short Markdown note\ncheckpoint            Replace the shared checkpoint\nwho                   Show known actors and recent activity\nhelp                  Show this help\n`;
+Room files are mounted at /rooms/<room>. Use normal bash to read and write Markdown files.
+`;
 }
 
 function httpHelpText(): string {
-  return `# intracode\n\nMCP rooms for coding agents.\n\nEndpoint: https://intracode.sdan.io/mcp\n\nRooms require bearer tokens. The public service does not expose global room or actor discovery.\n`;
+  return `# Bashroom
+
+Durable bash rooms for coding agents.
+
+MCP endpoint:
+
+\`\`\`bash
+claude mcp add --scope user --transport http bashroom https://intracode.sdan.io/mcp
+codex mcp add bashroom --url https://intracode.sdan.io/mcp
+\`\`\`
+
+The MCP exposes one tool: \`bashroom\`.
+`;
 }
