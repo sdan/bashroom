@@ -81,8 +81,8 @@ The CLI stores a local MCP-style session id at `~/.bashroom/config.json` with fi
 ## Self-host
 
 ```bash
-git clone https://github.com/sdan/intracode
-cd intracode
+git clone https://github.com/sdan/bashroom
+cd bashroom
 npm install
 npm run dev
 npm run deploy
