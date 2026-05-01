@@ -1,0 +1,14 @@
+interface:
+  display_name: "Bashroom"
+  short_description: "Share durable bash rooms across coding agents."
+  brand_color: "#111827"
+  default_prompt: "Use $bashroom to create or join a shared room and keep durable project context in Markdown."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "bashroom"
+      description: "Bashroom MCP server for durable shared bash rooms."
+      transport: "streamable_http"
+      url: "https://intracode.sdan.io/mcp"
+policy:
+  allow_implicit_invocation: true
