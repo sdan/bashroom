@@ -60,6 +60,14 @@ type AuthResult = {
   retry_after_seconds?: number;
 };
 
+type AccountAuth = {
+  ok: boolean;
+  userId?: string;
+  handle?: string;
+  error?: string;
+  retry_after_seconds?: number;
+};
+
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MAX_FILE_CHARS = 512_000;
@@ -311,6 +319,34 @@ export class Registry extends DurableObject<Env> {
         updated_at INTEGER NOT NULL
       );
     `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        handle TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS user_tokens (
+        token_hash TEXT PRIMARY KEY,
+        token_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT,
+        revoked_at TEXT
+      );
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS user_rooms (
+        user_id TEXT NOT NULL,
+        room TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, room)
+      );
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -363,6 +399,25 @@ export class Registry extends DurableObject<Env> {
       const auth = await this.authorize(wiki, bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
       return json(this.deleteWiki(wiki));
+    }
+
+    if (request.method === "POST" && url.pathname === "/account-create") {
+      const ip = String(body.ip || "unknown");
+      const limited = this.checkBucket(`account:create:ip:${ip}`, CREATE_IP_CAPACITY, CREATE_IP_REFILL);
+      if (limited) return json(limited, 429);
+      return json(await this.createAccount(String(body.handle || "user")));
+    }
+
+    if (request.method === "POST" && url.pathname === "/account-rooms") {
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
+      if (!account.ok) return json(account, 401);
+      return json({ ok: true, user_id: account.userId, handle: account.handle, rooms: this.accountRooms(account.userId || "") });
+    }
+
+    if (request.method === "POST" && url.pathname === "/account-room-create") {
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
+      if (!account.ok) return json(account, 401);
+      return json(await this.createAccountRoom(account.userId || "", String(body.room || body.wiki || ""), String(body.actor || defaultActor("cli"))));
     }
 
     return json({ ok: false, error: "not_found" }, 404);
@@ -462,6 +517,13 @@ export class Registry extends DurableObject<Env> {
         const auth = this.verifyTokenHash(row.room, tokenHash, "read", ip);
         if (auth.ok && auth.wiki && auth.actor && auth.scopes) byWiki.set(auth.wiki, { wiki: auth.wiki, actor: auth.actor, scopes: auth.scopes });
       }
+
+      const account = this.verifyAccountTokenHash(tokenHash, ip);
+      if (account.ok && account.userId) {
+        for (const row of this.accountRooms(account.userId)) {
+          byWiki.set(row.room, { wiki: row.room, actor: row.actor, scopes: row.scopes });
+        }
+      }
     }
 
     if (mcpSessionId) {
@@ -486,7 +548,11 @@ export class Registry extends DurableObject<Env> {
   }
 
   private async authorize(wiki: string, token: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
-    if (token) return this.verify(sanitizeWiki(wiki), token, scope, ip);
+    if (token) {
+      const roomAuth = await this.verify(sanitizeWiki(wiki), token, scope, ip);
+      if (roomAuth.ok || roomAuth.error !== "invalid_token") return roomAuth;
+      return this.verifyAccountRoom(sanitizeWiki(wiki), token, scope, ip);
+    }
     if (mcpSessionId) return this.verifySession(sanitizeWiki(wiki), mcpSessionId, scope, ip);
     return { ok: false, error: "missing_token" };
   }
@@ -563,9 +629,128 @@ export class Registry extends DurableObject<Env> {
     );
   }
 
+  private async createAccount(handle: string): Promise<Record<string, unknown>> {
+    const now = new Date().toISOString();
+    const userId = randomId("usr");
+    const token = randomAccountToken();
+    const tokenHash = await sha256(token);
+    const tokenId = randomId("utok");
+    const cleanHandle = sanitizeHandle(handle);
+
+    this.ctx.storage.sql.exec("INSERT INTO users (user_id, handle, created_at) VALUES (?, ?, ?)", userId, cleanHandle, now);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO user_tokens (token_hash, token_id, user_id, created_at)
+       VALUES (?, ?, ?, ?)`,
+      tokenHash,
+      tokenId,
+      userId,
+      now,
+    );
+
+    return { ok: true, user_id: userId, handle: cleanHandle, token };
+  }
+
+  private async createAccountRoom(userId: string, wiki: string, actor: string): Promise<Record<string, unknown>> {
+    const cleanWiki = wiki.trim() ? sanitizeWiki(wiki) : this.generateWikiSlug();
+    const cleanActor = sanitizeActor(actor);
+    const existing = this.ctx.storage.sql.exec("SELECT room FROM wikis WHERE room = ?", cleanWiki).toArray()[0];
+    if (existing) return { ok: false, error: "room_exists" };
+
+    const now = new Date().toISOString();
+    const scopes: Scope[] = ["read", "write", "checkpoint", "admin"];
+    this.ctx.storage.sql.exec("INSERT INTO wikis (room, created_at) VALUES (?, ?)", cleanWiki, now);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO user_rooms (user_id, room, actor, scopes, role, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      userId,
+      cleanWiki,
+      cleanActor,
+      scopes.join(","),
+      "owner",
+      now,
+    );
+
+    return { ok: true, wiki: cleanWiki, actor: cleanActor, scopes, role: "owner" };
+  }
+
+  private async verifyAccount(token: string, ip: string): Promise<AccountAuth> {
+    if (!token) return { ok: false, error: "missing_token" };
+    return this.verifyAccountTokenHash(await sha256(token), ip);
+  }
+
+  private verifyAccountTokenHash(tokenHash: string, ip: string): AccountAuth {
+    const ipLimited = this.checkBucket(`verify:ip:${ip}`, VERIFY_IP_CAPACITY, VERIFY_IP_REFILL);
+    if (ipLimited) return ipLimited;
+
+    const globalLimited = this.checkBucket("ops:global", GLOBAL_OPS_CAPACITY, GLOBAL_OPS_REFILL);
+    if (globalLimited) return globalLimited;
+
+    const tokenLimited = this.checkBucket(`ops:user_token:${tokenHash}`, OPS_TOKEN_CAPACITY, OPS_TOKEN_REFILL);
+    if (tokenLimited) return tokenLimited;
+
+    const row = this.ctx.storage.sql
+      .exec<{ user_id: string; handle: string; last_seen_at: string | null; revoked_at: string | null }>(
+        `SELECT t.user_id, u.handle, t.last_seen_at, t.revoked_at
+         FROM user_tokens t
+         JOIN users u ON u.user_id = t.user_id
+         WHERE t.token_hash = ?`,
+        tokenHash,
+      )
+      .toArray()[0];
+
+    if (!row || row.revoked_at) return { ok: false, error: "invalid_token" };
+
+    const now = Date.now();
+    if (!row.last_seen_at || now - Date.parse(row.last_seen_at) > LAST_SEEN_WRITE_INTERVAL_MS) {
+      this.ctx.storage.sql.exec("UPDATE user_tokens SET last_seen_at = ? WHERE token_hash = ?", new Date(now).toISOString(), tokenHash);
+    }
+
+    return { ok: true, userId: row.user_id, handle: row.handle };
+  }
+
+  private async verifyAccountRoom(wiki: string, token: string, scope: Scope, ip: string): Promise<AuthResult> {
+    const account = await this.verifyAccount(token, ip);
+    if (!account.ok || !account.userId) return { ok: false, error: account.error || "invalid_token" };
+
+    const row = this.ctx.storage.sql
+      .exec<{ room: string; actor: string; scopes: string }>(
+        `SELECT room, actor, scopes
+         FROM user_rooms
+         WHERE user_id = ? AND room = ?`,
+        account.userId,
+        wiki,
+      )
+      .toArray()[0];
+    if (!row) return { ok: false, error: "wrong_room" };
+
+    const scopes = row.scopes.split(",") as Scope[];
+    if (!hasScope(scopes, scope)) return { ok: false, error: "insufficient_scope" };
+    return { ok: true, wiki: row.room, actor: row.actor, scopes, tokenId: account.userId };
+  }
+
+  private accountRooms(userId: string): Array<{ room: string; actor: string; scopes: Scope[]; role: string; created_at: string }> {
+    return this.ctx.storage.sql
+      .exec<{ room: string; actor: string; scopes: string; role: string; created_at: string }>(
+        `SELECT room, actor, scopes, role, created_at
+         FROM user_rooms
+         WHERE user_id = ?
+         ORDER BY created_at DESC`,
+        userId,
+      )
+      .toArray()
+      .map((row) => ({
+        room: row.room,
+        actor: row.actor,
+        scopes: row.scopes.split(",") as Scope[],
+        role: row.role,
+        created_at: row.created_at,
+      }));
+  }
+
   private actors(wiki: string): string[] {
     const cleanWiki = sanitizeWiki(wiki);
-    return this.ctx.storage.sql
+    const actors = new Set<string>();
+    for (const row of this.ctx.storage.sql
       .exec<{ actor: string }>(
         `SELECT actor
          FROM wiki_tokens
@@ -574,8 +759,22 @@ export class Registry extends DurableObject<Env> {
          ORDER BY MIN(created_at) ASC`,
         cleanWiki,
       )
-      .toArray()
-      .map((row) => row.actor);
+      .toArray()) {
+      actors.add(row.actor);
+    }
+    for (const row of this.ctx.storage.sql
+      .exec<{ actor: string }>(
+        `SELECT actor
+         FROM user_rooms
+         WHERE room = ?
+         GROUP BY actor
+         ORDER BY MIN(created_at) ASC`,
+        cleanWiki,
+      )
+      .toArray()) {
+      actors.add(row.actor);
+    }
+    return [...actors];
   }
 
   private deleteWiki(wiki: string): Record<string, unknown> {
@@ -684,6 +883,29 @@ export default {
       const input = await readJson(request);
       const result = await runShell(env, bearerToken(request), mcpSessionId(request), clientIp(request), String(input.command || ""), String(input.stdin || ""));
       return json(result, result.exitCode === 0 ? 200 : 400);
+    }
+
+    if (url.pathname === "/account/login" && request.method === "POST") {
+      const input = await readJson(request);
+      return json(await registry(env, "/account-create", { handle: input.handle || "user", ip: clientIp(request) }));
+    }
+
+    if (url.pathname === "/account/rooms" && request.method === "POST") {
+      return json(await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) }));
+    }
+
+    if (url.pathname === "/account/room-create" && request.method === "POST") {
+      const input = await readJson(request);
+      const result = await registry(env, "/account-room-create", {
+        token: bearerToken(request),
+        room: input.room || input.wiki || "",
+        actor: input.actor || defaultActor("cli"),
+        ip: clientIp(request),
+      });
+      if (result.ok && typeof result.wiki === "string" && typeof result.actor === "string") {
+        await seedWiki(env, result.wiki, result.actor);
+      }
+      return json(result, result.ok === false ? 400 : 200);
     }
 
     if (url.pathname === "/" || url.pathname === "/help") return text(httpHelpText());
@@ -1075,6 +1297,10 @@ function sanitizeActor(actor: string): string {
   return actor.trim().replace(/[^a-zA-Z0-9@._-]/g, "_").slice(0, 80) || "actor";
 }
 
+function sanitizeHandle(handle: string): string {
+  return handle.trim().replace(/[^a-zA-Z0-9@._-]/g, "_").slice(0, 80) || "user";
+}
+
 function mountPath(wiki: string): string {
   return `/rooms/${sanitizeWiki(wiki)}`;
 }
@@ -1111,6 +1337,10 @@ function defaultActor(prefix: string): string {
 
 function randomToken(): string {
   return `ic_tok_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
+}
+
+function randomAccountToken(): string {
+  return `br_user_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
 function randomId(prefix: string): string {

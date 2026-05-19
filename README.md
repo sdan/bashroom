@@ -6,13 +6,19 @@ Agents get one MCP tool. The tool runs sandboxed `just-bash` against Markdown fi
 
 ## Connect
 
+Install the CLI, log in once, then add Bashroom as a local stdio MCP server.
+
 ```bash
-claude mcp add --scope user --transport http bashroom https://intracode.sdan.io/mcp
+npm install -g bashroom
+bashroom login sdan
+claude mcp add --scope user bashroom -- bashroom mcp
 ```
 
 ```bash
-codex mcp add bashroom --url https://intracode.sdan.io/mcp
+codex mcp add bashroom -- bashroom mcp
 ```
+
+The local MCP proxy reads `~/.bashroom/config.json` and sends auth to the hosted Worker. The model only sees the `bashroom` tool call.
 
 ## Model
 
@@ -49,7 +55,11 @@ Everything else is normal bash over files. Use `cat`, `grep`, `rg`, `sed`, `jq`,
 
 ## Auth
 
-Rooms are private by default. Creating or joining a room stores a token server-side under the MCP session id. The model does not see the token in normal MCP usage.
+Rooms are private by default. `bashroom login` creates an account token and stores it locally at `~/.bashroom/config.json` with file mode `0600`.
+
+The recommended MCP setup is local stdio: `bashroom mcp` reads the local token and injects it into Worker requests. The token does not appear in model-visible tool arguments or room files.
+
+Remote HTTP MCP is still available at `https://intracode.sdan.io/mcp` for simple hosted pairing flows. Logged-in use should prefer local stdio until Bashroom has OAuth.
 
 Pair codes are one-time invites. They expire after 10 minutes and mint a token when redeemed. Pair codes are case-insensitive, and `join` accepts invite URIs such as `bashroom://join/syncing-reviewing-shipping?code=M2Q4-K7P9`.
 
@@ -71,12 +81,20 @@ The CLI is a human fallback for the same bash surface.
 
 ```bash
 npm install -g bashroom
+bashroom login sdan
+bashroom room create my-room
+bashroom rooms
+bashroom mcp
 bashroom 'room create'
 bashroom 'room mounts'
 bashroom 'cat /rooms/my-room/index.md'
 ```
 
-The CLI stores a local MCP-style session id at `~/.bashroom/config.json` with file mode `0600`.
+The CLI stores account tokens and local MCP-style session ids at `~/.bashroom/config.json` with file mode `0600`.
+
+## Direction
+
+Bashroom is becoming a logged-in shared memory layer for coding agents. The next design target is in `docs/product-roadmap.md`.
 
 ## Self-host
 
