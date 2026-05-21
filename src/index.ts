@@ -3,12 +3,18 @@ import { createMcpHandler, type TransportState } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Bash, InMemoryFs, defineCommand, type ExecResult, type InitialFiles } from "just-bash/browser";
 import { z } from "zod";
+import { webIndexHtml } from "./web-ui";
+import { webLandingHtml } from "./web-landing";
+import { webDeviceHtml, webDeviceResultHtml } from "./web-device";
 
 type Env = {
   ROOMS: DurableObjectNamespace<Room>;
   REGISTRY: DurableObjectNamespace<Registry>;
   BASHROOM_ENABLE_FULL_NETWORK?: string;
   INTRACODE_ENABLE_FULL_NETWORK?: string;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  BASHROOM_PUBLIC_URL?: string;
 };
 
 type Scope = "read" | "write" | "checkpoint" | "admin";
@@ -326,6 +332,19 @@ export class Registry extends DurableObject<Env> {
         created_at TEXT NOT NULL
       );
     `);
+    // Idempotent column adds for existing deployments. NULLable so legacy
+    // rows (created before OAuth) coexist with stitched-to-GitHub rows.
+    const userCols = this.ctx.storage.sql
+      .exec<{ name: string }>("SELECT name FROM pragma_table_info('users')")
+      .toArray()
+      .map((r) => r.name);
+    if (!userCols.includes("github_id")) {
+      this.ctx.storage.sql.exec("ALTER TABLE users ADD COLUMN github_id INTEGER");
+      this.ctx.storage.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_github_id_idx ON users(github_id) WHERE github_id IS NOT NULL");
+    }
+    if (!userCols.includes("github_login")) {
+      this.ctx.storage.sql.exec("ALTER TABLE users ADD COLUMN github_login TEXT");
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS user_tokens (
         token_hash TEXT PRIMARY KEY,
@@ -345,6 +364,20 @@ export class Registry extends DurableObject<Env> {
         role TEXT NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (user_id, room)
+      );
+    `);
+    // Device codes for OAuth device flow. Lifecycle: minted by /auth/device/start,
+    // displayed at /device, claimed by /auth/github/callback, polled by CLI.
+    // Single row per code; deleted by background sweep or on first claim.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS device_codes (
+        code_hash TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        claimed_at TEXT,
+        oauth_state TEXT,
+        user_id TEXT,
+        token TEXT
       );
     `);
   }
@@ -418,6 +451,36 @@ export class Registry extends DurableObject<Env> {
       const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
       if (!account.ok) return json(account, 401);
       return json(await this.createAccountRoom(account.userId || "", String(body.room || body.wiki || ""), String(body.actor || defaultActor("cli"))));
+    }
+
+    if (request.method === "POST" && url.pathname === "/device-start") {
+      const ip = String(body.ip || "unknown");
+      const limited = this.checkBucket(`device:start:ip:${ip}`, CREATE_IP_CAPACITY, CREATE_IP_REFILL);
+      if (limited) return json(limited, 429);
+      return json(await this.startDeviceFlow());
+    }
+
+    if (request.method === "POST" && url.pathname === "/device-poll") {
+      return json(await this.pollDeviceCode(String(body.code || "")));
+    }
+
+    if (request.method === "POST" && url.pathname === "/device-bind-state") {
+      // Internal: called by /auth/github to attach OAuth state to a device code.
+      return json(await this.bindDeviceState(String(body.code || ""), String(body.state || "")));
+    }
+
+    if (request.method === "POST" && url.pathname === "/device-lookup-state") {
+      // Internal: called by /auth/github/callback to find device code from OAuth state.
+      return json(await this.lookupDeviceByState(String(body.state || "")));
+    }
+
+    if (request.method === "POST" && url.pathname === "/device-claim-by-state") {
+      // Internal: called by /auth/github/callback after GitHub user is verified.
+      return json(await this.claimDeviceByState(
+        String(body.state || ""),
+        Number(body.github_id || 0),
+        String(body.github_login || ""),
+      ));
     }
 
     return json({ ok: false, error: "not_found" }, 404);
@@ -648,6 +711,171 @@ export class Registry extends DurableObject<Env> {
     );
 
     return { ok: true, user_id: userId, handle: cleanHandle, token };
+  }
+
+  // ─── Device flow ────────────────────────────────────────────────────────
+  // Lifecycle:
+  //   1. CLI calls /device-start → row inserted with code_hash, expires_at
+  //   2. Browser visits /device, posts to /auth/github with the code
+  //   3. /auth/github mints an oauth_state, calls /device-bind-state to attach
+  //      state→code, then 302s to GitHub
+  //   4. /auth/github/callback receives the GitHub code, exchanges for user,
+  //      looks up the device code via /device-lookup-state, calls
+  //      /device-claim to mint a bashroom token + stitch user_id
+  //   5. CLI's /device-poll sees claimed_at set, returns the token, deletes the row
+
+  private async startDeviceFlow(): Promise<Record<string, unknown>> {
+    const now = new Date();
+    const code = randomPairCode();
+    const codeHash = await sha256(code);
+    const expiresAt = new Date(now.getTime() + PAIR_CODE_TTL_MS).toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO device_codes (code_hash, created_at, expires_at) VALUES (?, ?, ?)`,
+      codeHash,
+      now.toISOString(),
+      expiresAt,
+    );
+    return {
+      ok: true,
+      code,
+      verification_url: `/device?code=${encodeURIComponent(code)}`,
+      expires_at: expiresAt,
+      interval: 3,
+    };
+  }
+
+  private async pollDeviceCode(code: string): Promise<Record<string, unknown>> {
+    if (!code) return { ok: false, error: "missing_code" };
+    const codeHash = await sha256(normalizeDeviceCode(code));
+    const row = this.ctx.storage.sql
+      .exec<{ expires_at: string; claimed_at: string | null; user_id: string | null; token: string | null }>(
+        "SELECT expires_at, claimed_at, user_id, token FROM device_codes WHERE code_hash = ?",
+        codeHash,
+      )
+      .toArray()[0];
+    if (!row) return { ok: false, error: "unknown_code" };
+    if (new Date(row.expires_at) < new Date()) {
+      this.ctx.storage.sql.exec("DELETE FROM device_codes WHERE code_hash = ?", codeHash);
+      return { ok: false, error: "expired" };
+    }
+    if (!row.claimed_at || !row.token || !row.user_id) {
+      return { ok: true, status: "pending" };
+    }
+    // Hand the token to the CLI exactly once, then burn the row.
+    const token = row.token;
+    const userId = row.user_id;
+    this.ctx.storage.sql.exec("DELETE FROM device_codes WHERE code_hash = ?", codeHash);
+    const user = this.ctx.storage.sql
+      .exec<{ handle: string }>("SELECT handle FROM users WHERE user_id = ?", userId)
+      .toArray()[0];
+    return { ok: true, status: "approved", token, user_id: userId, handle: user?.handle || "" };
+  }
+
+  private async bindDeviceState(code: string, state: string): Promise<Record<string, unknown>> {
+    if (!code || !state) return { ok: false, error: "missing_fields" };
+    const codeHash = await sha256(normalizeDeviceCode(code));
+    const row = this.ctx.storage.sql
+      .exec<{ expires_at: string }>("SELECT expires_at FROM device_codes WHERE code_hash = ?", codeHash)
+      .toArray()[0];
+    if (!row) return { ok: false, error: "unknown_code" };
+    if (new Date(row.expires_at) < new Date()) return { ok: false, error: "expired" };
+    this.ctx.storage.sql.exec("UPDATE device_codes SET oauth_state = ? WHERE code_hash = ?", state, codeHash);
+    return { ok: true };
+  }
+
+  private async lookupDeviceByState(state: string): Promise<Record<string, unknown>> {
+    if (!state) return { ok: false, error: "missing_state" };
+    const row = this.ctx.storage.sql
+      .exec<{ code_hash: string; expires_at: string }>(
+        "SELECT code_hash, expires_at FROM device_codes WHERE oauth_state = ?",
+        state,
+      )
+      .toArray()[0];
+    if (!row) return { ok: false, error: "unknown_state" };
+    if (new Date(row.expires_at) < new Date()) return { ok: false, error: "expired" };
+    return { ok: true, code_hash: row.code_hash };
+  }
+
+  private async claimDeviceByState(state: string, githubId: number, githubLogin: string): Promise<Record<string, unknown>> {
+    if (!state || !githubId || !githubLogin) return { ok: false, error: "missing_fields" };
+    const row = this.ctx.storage.sql
+      .exec<{ code_hash: string; expires_at: string; claimed_at: string | null }>(
+        "SELECT code_hash, expires_at, claimed_at FROM device_codes WHERE oauth_state = ?",
+        state,
+      )
+      .toArray()[0];
+    if (!row) return { ok: false, error: "unknown_state" };
+    if (new Date(row.expires_at) < new Date()) return { ok: false, error: "expired" };
+    if (row.claimed_at) return { ok: false, error: "already_claimed" };
+    const codeHash = row.code_hash;
+
+    // Stitch GitHub identity to existing or new account.
+    const userId = await this.upsertGithubUser(githubId, githubLogin);
+
+    // Mint a fresh token for this device.
+    const now = new Date().toISOString();
+    const token = randomAccountToken();
+    const tokenHash = await sha256(token);
+    const tokenId = randomId("utok");
+    this.ctx.storage.sql.exec(
+      "INSERT INTO user_tokens (token_hash, token_id, user_id, created_at) VALUES (?, ?, ?, ?)",
+      tokenHash,
+      tokenId,
+      userId,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      "UPDATE device_codes SET claimed_at = ?, user_id = ?, token = ? WHERE code_hash = ?",
+      now,
+      userId,
+      token,
+      codeHash,
+    );
+    return { ok: true, user_id: userId, github_login: githubLogin };
+  }
+
+  // Find-or-create a bashroom account for this GitHub user. Stitches to an
+  // existing pre-OAuth row if handle matches and github_id is unset (one-time
+  // migration for legacy accounts).
+  private async upsertGithubUser(githubId: number, githubLogin: string): Promise<string> {
+    const cleanLogin = sanitizeHandle(githubLogin);
+    // 1. Already linked? Reuse.
+    const linked = this.ctx.storage.sql
+      .exec<{ user_id: string }>("SELECT user_id FROM users WHERE github_id = ?", githubId)
+      .toArray()[0];
+    if (linked) {
+      // Refresh handle in case the GitHub login changed.
+      this.ctx.storage.sql.exec("UPDATE users SET handle = ?, github_login = ? WHERE user_id = ?", cleanLogin, cleanLogin, linked.user_id);
+      return linked.user_id;
+    }
+    // 2. Legacy row claimable? Stitch.
+    const legacy = this.ctx.storage.sql
+      .exec<{ user_id: string }>(
+        "SELECT user_id FROM users WHERE handle = ? AND github_id IS NULL LIMIT 1",
+        cleanLogin,
+      )
+      .toArray()[0];
+    if (legacy) {
+      this.ctx.storage.sql.exec(
+        "UPDATE users SET github_id = ?, github_login = ? WHERE user_id = ?",
+        githubId,
+        cleanLogin,
+        legacy.user_id,
+      );
+      return legacy.user_id;
+    }
+    // 3. Fresh user.
+    const userId = randomId("usr");
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO users (user_id, handle, created_at, github_id, github_login) VALUES (?, ?, ?, ?, ?)",
+      userId,
+      cleanLogin,
+      now,
+      githubId,
+      cleanLogin,
+    );
+    return userId;
   }
 
   private async createAccountRoom(userId: string, wiki: string, actor: string): Promise<Record<string, unknown>> {
@@ -908,11 +1136,119 @@ export default {
       return json(result, result.ok === false ? 400 : 200);
     }
 
-    if (url.pathname === "/" || url.pathname === "/help") return text(httpHelpText());
+    if (url.pathname === "/web" || url.pathname === "/web/") return html(webIndexHtml());
+
+    if (url.pathname === "/web/api/rooms" && request.method === "GET") {
+      return json(await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) }));
+    }
+
+    if (url.pathname === "/web/api/snapshot" && request.method === "GET") {
+      const token = bearerToken(request);
+      const room = sanitizeWiki(url.searchParams.get("room") || "");
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      const account = await registry(env, "/account-rooms", { token, ip: clientIp(request) });
+      const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
+      if (!rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
+      return json({ ok: true, files: await wikiSnapshot(env, room) });
+    }
+
+    // ─── Device-flow OAuth ────────────────────────────────────────────────
+    if (url.pathname === "/auth/device/start" && request.method === "POST") {
+      const start = await registry(env, "/device-start", { ip: clientIp(request) });
+      if (start.ok) {
+        const base = publicBaseUrl(env, request);
+        (start as any).verification_url = `${base}/device?code=${encodeURIComponent(String(start.code))}`;
+      }
+      return json(start);
+    }
+
+    if (url.pathname === "/auth/device/poll" && request.method === "POST") {
+      const input = await readJson(request);
+      return json(await registry(env, "/device-poll", { code: String(input.code || "") }));
+    }
+
+    if (url.pathname === "/device") {
+      const code = url.searchParams.get("code") || "";
+      return html(webDeviceHtml(code));
+    }
+
+    if (url.pathname === "/auth/github") {
+      const code = url.searchParams.get("code") || "";
+      if (!code) return text("Missing device code.", 400);
+      if (!env.GITHUB_CLIENT_ID) return text("GitHub OAuth not configured.", 500);
+      // Mint state, attach to device code so the callback can find its way back.
+      const state = base64url(crypto.getRandomValues(new Uint8Array(18)));
+      const bind = await registry(env, "/device-bind-state", { code, state });
+      if (!bind.ok) return text(`Bind failed: ${bind.error}`, 400);
+      const base = publicBaseUrl(env, request);
+      const ghUrl = new URL("https://github.com/login/oauth/authorize");
+      ghUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+      ghUrl.searchParams.set("redirect_uri", `${base}/auth/github/callback`);
+      ghUrl.searchParams.set("scope", "read:user");
+      ghUrl.searchParams.set("state", state);
+      ghUrl.searchParams.set("allow_signup", "true");
+      return new Response(null, { status: 302, headers: { location: ghUrl.toString() } });
+    }
+
+    if (url.pathname === "/auth/github/callback") {
+      const ghCode = url.searchParams.get("code") || "";
+      const state = url.searchParams.get("state") || "";
+      if (!ghCode || !state) return html(webDeviceResultHtml({ ok: false, message: "Missing OAuth code or state." }), 400);
+      if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) return html(webDeviceResultHtml({ ok: false, message: "GitHub OAuth not configured." }), 500);
+
+      // Find the device code waiting on this state.
+      const lookup = await registry(env, "/device-lookup-state", { state });
+      if (!lookup.ok) return html(webDeviceResultHtml({ ok: false, message: `State not recognized: ${lookup.error}` }), 400);
+
+      // Exchange GitHub OAuth code for an access token.
+      const base = publicBaseUrl(env, request);
+      const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json", "user-agent": "bashroom" },
+        body: JSON.stringify({
+          client_id: env.GITHUB_CLIENT_ID,
+          client_secret: env.GITHUB_CLIENT_SECRET,
+          code: ghCode,
+          redirect_uri: `${base}/auth/github/callback`,
+        }),
+      });
+      const tokenJson = await tokenRes.json().catch(() => ({})) as { access_token?: string; error?: string };
+      if (!tokenJson.access_token) return html(webDeviceResultHtml({ ok: false, message: `GitHub: ${tokenJson.error || "no access token"}` }), 400);
+
+      // Fetch the GitHub user.
+      const userRes = await fetch("https://api.github.com/user", {
+        headers: { authorization: `Bearer ${tokenJson.access_token}`, accept: "application/vnd.github+json", "user-agent": "bashroom" },
+      });
+      const userJson = await userRes.json().catch(() => ({})) as { id?: number; login?: string };
+      if (!userJson.id || !userJson.login) return html(webDeviceResultHtml({ ok: false, message: "Couldn't read GitHub profile." }), 400);
+
+      // Reconstruct the original device code by looking it up via the code_hash we just got back.
+      // The CLI knows its code; we don't need to re-display it. We just need to tell the registry
+      // to claim by state (which it can derive from code_hash). Easier: claim by re-deriving
+      // through state lookup. But our /device-claim takes the plain code, which we don't have here —
+      // only its hash. Refactor: claim-by-state instead.
+      const claim = await registry(env, "/device-claim-by-state", {
+        state,
+        github_id: userJson.id,
+        github_login: userJson.login,
+      });
+      if (!claim.ok) return html(webDeviceResultHtml({ ok: false, message: `Claim failed: ${claim.error}` }), 400);
+
+      return html(webDeviceResultHtml({ ok: true, message: `Signed in as @${userJson.login}. You can close this tab.` }));
+    }
+
+    if (url.pathname === "/") return html(webLandingHtml());
+    if (url.pathname === "/help") return text(httpHelpText());
 
     return json({ ok: false, error: "not_found" }, 404);
   },
 };
+
+function publicBaseUrl(env: Env, request: Request): string {
+  if (env.BASHROOM_PUBLIC_URL) return env.BASHROOM_PUBLIC_URL.replace(/\/$/, "");
+  const url = new URL(request.url);
+  return `${url.protocol}//${url.host}`;
+}
 
 async function runShell(env: Env, headerToken: string, mcpSessionId: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
   const initialMounts = await registry(env, "/mounts", { token: headerToken, mcpSessionId, ip });
@@ -1355,6 +1691,10 @@ function inviteUri(wiki: string, code: string): string {
   return `bashroom://join/${encodeURIComponent(wiki)}?code=${encodeURIComponent(code)}`;
 }
 
+function normalizeDeviceCode(code: string): string {
+  return code.trim().replace(/\s+/g, "").toUpperCase();
+}
+
 function normalizePairCode(invite: string): string {
   const value = invite.trim();
   if (!value.includes("://")) return value.toUpperCase();
@@ -1422,6 +1762,13 @@ function text(value: string, status = 200): Response {
   });
 }
 
+function html(value: string, status = 200): Response {
+  return new Response(value, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
 function roomHelp(): string {
   return `Bashroom commands
 
@@ -1444,8 +1791,8 @@ Durable bash rooms for coding agents.
 MCP endpoint:
 
 \`\`\`bash
-claude mcp add --scope user --transport http bashroom https://intracode.sdan.io/mcp
-codex mcp add bashroom --url https://intracode.sdan.io/mcp
+claude mcp add --scope user --transport http bashroom https://bashroom.sdan.io/mcp
+codex mcp add bashroom --url https://bashroom.sdan.io/mcp
 \`\`\`
 
 The MCP exposes one tool: \`bashroom\`.

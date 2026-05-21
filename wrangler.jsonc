@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "intracode",
+  "name": "bashroom",
   "main": "src/index.ts",
   "compatibility_date": "2026-04-20",
   "compatibility_flags": ["nodejs_compat"],
@@ -26,6 +26,10 @@
       "new_sqlite_classes": ["Registry"]
     }
   ],
+  "vars": {
+    "GITHUB_CLIENT_ID": "Ov23ligO8e72A6E9MGRx",
+    "BASHROOM_PUBLIC_URL": "https://bashroom.sdan.io"
+  },
   "observability": {
     "enabled": true
   }

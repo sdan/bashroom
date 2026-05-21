@@ -6,3 +6,9 @@ node_modules/
 npm-debug.log*
 .ai/
 .convx/
+
+# Web HTML kept private — landing, device pages, and reader.
+# These exist on the deployed worker but are not source-public.
+src/web-landing.ts
+src/web-device.ts
+src/web-ui.ts

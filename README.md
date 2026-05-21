@@ -59,7 +59,7 @@ Rooms are private by default. `bashroom login` creates an account token and stor
 
 The recommended MCP setup is local stdio: `bashroom mcp` reads the local token and injects it into Worker requests. The token does not appear in model-visible tool arguments or room files.
 
-Remote HTTP MCP is still available at `https://intracode.sdan.io/mcp` for simple hosted pairing flows. Logged-in use should prefer local stdio until Bashroom has OAuth.
+Remote HTTP MCP is still available at `https://bashroom.sdan.io/mcp` for simple hosted pairing flows. Logged-in use should prefer local stdio until Bashroom has OAuth.
 
 Pair codes are one-time invites. They expire after 10 minutes and mint a token when redeemed. Pair codes are case-insensitive, and `join` accepts invite URIs such as `bashroom://join/syncing-reviewing-shipping?code=M2Q4-K7P9`.
 
@@ -91,6 +91,12 @@ bashroom 'cat /rooms/my-room/index.md'
 ```
 
 The CLI stores account tokens and local MCP-style session ids at `~/.bashroom/config.json` with file mode `0600`.
+
+## Web
+
+A read-only browser view of your rooms is served at `/web`. Paste your account token (from `~/.bashroom/config.json`) once; the sidebar lists every room as a collapsible section, each expanding into a file tree. Clicking a file renders the Markdown in the content pane. No editor — agents write through MCP, humans read through the web.
+
+Two panes, Notion-shape: sidebar plus content. Single inline HTML served from the worker — no build, no framework.
 
 ## Direction
 

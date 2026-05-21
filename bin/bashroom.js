@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const DEFAULT_URL = "https://intracode.sdan.io";
+const DEFAULT_URL = "https://bashroom.sdan.io";
 const CONFIG_PATH = path.join(os.homedir(), ".bashroom", "config.json");
 
 function usage() {
@@ -16,13 +16,13 @@ Human fallback for Bashroom durable bash rooms.
 Usage:
   bashroom [--url <url>] <bash command>
   bashroom [--url <url>] -- <bash command>
-  bashroom login [handle]
+  bashroom login
   bashroom rooms
   bashroom room create [room] [--actor <actor>]
   bashroom mcp
 
 Examples:
-  bashroom login sdan
+  bashroom login
   bashroom rooms
   bashroom room create suryad
   bashroom 'room create'
@@ -126,16 +126,52 @@ async function api(baseUrl, path, body = {}, token = "") {
 }
 
 async function login(baseUrl, args) {
+  const force = args.includes("--force") || args.includes("-f");
   const existing = account(baseUrl);
-  if (existing?.token) {
-    console.log(`logged in as ${existing.handle || existing.user_id || "user"}`);
+  if (!force && existing?.token) {
+    console.log(`already logged in as ${existing.handle || existing.user_id || "user"}`);
+    console.log("Use `bashroom login --force` to re-authenticate.");
     return;
   }
 
-  const handle = args[0] || os.userInfo().username || "user";
-  const result = await api(baseUrl, "/account/login", { handle });
-  writeAccount(baseUrl, { token: result.token, user_id: result.user_id, handle: result.handle });
-  console.log(`logged in as ${result.handle}`);
+  // 1. Mint a device code.
+  const start = await api(baseUrl, "/auth/device/start", {});
+  const code = String(start.code || "");
+  const url = String(start.verification_url || `${baseUrl}/device?code=${encodeURIComponent(code)}`);
+  const expiresAt = new Date(String(start.expires_at || ""));
+  const interval = Math.max(2, Number(start.interval || 3));
+
+  console.log();
+  console.log(`Open: ${url}`);
+  console.log(`Code: ${code}`);
+  console.log();
+  console.log(`Waiting for authorization (expires ${expiresAt.toLocaleTimeString()})…`);
+
+  // 2. Poll until claimed or expired.
+  while (true) {
+    if (new Date() > expiresAt) {
+      throw new Error("device code expired. Run `bashroom login` again.");
+    }
+    await sleep(interval * 1000);
+    let poll;
+    try { poll = await api(baseUrl, "/auth/device/poll", { code }); }
+    catch (e) {
+      if (e.message === "expired") throw new Error("device code expired. Run `bashroom login` again.");
+      if (e.message === "unknown_code") throw new Error("device code not recognized.");
+      throw e;
+    }
+    if (poll.status === "approved") {
+      writeAccount(baseUrl, { token: poll.token, user_id: poll.user_id, handle: poll.handle });
+      console.log();
+      console.log(`Signed in as @${poll.handle}`);
+      console.log(`Token saved to ${CONFIG_PATH}`);
+      return;
+    }
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function listRooms(baseUrl) {
