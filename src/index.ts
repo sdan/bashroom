@@ -191,11 +191,45 @@ export class Room extends DurableObject<Env> {
 
   private seed(wiki: string, actor: string): Record<string, unknown> {
     const now = new Date().toISOString();
+    const today = now.slice(0, 10);
+
+    // Default seed shapes how agents use the room. Per Anthropic + Lance
+    // Martin context-engineering guidance: keep AGENTS.md terse and
+    // rule-based (long convention files get ignored), and ship a directory
+    // pattern that demonstrates folders so agents inherit it.
     const files: Record<string, string> = {
-      "README.md": `# ${wiki}\n\nThis is a Bashroom room. Agents maintain these files through durable bash.\n`,
-      "AGENTS.md": `# Bashroom Room\n\nUse Markdown files as shared state. Keep index.md current. Append important chronological updates to log.md.\n`,
-      "index.md": `# Index\n\n- README.md — room overview\n- log.md — chronological updates\n`,
-      "log.md": `# Log\n\n## [${now.slice(0, 10)}] create | ${wiki}\n\nCreated by ${actor}.\n`,
+      "README.md":
+        `# ${wiki}\n\nA Bashroom room. Multiple agents read and write the files here through ` +
+        `durable bash. Edit this README to describe what this specific room is for.\n`,
+      "AGENTS.md":
+        `# Bashroom room conventions\n\n` +
+        `Shared Markdown filesystem. Multiple agents read and write here.\n` +
+        `Reorganize freely — rename, split, merge, or delete files when the\n` +
+        `structure no longer fits. Every change is in \`room history\`, so\n` +
+        `nothing is ever truly lost.\n\n` +
+        `## Default shape\n\n` +
+        `- Dated entries → \`log/YYYY-MM-DD.md\` (one file per day, append \`## HH:MM topic\` sections)\n` +
+        `- Standalone topics → \`notes/<topic>.md\` (one file per subject)\n` +
+        `- Top-level \`index.md\` is the table of contents — keep it current when files change\n\n` +
+        `## Rules\n\n` +
+        `- IMPORTANT: append to log files (\`>>\`), don't overwrite (\`>\`) — preserves chronology\n` +
+        `- IMPORTANT: update \`index.md\` whenever the file tree changes\n` +
+        `- Markdown only. No binaries.\n` +
+        `- If a file gets long, split it into a folder.\n`,
+      "index.md":
+        `# Index\n\n` +
+        `- [README.md](README.md) — what this room is for\n` +
+        `- [AGENTS.md](AGENTS.md) — conventions for agents working here\n` +
+        `- [log/](log/) — dated entries, newest day at top of folder\n` +
+        `- [notes/](notes/) — topical notes\n`,
+      [`log/${today}.md`]:
+        `# ${today}\n\n` +
+        `## room created\n\n` +
+        `Created by ${actor}. Append further entries under \`## HH:MM topic\` headings.\n`,
+      "notes/README.md":
+        `# notes/\n\n` +
+        `One Markdown file per topic. Filename = topic, kebab-case (e.g. \`auth-flow.md\`).\n` +
+        `Delete this README when the folder has real content.\n`,
     };
 
     for (const [path, content] of Object.entries(files)) {
@@ -1197,6 +1231,15 @@ async function roomCommand(
       return cmdOk(output ? `${output}\n` : "No history.\n");
     }
 
+    if (subcommand === "delete") {
+      const wiki = resolveWikiArg(rest[0], mounts);
+      if (!wiki.ok) return cmdErr(wiki.error);
+      const result = await registry(env, "/delete", { wiki: wiki.value, token: headerToken, ip });
+      if (result.ok === false) return cmdErr(String(result.error || "delete_failed"));
+      await deleteWikiFiles(env, wiki.value);
+      return cmdOk(`deleted ${wiki.value}\n`);
+    }
+
     return cmdErr(`unknown room subcommand: ${subcommand}\n\n${roomHelp()}`);
   } catch (error) {
     return cmdErr(`${error instanceof Error ? error.message : String(error)}\n`);
@@ -1344,6 +1387,10 @@ async function wikiSnapshot(env: Env, wiki: string): Promise<WikiFile[]> {
 
 async function seedWiki(env: Env, wiki: string, actor: string): Promise<void> {
   await roomControl(env, wiki, "/seed", { wiki, actor });
+}
+
+async function deleteWikiFiles(env: Env, wiki: string): Promise<void> {
+  await roomControl(env, wiki, "/delete");
 }
 
 async function applyWikiChanges(env: Env, wiki: string, actor: string, changes: FileChange[], command: string): Promise<Record<string, unknown>> {
@@ -1600,6 +1647,7 @@ room pair [room]
 room mounts
 room who [room]
 room history [room] [limit]
+room delete <room>
 
 Room files are mounted at /rooms/<room>. Use normal bash to read and write Markdown files.
 `;
