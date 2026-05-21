@@ -280,18 +280,13 @@ export class Registry extends DurableObject<Env> {
         created_at TEXT NOT NULL
       );
     `);
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS wiki_tokens (
-        token_hash TEXT PRIMARY KEY,
-        token_id TEXT NOT NULL,
-        room TEXT NOT NULL,
-        actor TEXT NOT NULL,
-        scopes TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        last_seen_at TEXT,
-        revoked_at TEXT
-      );
-    `);
+    // Dead grant tables from the pre-account era. Drop on cold start.
+    // wiki_tokens: per-room access tokens (replaced by user_rooms membership).
+    // wiki_session_tokens: per-MCP-session room grants (replaced by token → user → membership).
+    this.ctx.storage.sql.exec("DROP TABLE IF EXISTS wiki_tokens");
+    this.ctx.storage.sql.exec("DROP TABLE IF EXISTS wiki_session_tokens");
+    // Pair codes survive — short-lived invites that bestow membership on
+    // redemption by an authenticated user.
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS wiki_pair_codes (
         code_hash TEXT PRIMARY KEY,
@@ -300,15 +295,6 @@ export class Registry extends DurableObject<Env> {
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         used_at TEXT
-      );
-    `);
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS wiki_session_tokens (
-        session_hash TEXT NOT NULL,
-        room TEXT NOT NULL,
-        token_hash TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (session_hash, room)
       );
     `);
     this.ctx.storage.sql.exec(`
@@ -395,50 +381,51 @@ export class Registry extends DurableObject<Env> {
       return json({ ok: true });
     }
 
+    // Every room operation below requires an account token. No anonymous paths.
     if (request.method === "POST" && url.pathname === "/create") {
       const ip = String(body.ip || "unknown");
       const limited = this.checkBucket(`create:ip:${ip}`, CREATE_IP_CAPACITY, CREATE_IP_REFILL) || this.checkBucket("create:global", CREATE_GLOBAL_CAPACITY, CREATE_GLOBAL_REFILL);
       if (limited) return json(limited, 429);
-      return json(await this.createWiki(String(body.wiki || ""), String(body.actor || defaultActor("actor")), bearerFromUnknown(body.mcpSessionId)));
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), ip);
+      if (!account.ok) return json(account, 401);
+      return json(await this.createWiki(account.userId || "", account.handle || "user", String(body.wiki || ""), String(body.actor || "")));
     }
 
     if (request.method === "POST" && url.pathname === "/join") {
       const ip = String(body.ip || "unknown");
       const limited = this.checkBucket(`join:ip:${ip}`, JOIN_IP_CAPACITY, JOIN_IP_REFILL) || this.checkBucket("join:global", JOIN_GLOBAL_CAPACITY, JOIN_GLOBAL_REFILL);
       if (limited) return json(limited, 429);
-      return json(await this.join(String(body.invite || body.code || ""), String(body.actor || defaultActor("actor")), bearerFromUnknown(body.mcpSessionId)));
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), ip);
+      if (!account.ok) return json(account, 401);
+      return json(await this.join(account.userId || "", account.handle || "user", String(body.invite || body.code || ""), String(body.actor || "")));
     }
 
     if (request.method === "POST" && url.pathname === "/pair") {
       const wiki = String(body.wiki || body.room || "");
-      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
+      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), "admin", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
       return json(await this.createPairCode(wiki, parseScopes(body.scopes, ["read", "write", "checkpoint"])));
     }
 
     if (request.method === "POST" && url.pathname === "/mounts") {
-      return json({ ok: true, mounts: await this.mounts(bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), String(body.ip || "unknown")) });
+      const ip = String(body.ip || "unknown");
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), ip);
+      if (!account.ok) return json({ ok: true, mounts: [] }); // no account = no mounts (don't error)
+      return json({ ok: true, mounts: this.mounts(account.userId || "") });
     }
 
     if (request.method === "POST" && url.pathname === "/actors") {
       const wiki = String(body.wiki || body.room || "");
-      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "read", String(body.ip || "unknown"));
+      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), "read", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
       return json({ ok: true, actors: this.actors(wiki) });
     }
 
     if (request.method === "POST" && url.pathname === "/delete") {
       const wiki = String(body.wiki || body.room || "");
-      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), bearerFromUnknown(body.mcpSessionId), "admin", String(body.ip || "unknown"));
+      const auth = await this.authorize(wiki, bearerFromUnknown(body.token), "admin", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
       return json(this.deleteWiki(wiki));
-    }
-
-    if (request.method === "POST" && url.pathname === "/account-create") {
-      const ip = String(body.ip || "unknown");
-      const limited = this.checkBucket(`account:create:ip:${ip}`, CREATE_IP_CAPACITY, CREATE_IP_REFILL);
-      if (limited) return json(limited, 429);
-      return json(await this.createAccount(String(body.handle || "user")));
     }
 
     if (request.method === "POST" && url.pathname === "/account-rooms") {
@@ -448,9 +435,10 @@ export class Registry extends DurableObject<Env> {
     }
 
     if (request.method === "POST" && url.pathname === "/account-room-create") {
+      // Kept as alias for /create. CLI calls this from `bashroom room create`.
       const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
       if (!account.ok) return json(account, 401);
-      return json(await this.createAccountRoom(account.userId || "", String(body.room || body.wiki || ""), String(body.actor || defaultActor("cli"))));
+      return json(await this.createWiki(account.userId || "", account.handle || "user", String(body.room || body.wiki || ""), String(body.actor || "")));
     }
 
     if (request.method === "POST" && url.pathname === "/device-start") {
@@ -486,37 +474,36 @@ export class Registry extends DurableObject<Env> {
     return json({ ok: false, error: "not_found" }, 404);
   }
 
-  private async createWiki(wiki: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
+  // Create a room owned by the calling user. Inserts into wikis (the room
+  // exists) and user_rooms (the user owns it). Returns the mount info — no
+  // tokens are minted; access is via the user's account token.
+  private async createWiki(userId: string, handle: string, wiki: string, actor: string): Promise<Record<string, unknown>> {
     const cleanWiki = wiki.trim() ? sanitizeWiki(wiki) : this.generateWikiSlug();
-    const cleanActor = sanitizeActor(actor);
+    const cleanActor = sanitizeActor(actor || handle);
     const existing = this.ctx.storage.sql.exec("SELECT room FROM wikis WHERE room = ?", cleanWiki).toArray()[0];
     if (existing) return { ok: false, error: "room_exists" };
 
     const now = new Date().toISOString();
-    const token = randomToken();
-    const tokenHash = await sha256(token);
-    const tokenId = randomId("tok");
     const scopes: Scope[] = ["read", "write", "checkpoint", "admin"];
-
     this.ctx.storage.sql.exec("INSERT INTO wikis (room, created_at) VALUES (?, ?)", cleanWiki, now);
     this.ctx.storage.sql.exec(
-      `INSERT INTO wiki_tokens (token_hash, token_id, room, actor, scopes, created_at)
+      `INSERT INTO user_rooms (user_id, room, actor, scopes, role, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      tokenHash,
-      tokenId,
+      userId,
       cleanWiki,
       cleanActor,
       scopes.join(","),
+      "owner",
       now,
     );
-    await this.rememberSessionToken(mcpSessionId, cleanWiki, tokenHash, now);
-
-    return { ok: true, wiki: cleanWiki, token, actor: cleanActor, scopes };
+    return { ok: true, wiki: cleanWiki, actor: cleanActor, scopes, role: "owner" };
   }
 
-  private async join(invite: string, actor: string, mcpSessionId = ""): Promise<Record<string, unknown>> {
+  // Redeem a pair code as the calling user. Inserts into user_rooms with the
+  // scopes baked into the code. Marks the code used.
+  private async join(userId: string, handle: string, invite: string, actor: string): Promise<Record<string, unknown>> {
     const cleanCode = normalizePairCode(invite);
-    const cleanActor = sanitizeActor(actor);
+    const cleanActor = sanitizeActor(actor || handle);
     const codeHash = await sha256(cleanCode);
     const row = this.ctx.storage.sql
       .exec<{ room: string; scopes: string; expires_at: string; used_at: string | null }>(
@@ -529,24 +516,21 @@ export class Registry extends DurableObject<Env> {
     if (Date.parse(row.expires_at) < Date.now()) return { ok: false, error: "expired_code" };
 
     const now = new Date().toISOString();
-    const token = randomToken();
-    const tokenHash = await sha256(token);
-    const tokenId = randomId("tok");
-
+    const scopes = row.scopes.split(",") as Scope[];
     this.ctx.storage.sql.exec("UPDATE wiki_pair_codes SET used_at = ? WHERE code_hash = ?", now, codeHash);
+    // Upsert — re-joining a room you're already in just refreshes the actor.
     this.ctx.storage.sql.exec(
-      `INSERT INTO wiki_tokens (token_hash, token_id, room, actor, scopes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      tokenHash,
-      tokenId,
+      `INSERT INTO user_rooms (user_id, room, actor, scopes, role, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, room) DO UPDATE SET actor = excluded.actor, scopes = excluded.scopes`,
+      userId,
       row.room,
       cleanActor,
       row.scopes,
+      "member",
       now,
     );
-    await this.rememberSessionToken(mcpSessionId, row.room, tokenHash, now);
-
-    return { ok: true, wiki: row.room, token, actor: cleanActor, scopes: row.scopes.split(",") };
+    return { ok: true, wiki: row.room, actor: cleanActor, scopes, role: "member" };
   }
 
   private async createPairCode(wiki: string, scopes: Scope[]): Promise<Record<string, unknown>> {
@@ -568,149 +552,44 @@ export class Registry extends DurableObject<Env> {
     return { ok: true, wiki: cleanWiki, code, invite: inviteUri(cleanWiki, code), expires_at: expiresAt, scopes };
   }
 
-  private async mounts(token: string, mcpSessionId: string, ip: string): Promise<Mount[]> {
-    const byWiki = new Map<string, Mount>();
-
-    if (token) {
-      const tokenHash = await sha256(token);
-      const row = this.ctx.storage.sql
-        .exec<{ room: string }>("SELECT room FROM wiki_tokens WHERE token_hash = ? AND revoked_at IS NULL", tokenHash)
-        .toArray()[0];
-      if (row) {
-        const auth = this.verifyTokenHash(row.room, tokenHash, "read", ip);
-        if (auth.ok && auth.wiki && auth.actor && auth.scopes) byWiki.set(auth.wiki, { wiki: auth.wiki, actor: auth.actor, scopes: auth.scopes });
-      }
-
-      const account = this.verifyAccountTokenHash(tokenHash, ip);
-      if (account.ok && account.userId) {
-        for (const row of this.accountRooms(account.userId)) {
-          byWiki.set(row.room, { wiki: row.room, actor: row.actor, scopes: row.scopes });
-        }
-      }
-    }
-
-    if (mcpSessionId) {
-      const rows = this.ctx.storage.sql
-        .exec<{ room: string; token_hash: string }>(
-          `SELECT st.room, st.token_hash
-           FROM wiki_session_tokens st
-           JOIN wiki_tokens t ON t.token_hash = st.token_hash
-           WHERE st.session_hash = ? AND t.revoked_at IS NULL
-           ORDER BY st.room ASC`,
-          await sha256(mcpSessionId),
-        )
-        .toArray();
-
-      for (const row of rows) {
-        const auth = this.verifyTokenHash(row.room, row.token_hash, "read", ip);
-        if (auth.ok && auth.wiki && auth.actor && auth.scopes) byWiki.set(auth.wiki, { wiki: auth.wiki, actor: auth.actor, scopes: auth.scopes });
-      }
-    }
-
-    return [...byWiki.values()].sort((left, right) => mountPath(left.wiki).localeCompare(mountPath(right.wiki)));
+  // mounts(userId) = the rooms this user is a member of. Single lookup.
+  private mounts(userId: string): Mount[] {
+    if (!userId) return [];
+    return this.accountRooms(userId)
+      .map((row) => ({ wiki: row.room, actor: row.actor, scopes: row.scopes }))
+      .sort((left, right) => mountPath(left.wiki).localeCompare(mountPath(right.wiki)));
   }
 
-  private async authorize(wiki: string, token: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
-    if (token) {
-      const roomAuth = await this.verify(sanitizeWiki(wiki), token, scope, ip);
-      if (roomAuth.ok || roomAuth.error !== "invalid_token") return roomAuth;
-      return this.verifyAccountRoom(sanitizeWiki(wiki), token, scope, ip);
-    }
-    if (mcpSessionId) return this.verifySession(sanitizeWiki(wiki), mcpSessionId, scope, ip);
-    return { ok: false, error: "missing_token" };
-  }
+  // Single authorization path: bearer token → user → membership → scope.
+  // No fallbacks, no aggregation. If the user isn't a member, they don't
+  // have access — full stop.
+  private async authorize(wiki: string, token: string, scope: Scope, ip: string): Promise<AuthResult> {
+    const cleanWiki = sanitizeWiki(wiki);
+    const account = await this.verifyAccount(token, ip);
+    if (!account.ok || !account.userId) return { ok: false, error: account.error || "invalid_token" };
 
-  private async verify(wiki: string, token: string, scope: Scope, ip: string): Promise<AuthResult> {
-    if (!token) return { ok: false, error: "missing_token" };
-    return this.verifyTokenHash(wiki, await sha256(token), scope, ip);
-  }
-
-  private async verifySession(wiki: string, mcpSessionId: string, scope: Scope, ip: string): Promise<AuthResult> {
-    const row = this.ctx.storage.sql
-      .exec<{ token_hash: string }>(
-        `SELECT token_hash
-         FROM wiki_session_tokens
-         WHERE session_hash = ? AND room = ?`,
-        await sha256(mcpSessionId),
-        wiki,
-      )
-      .toArray()[0];
-    if (!row) return { ok: false, error: "missing_session_token" };
-    return this.verifyTokenHash(wiki, row.token_hash, scope, ip);
-  }
-
-  private verifyTokenHash(wiki: string, tokenHash: string, scope: Scope, ip: string): AuthResult {
-    const ipLimited = this.checkBucket(`verify:ip:${ip}`, VERIFY_IP_CAPACITY, VERIFY_IP_REFILL);
-    if (ipLimited) return ipLimited;
-
-    const globalLimited = this.checkBucket("ops:global", GLOBAL_OPS_CAPACITY, GLOBAL_OPS_REFILL);
-    if (globalLimited) return globalLimited;
-
-    const tokenLimited = this.checkBucket(`ops:token:${tokenHash}`, OPS_TOKEN_CAPACITY, OPS_TOKEN_REFILL);
-    if (tokenLimited) return tokenLimited;
-
+    // Per-token write/op rate limits — bucket key is the user id since
+    // the token already maps 1:1 to a user. Keeps the limiter behavior
+    // we had on the old verifyTokenHash path.
+    const opsLimited = this.checkBucket(`ops:user:${account.userId}`, OPS_TOKEN_CAPACITY, OPS_TOKEN_REFILL);
+    if (opsLimited) return opsLimited;
     if (scope === "write" || scope === "checkpoint") {
-      const writeLimited = this.checkBucket(`write:token:${tokenHash}`, WRITE_TOKEN_CAPACITY, WRITE_TOKEN_REFILL);
+      const writeLimited = this.checkBucket(`write:user:${account.userId}`, WRITE_TOKEN_CAPACITY, WRITE_TOKEN_REFILL);
       if (writeLimited) return writeLimited;
     }
 
     const row = this.ctx.storage.sql
-      .exec<{ token_id: string; room: string; actor: string; scopes: string; last_seen_at: string | null; revoked_at: string | null }>(
-        `SELECT token_id, room, actor, scopes, last_seen_at, revoked_at
-         FROM wiki_tokens
-         WHERE token_hash = ?`,
-        tokenHash,
+      .exec<{ actor: string; scopes: string }>(
+        "SELECT actor, scopes FROM user_rooms WHERE user_id = ? AND room = ?",
+        account.userId,
+        cleanWiki,
       )
       .toArray()[0];
-
-    if (!row || row.revoked_at) return { ok: false, error: "invalid_token" };
-    if (row.room !== wiki) return { ok: false, error: "wrong_room" };
+    if (!row) return { ok: false, error: "wrong_room" };
 
     const scopes = row.scopes.split(",") as Scope[];
     if (!hasScope(scopes, scope)) return { ok: false, error: "insufficient_scope" };
-
-    const now = Date.now();
-    if (!row.last_seen_at || now - Date.parse(row.last_seen_at) > LAST_SEEN_WRITE_INTERVAL_MS) {
-      this.ctx.storage.sql.exec("UPDATE wiki_tokens SET last_seen_at = ? WHERE token_hash = ?", new Date(now).toISOString(), tokenHash);
-    }
-
-    return { ok: true, wiki: row.room, actor: row.actor, scopes, tokenId: row.token_id };
-  }
-
-  private async rememberSessionToken(mcpSessionId: string, wiki: string, tokenHash: string, createdAt: string): Promise<void> {
-    if (!mcpSessionId) return;
-    this.ctx.storage.sql.exec(
-      `INSERT INTO wiki_session_tokens (session_hash, room, token_hash, created_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(session_hash, room) DO UPDATE SET
-         token_hash = excluded.token_hash,
-         created_at = excluded.created_at`,
-      await sha256(mcpSessionId),
-      wiki,
-      tokenHash,
-      createdAt,
-    );
-  }
-
-  private async createAccount(handle: string): Promise<Record<string, unknown>> {
-    const now = new Date().toISOString();
-    const userId = randomId("usr");
-    const token = randomAccountToken();
-    const tokenHash = await sha256(token);
-    const tokenId = randomId("utok");
-    const cleanHandle = sanitizeHandle(handle);
-
-    this.ctx.storage.sql.exec("INSERT INTO users (user_id, handle, created_at) VALUES (?, ?, ?)", userId, cleanHandle, now);
-    this.ctx.storage.sql.exec(
-      `INSERT INTO user_tokens (token_hash, token_id, user_id, created_at)
-       VALUES (?, ?, ?, ?)`,
-      tokenHash,
-      tokenId,
-      userId,
-      now,
-    );
-
-    return { ok: true, user_id: userId, handle: cleanHandle, token };
+    return { ok: true, wiki: cleanWiki, actor: row.actor, scopes, tokenId: account.userId };
   }
 
   // ─── Device flow ────────────────────────────────────────────────────────
@@ -878,29 +757,6 @@ export class Registry extends DurableObject<Env> {
     return userId;
   }
 
-  private async createAccountRoom(userId: string, wiki: string, actor: string): Promise<Record<string, unknown>> {
-    const cleanWiki = wiki.trim() ? sanitizeWiki(wiki) : this.generateWikiSlug();
-    const cleanActor = sanitizeActor(actor);
-    const existing = this.ctx.storage.sql.exec("SELECT room FROM wikis WHERE room = ?", cleanWiki).toArray()[0];
-    if (existing) return { ok: false, error: "room_exists" };
-
-    const now = new Date().toISOString();
-    const scopes: Scope[] = ["read", "write", "checkpoint", "admin"];
-    this.ctx.storage.sql.exec("INSERT INTO wikis (room, created_at) VALUES (?, ?)", cleanWiki, now);
-    this.ctx.storage.sql.exec(
-      `INSERT INTO user_rooms (user_id, room, actor, scopes, role, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      userId,
-      cleanWiki,
-      cleanActor,
-      scopes.join(","),
-      "owner",
-      now,
-    );
-
-    return { ok: true, wiki: cleanWiki, actor: cleanActor, scopes, role: "owner" };
-  }
-
   private async verifyAccount(token: string, ip: string): Promise<AccountAuth> {
     if (!token) return { ok: false, error: "missing_token" };
     return this.verifyAccountTokenHash(await sha256(token), ip);
@@ -936,26 +792,6 @@ export class Registry extends DurableObject<Env> {
     return { ok: true, userId: row.user_id, handle: row.handle };
   }
 
-  private async verifyAccountRoom(wiki: string, token: string, scope: Scope, ip: string): Promise<AuthResult> {
-    const account = await this.verifyAccount(token, ip);
-    if (!account.ok || !account.userId) return { ok: false, error: account.error || "invalid_token" };
-
-    const row = this.ctx.storage.sql
-      .exec<{ room: string; actor: string; scopes: string }>(
-        `SELECT room, actor, scopes
-         FROM user_rooms
-         WHERE user_id = ? AND room = ?`,
-        account.userId,
-        wiki,
-      )
-      .toArray()[0];
-    if (!row) return { ok: false, error: "wrong_room" };
-
-    const scopes = row.scopes.split(",") as Scope[];
-    if (!hasScope(scopes, scope)) return { ok: false, error: "insufficient_scope" };
-    return { ok: true, wiki: row.room, actor: row.actor, scopes, tokenId: account.userId };
-  }
-
   private accountRooms(userId: string): Array<{ room: string; actor: string; scopes: Scope[]; role: string; created_at: string }> {
     return this.ctx.storage.sql
       .exec<{ room: string; actor: string; scopes: string; role: string; created_at: string }>(
@@ -977,20 +813,7 @@ export class Registry extends DurableObject<Env> {
 
   private actors(wiki: string): string[] {
     const cleanWiki = sanitizeWiki(wiki);
-    const actors = new Set<string>();
-    for (const row of this.ctx.storage.sql
-      .exec<{ actor: string }>(
-        `SELECT actor
-         FROM wiki_tokens
-         WHERE room = ? AND revoked_at IS NULL
-         GROUP BY actor
-         ORDER BY MIN(created_at) ASC`,
-        cleanWiki,
-      )
-      .toArray()) {
-      actors.add(row.actor);
-    }
-    for (const row of this.ctx.storage.sql
+    const rows = this.ctx.storage.sql
       .exec<{ actor: string }>(
         `SELECT actor
          FROM user_rooms
@@ -999,19 +822,16 @@ export class Registry extends DurableObject<Env> {
          ORDER BY MIN(created_at) ASC`,
         cleanWiki,
       )
-      .toArray()) {
-      actors.add(row.actor);
-    }
-    return [...actors];
+      .toArray();
+    return rows.map((row) => row.actor);
   }
 
   private deleteWiki(wiki: string): Record<string, unknown> {
     const cleanWiki = sanitizeWiki(wiki);
     const now = new Date().toISOString();
     this.ctx.storage.sql.exec("DELETE FROM wikis WHERE room = ?", cleanWiki);
-    this.ctx.storage.sql.exec("UPDATE wiki_tokens SET revoked_at = ? WHERE room = ? AND revoked_at IS NULL", now, cleanWiki);
+    this.ctx.storage.sql.exec("DELETE FROM user_rooms WHERE room = ?", cleanWiki);
     this.ctx.storage.sql.exec("UPDATE wiki_pair_codes SET used_at = ? WHERE room = ? AND used_at IS NULL", now, cleanWiki);
-    this.ctx.storage.sql.exec("DELETE FROM wiki_session_tokens WHERE room = ?", cleanWiki);
     return { ok: true, wiki: cleanWiki };
   }
 
@@ -1111,11 +931,6 @@ export default {
       const input = await readJson(request);
       const result = await runShell(env, bearerToken(request), mcpSessionId(request), clientIp(request), String(input.command || ""), String(input.stdin || ""));
       return json(result, result.exitCode === 0 ? 200 : 400);
-    }
-
-    if (url.pathname === "/account/login" && request.method === "POST") {
-      const input = await readJson(request);
-      return json(await registry(env, "/account-create", { handle: input.handle || "user", ip: clientIp(request) }));
     }
 
     if (url.pathname === "/account/rooms" && request.method === "POST") {
@@ -1251,7 +1066,7 @@ function publicBaseUrl(env: Env, request: Request): string {
 }
 
 async function runShell(env: Env, headerToken: string, mcpSessionId: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
-  const initialMounts = await registry(env, "/mounts", { token: headerToken, mcpSessionId, ip });
+  const initialMounts = await registry(env, "/mounts", { token: headerToken, ip });
   const mounts = normalizeMounts(initialMounts.mounts);
   const before = new Map<string, Map<string, string>>();
   const fs = new InMemoryFs(initialShellFiles(mounts));
@@ -1329,7 +1144,7 @@ async function roomCommand(
 
     if (subcommand === "create") {
       const parsed = parseCommandFlags(rest);
-      const result = await registry(env, "/create", { wiki: parsed.positionals[0] || "", actor: parsed.actor || defaultActor("mcp"), mcpSessionId, ip });
+      const result = await registry(env, "/create", { wiki: parsed.positionals[0] || "", actor: parsed.actor || "", token: headerToken, ip });
       if (result.ok === false) return cmdErr(String(result.error || "create_failed"));
       const mount = resultMount(result);
       await seedWiki(env, mount.wiki, mount.actor);
@@ -1341,7 +1156,7 @@ async function roomCommand(
       const parsed = parseCommandFlags(rest);
       const invite = parsed.positionals[0];
       if (!invite) return cmdErr("usage: room join <invite> [--actor <actor>]\n");
-      const result = await registry(env, "/join", { invite, actor: parsed.actor || defaultActor("mcp"), mcpSessionId, ip });
+      const result = await registry(env, "/join", { invite, actor: parsed.actor || "", token: headerToken, ip });
       if (result.ok === false) return cmdErr(String(result.error || "join_failed"));
       const mount = resultMount(result);
       await addMount(mount);
@@ -1351,7 +1166,7 @@ async function roomCommand(
     if (subcommand === "pair") {
       const wiki = resolveWikiArg(rest[0], mounts);
       if (!wiki.ok) return cmdErr(wiki.error);
-      const result = await registry(env, "/pair", { wiki: wiki.value, token: headerToken, mcpSessionId, ip });
+      const result = await registry(env, "/pair", { wiki: wiki.value, token: headerToken, ip });
       if (result.ok === false) return cmdErr(String(result.error || "pair_failed"));
       return cmdOk(`${result.invite}\ncode ${result.code}\nexpires ${result.expires_at}\n`);
     }
@@ -1359,7 +1174,7 @@ async function roomCommand(
     if (subcommand === "who") {
       const wiki = resolveWikiArg(rest[0], mounts);
       if (!wiki.ok) return cmdErr(wiki.error);
-      const result = await registry(env, "/actors", { wiki: wiki.value, token: headerToken, mcpSessionId, ip });
+      const result = await registry(env, "/actors", { wiki: wiki.value, token: headerToken, ip });
       if (result.ok === false) return cmdErr(String(result.error || "who_failed"));
       return cmdOk(`${(Array.isArray(result.actors) ? result.actors : []).join("\n")}\n`);
     }
