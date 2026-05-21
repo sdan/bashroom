@@ -954,7 +954,14 @@ export default {
     if (url.pathname === "/web" || url.pathname === "/web/") return html(webIndexHtml());
 
     if (url.pathname === "/web/api/rooms" && request.method === "GET") {
-      return json(await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) }));
+      // Pass ?active=ROOM to also fetch that room's snapshot in the same
+      // response — saves a round-trip on initial page load.
+      const account = await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) });
+      const requested = sanitizeWiki(url.searchParams.get("active") || "");
+      const memberRooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
+      const activeRoom = requested && memberRooms.some((row) => row.room === requested) ? requested : "";
+      const snapshot = activeRoom ? await wikiSnapshot(env, activeRoom) : null;
+      return json({ ...account, active: activeRoom || null, snapshot });
     }
 
     if (url.pathname === "/web/api/snapshot" && request.method === "GET") {
