@@ -951,7 +951,23 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
+    try {
+      return await handleRequest(request, env, ctx);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "internal_error";
+      // sanitize* helpers throw plain Errors for malformed user input.
+      // Map those to 400 so a stale browser state can't cause a 1101.
+      if (VALIDATION_ERRORS.has(message)) return json({ ok: false, error: message }, 400);
+      console.error("worker exception:", error);
+      return json({ ok: false, error: "internal_error" }, 500);
+    }
+  },
+};
+
+const VALIDATION_ERRORS = new Set(["invalid room", "invalid file path"]);
+
+async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const url = new URL(request.url);
 
     if (url.pathname === "/mcp") {
       const token = bearerToken(request);
@@ -991,7 +1007,7 @@ export default {
       // Pass ?active=ROOM to also fetch that room's snapshot in the same
       // response — saves a round-trip on initial page load.
       const account = await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) });
-      const requested = sanitizeWiki(url.searchParams.get("active") || "");
+      const requested = parseOptionalWiki(url.searchParams.get("active"));
       const memberRooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
       const activeRoom = requested && memberRooms.some((row) => row.room === requested) ? requested : "";
       const snapshot = activeRoom ? await wikiSnapshot(env, activeRoom) : null;
@@ -1000,7 +1016,7 @@ export default {
 
     if (url.pathname === "/web/api/snapshot" && request.method === "GET") {
       const token = bearerToken(request);
-      const room = sanitizeWiki(url.searchParams.get("room") || "");
+      const room = parseOptionalWiki(url.searchParams.get("room"));
       if (!room) return json({ ok: false, error: "room_required" }, 400);
       const account = await registry(env, "/account-rooms", { token, ip: clientIp(request) });
       const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
@@ -1097,8 +1113,7 @@ export default {
     if (url.pathname === "/help") return text(httpHelpText());
 
     return json({ ok: false, error: "not_found" }, 404);
-  },
-};
+}
 
 function publicBaseUrl(env: Env, request: Request): string {
   if (env.BASHROOM_PUBLIC_URL) return env.BASHROOM_PUBLIC_URL.replace(/\/$/, "");
@@ -1489,6 +1504,15 @@ function sanitizeWiki(wiki: string): string {
   if (!/^[a-zA-Z0-9._/-]{1,160}$/.test(value)) throw new Error("invalid room");
   if (value.split("/").some((segment) => !segment || segment === "." || segment === "..")) throw new Error("invalid room");
   return value;
+}
+
+// Empty/missing input is legitimate (e.g. an optional ?room= query param).
+// Malformed non-empty input is a client error and throws — caught at the
+// fetch boundary and returned as 400.
+function parseOptionalWiki(raw: string | null | undefined): string {
+  const value = (raw ?? "").trim();
+  if (!value) return "";
+  return sanitizeWiki(value);
 }
 
 function sanitizeFilePath(path: string): string {
