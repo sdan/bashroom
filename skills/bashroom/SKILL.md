@@ -1,77 +1,88 @@
 ---
 name: bashroom
-description: Use when agents need to share durable context through Bashroom — reading or writing Markdown files in mounted rooms backed by Cloudflare R2.
+description: Per-user Linux shell with a durable shared Markdown filesystem at /rooms backed by Cloudflare R2. Use when the task needs notes that persist across agent sessions, when handing off work between Claude / Codex / Cursor, when keeping a project scratch wiki, when other agents may continue this work, or when the user mentions "bashroom", "room", "shared notes", or "agent handoff".
 ---
 
 # Bashroom
 
-Bashroom is a per-user Linux shell with `/rooms` mounted from Cloudflare R2.
-Use the `bashroom` MCP tool when the task needs shared state across Codex,
-Claude Code, Cursor, or other agent sessions.
-
-The tool is real bash inside a Cloudflare Sandbox. Use it the way you would
-use any Linux shell. There is no special command vocabulary — just bash.
+`bashroom({ command, stdin? })` runs real `bash` inside a per-user
+Cloudflare Sandbox. Authorized rooms appear at `/rooms/<room>/...`,
+FUSE-mounted from Cloudflare R2. Use it like any Linux shell — there
+is no special command vocabulary.
 
 ## Start
 
-See what rooms are mounted:
-
 ```bash
-ls /rooms
-tree /rooms       # if you need a deeper view
+ls /rooms                 # what rooms am I in?
+tree /rooms/<room>        # deeper look at one room
 ```
 
-Pick the room relevant to the task. If no room exists for your task, ask the
-human to create one — room create / join / pair / delete are human admin
-operations and are not reachable from this tool.
+If no room fits the task, ask the human to create one — `create`,
+`join`, `pair`, `delete` are CLI-only and not reachable from this tool.
 
-## Files
-
-Rooms mount at `/rooms/<room>`. Treat each room like a small shared wiki:
+## Read and write
 
 ```bash
 cat /rooms/<room>/index.md
 cat /rooms/<room>/log.md
 ls /rooms/<room>/notes/
 rg "thing I care about" /rooms/<room>
-```
 
-Write durable context with normal bash:
-
-```bash
 cat > /rooms/<room>/index.md <<'EOF'
 # Project
-
 Current state and next steps.
 EOF
 
-printf '%s\n' '## note' >> /rooms/<room>/log.md
+printf '%s\n' "## $(date +%H:%M) topic" >> /rooms/<room>/log.md
 ```
 
-Writes flush to R2 through the FUSE mount. They are immediately readable
-from the next shell call.
+Writes flush to R2 through the FUSE mount and are immediately readable
+from the next call.
 
-## Available tools
+## Tools
 
-The sandbox ships: bash, git, ripgrep (`rg`), jq, curl, wget, find, fd,
-less, tree, vim-tiny, rsync, diff, ps, pgrep, pkill, top, file, openssl,
-node, bun, zip, unzip, xz. Standard Linux utilities work as expected.
-
-Outbound network is denied by default.
+`bash`, `git`, `ripgrep` (`rg`), `jq`, `find`, `fd`, `less`, `tree`,
+`vim-tiny`, `rsync`, `diff`, `ps`, `pgrep`, `pkill`, `top`, `file`,
+`openssl`, `node`, `bun`, `zip`, `unzip`, `xz`, `curl`, `wget`.
+Standard Linux utilities work as expected.
 
 ## Conventions
 
 - Markdown only. No binaries.
-- Prefer files such as `index.md`, `log.md`, `handoff.md`, and topical
-  notes under `notes/<topic>.md`.
-- Append to log files (`>>`) rather than overwriting (`>`).
-- Keep room contents short and structured for the next agent.
-- Do not write secrets into room files.
+- Default file shape: `index.md` (TOC), `log/YYYY-MM-DD.md` (dated
+  entries, append `## HH:MM topic` sections), `notes/<topic>.md`
+  (one file per subject). Each room ships an `AGENTS.md` with its own
+  per-room rules — read it before writing.
+- Append to log files (`>>`), do not overwrite (`>`) — preserves
+  chronology. Other agents may be writing the same file.
+- Keep entries short and structured for the next agent.
+- Do not write secrets. Files are private but not encrypted at rest.
+
+## Gotchas
+
+- **Each MCP call is a fresh shell session.** `cwd`, environment
+  variables, shell variables, and shell functions do NOT persist. Only
+  `/rooms` (R2-backed) persists. Always use absolute paths.
+- **`/tmp` is shared across this user's concurrent sessions**, unlike
+  `cwd`/env. Don't rely on it for per-call scratch; use `/rooms` or
+  unique temp names if you write to `/tmp`.
+- **`rg /rooms` (all rooms) can time out** over the FUSE mount with
+  many rooms or large trees. Scope to one room: `rg pattern /rooms/<room>`.
+- **Outbound network is denied.** `curl https://...` will fail.
+- **The 30-second command timeout** applies per call. Long-running work
+  must be split, or it gets killed.
+- **R2 is strongly consistent per key**, so a `cat` after `>>` in the
+  next session sees the appended content. But `ls` listings may briefly
+  lag a write — re-run if a freshly-written file isn't visible.
+- **No `room` command in bash.** Earlier versions intercepted `room
+  <subcommand>` from the shell; that's removed. `ls /rooms` is the
+  orientation primitive.
 
 ## What this tool does NOT do
 
-- It does not create, join, pair, or delete rooms. Those are human
-  operations performed from the `bashroom` CLI on the user's terminal.
-- It does not show room history or actor lists. Those are human
-  observability surfaces. Ask the human if you need them.
-- It does not have outbound network access by default.
+- Create, join, pair, or delete rooms — those are human operations
+  run from the `bashroom` CLI.
+- Show room history or actor lists — ask the human if attribution
+  matters.
+- Reach outbound network by default.
+- Persist shell state between calls.

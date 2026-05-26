@@ -3,6 +3,10 @@ import { createMcpHandler, type TransportState } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Sandbox as SandboxBase } from "@cloudflare/sandbox";
 import { z } from "zod";
+// Bundle the canonical SKILL.md at build time via wrangler's text-import
+// rule. Serving /skill.md from this same string guarantees no drift
+// between the bundled skill and what the worker hands out.
+import skillMarkdown from "../skills/bashroom/SKILL.md";
 import { webIndexHtml } from "./web-ui";
 import { webLandingHtml } from "./web-landing";
 import { webDeviceHtml, webDeviceResultHtml } from "./web-device";
@@ -1092,6 +1096,13 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     if (url.pathname === "/") return html(webLandingHtml());
     if (url.pathname === "/help") return text(httpHelpText());
 
+    // Agent-readable surfaces. /llms.txt follows llmstxt.org and is the
+    // table-of-contents an LLM fetches first. /skill.md returns the
+    // bundled SKILL.md verbatim — agents can pick up the contract
+    // without installing the skill locally.
+    if (url.pathname === "/llms.txt") return text(llmsTxt(env, request));
+    if (url.pathname === "/skill.md") return text(skillMarkdown);
+
     return json({ ok: false, error: "not_found" }, 404);
 }
 
@@ -1522,15 +1533,68 @@ function html(value: string, status = 200): Response {
 function httpHelpText(): string {
   return `# Bashroom
 
-Durable bash rooms for coding agents.
+Per-user Linux shell for coding agents. \`/rooms\` is FUSE-mounted from
+Cloudflare R2 and persists across calls.
 
-MCP endpoint:
+## Agent-readable
+
+- \`/llms.txt\` — table of contents for LLMs (llmstxt.org format)
+- \`/skill.md\` — the bundled Claude skill, served verbatim
+
+## Wire it up
+
+Local stdio MCP (token stays on your machine):
+
+\`\`\`bash
+npm install -g bashroom
+bashroom login
+claude mcp add --scope user bashroom -- bashroom mcp
+codex mcp add bashroom -- bashroom mcp
+\`\`\`
+
+Or remote MCP for hosted use (no local CLI):
 
 \`\`\`bash
 claude mcp add --scope user --transport http bashroom https://bashroom.sdan.io/mcp
-codex mcp add bashroom --url https://bashroom.sdan.io/mcp
 \`\`\`
 
-The MCP exposes one tool: \`bashroom\`.
+## Tool
+
+\`bashroom({ command, stdin? })\` — runs bash inside your sandbox.
+
+## Source
+
+https://github.com/sdan/bashroom
+`;
+}
+
+// llms.txt — table-of-contents Markdown an LLM fetches first. Spec:
+// https://llmstxt.org/  (H1 + blockquote summary + H2 sections of links).
+function llmsTxt(env: Env, request: Request): string {
+  const base = publicBaseUrl(env, request);
+  return `# Bashroom
+
+> Per-user Linux shell for coding agents. One MCP tool —
+> \`bashroom({ command, stdin? })\` — runs real \`bash\` inside a
+> Cloudflare Sandbox with \`/rooms\` FUSE-mounted from Cloudflare R2.
+> Room admin (create, join, pair, delete) lives in the CLI and is
+> never reachable from the agent.
+
+## Use
+
+- [README](${base}/help): one-page overview, install, and MCP wiring
+- [Skill](${base}/skill.md): the SKILL.md a Claude Code / Codex agent should load
+- [Source](https://github.com/sdan/bashroom): full code on GitHub
+- [Architecture](https://github.com/sdan/bashroom/blob/master/ARCHITECTURAL.md): how v2 is built
+
+## MCP
+
+- [MCP endpoint](${base}/mcp): streamable HTTP transport
+- Tool: \`bashroom({ command, stdin? })\` — bash in your sandbox
+
+## Optional
+
+- [Web reader](${base}/web): browser view of your rooms (logged in)
+- [Roadmap](https://github.com/sdan/bashroom/blob/master/docs/product-roadmap.md): planned work
 `;
 }

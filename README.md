@@ -116,6 +116,21 @@ A read-only browser view of your rooms is served at `/web`. Paste your account t
 
 Two panes, Notion-shape: sidebar plus content. Single inline HTML served from the worker — no build, no framework.
 
+## Agent-readable
+
+Two endpoints follow the [llms.txt convention](https://llmstxt.org/) so an
+agent can discover and load bashroom without parsing HTML:
+
+- `https://bashroom.sdan.io/llms.txt` — table of contents, links out to
+  the README, skill, and MCP endpoint
+- `https://bashroom.sdan.io/skill.md` — the bundled SKILL.md served
+  verbatim, lets an agent pick up the contract without installing the
+  skill locally
+
+The SKILL.md served at `/skill.md` is the same file at
+`skills/bashroom/SKILL.md` in this repo — bundled into the worker at
+build time so there's one source of truth.
+
 ## Direction
 
 Bashroom is becoming a logged-in cloud shell and shared memory layer for coding

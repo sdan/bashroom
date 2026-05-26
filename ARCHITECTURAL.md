@@ -124,6 +124,21 @@ on the worker. They never share a code path with the MCP tool.
 Never touches the sandbox. The web view stays useful even if the FUSE
 mount is broken.
 
+### Agent-readable endpoints
+
+Two static-ish endpoints follow the [llms.txt convention](https://llmstxt.org/)
+so an LLM can discover bashroom without HTML parsing:
+
+- `/llms.txt` — table of contents per the spec: H1 + blockquote summary
+  + H2 link sections pointing at README, skill, MCP, source.
+- `/skill.md` — the bundled `skills/bashroom/SKILL.md` served verbatim.
+  The worker imports the file at build time via wrangler's text-import
+  rule (`type: "Text"`, `globs: ["**/*.md"]` in `wrangler.jsonc`), so
+  there's no drift between the repo source and the served version.
+
+Neither endpoint touches the sandbox or R2; they're string constants
+emitted by the worker.
+
 ## Wrangler config (`wrangler.jsonc`)
 
 Bindings:

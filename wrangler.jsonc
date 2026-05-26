@@ -48,6 +48,12 @@
       "deleted_classes": ["Room"]
     }
   ],
+  "rules": [
+    {
+      "type": "Text",
+      "globs": ["**/*.md"]
+    }
+  ],
   "vars": {
     "GITHUB_CLIENT_ID": "Ov23ligO8e72A6E9MGRx",
     "BASHROOM_PUBLIC_URL": "https://bashroom.sdan.io",
