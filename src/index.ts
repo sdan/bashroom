@@ -1093,7 +1093,10 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       return html(webDeviceResultHtml({ ok: true, message: `Signed in as @${userJson.login}. You can close this tab.` }));
     }
 
-    if (url.pathname === "/") return html(webLandingHtml());
+    if (url.pathname === "/") {
+      const cities = await pingpongCities("bashroom.sdan.io").catch(() => [] as string[]);
+      return html(webLandingHtml(cities));
+    }
     if (url.pathname === "/help") return text(httpHelpText());
 
     // Agent-readable surfaces. /llms.txt follows llmstxt.org and is the
@@ -1104,6 +1107,40 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     if (url.pathname === "/skill.md") return text(skillMarkdown);
 
     return json({ ok: false, error: "not_found" }, 404);
+}
+
+// Pulls the top viewing-city list from pingpong.sdan.io for the landing
+// footer. Cached in the Cloudflare Cache API for 5 minutes so repeated
+// landing renders don't hammer pingpong. Returns city names only (the
+// API returns "City, CC" — we strip the country code for the footer's
+// human read). Empty array on any failure; the caller falls back
+// gracefully to just the "from @sdan" signature.
+async function pingpongCities(site: string): Promise<string[]> {
+  const cacheKey = new Request(`https://internal/pingpong-cities/${encodeURIComponent(site)}`);
+  const cache = caches.default;
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    const data = await cached.json<{ cities: string[] }>().catch(() => null);
+    if (data?.cities) return data.cities;
+  }
+
+  const url = `https://pingpong.sdan.io/stats?site=${encodeURIComponent(site)}&groupBy=city&limit=12`;
+  const res = await fetch(url, { headers: { accept: "application/json" } });
+  if (!res.ok) return [];
+  const json = await res.json<{ rows?: Array<{ key: string }> }>().catch(() => null);
+  const rows = json?.rows || [];
+  const cities = rows
+    .map((row) => (row.key || "").split(",")[0].trim()) // "New York City, US" -> "New York City"
+    .filter(Boolean);
+
+  // 5-minute cache; pingpong's data is rolling-window monthly, no need for tight freshness.
+  await cache.put(
+    cacheKey,
+    new Response(JSON.stringify({ cities }), {
+      headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
+    }),
+  );
+  return cities;
 }
 
 function publicBaseUrl(env: Env, request: Request): string {
