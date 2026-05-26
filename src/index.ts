@@ -1095,7 +1095,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
     if (url.pathname === "/") {
       const cities = await pingpongCities("bashroom.sdan.io").catch(() => [] as string[]);
-      return html(webLandingHtml(cities));
+      const colo = ((request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "").toLowerCase();
+      return html(webLandingHtml(cities, colo));
     }
     if (url.pathname === "/help") return text(httpHelpText());
 
