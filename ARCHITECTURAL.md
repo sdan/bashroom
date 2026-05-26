@@ -209,18 +209,11 @@ These are explicit boundaries, not "later":
 
 ## Migration history
 
-v1 → v2 cutover: hard rewrite, single-user, one deploy. Migration script
-`scripts/migrate-v1-to-r2.mjs` ran once to copy 11 rooms (103 files,
-~640 KB) from per-room Room DOs into `users/<user_id>/<room>/<path>` in
-the `bashroom-rooms` R2 bucket. Local backups in `./backup/` retained
-during the cutover window. Room DO class deleted in the `v4` migration
-tag once R2 round-trip was verified via the worker's R2 binding.
-
-The migration token (`MIGRATION_TOKEN` wrangler secret) and the
-`/internal/snapshot` + `/internal/r2-put` worker endpoints were
-removed in the same deploy that landed the v2 code path. The secret
-should also be deleted via `wrangler secret delete MIGRATION_TOKEN`
-after final verification.
+v1 → v2 was a hard cutover: single-user, one deploy, no soak period.
+File contents moved from per-room Durable Object snapshots to
+`users/<user_id>/<room>/<path>` in the `bashroom-rooms` R2 bucket. The
+Room DO class is dropped in the `v4` migration tag (kept in the
+migration log for replay safety; do not remove past tags).
 
 ## Validation standard
 
