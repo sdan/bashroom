@@ -19,6 +19,7 @@ Usage:
 
 Account:
   bashroom login                       Device-flow OAuth login.
+  bashroom token                       Print your account token (for the /web reader).
   bashroom rooms                       List rooms you can access (with role + actor).
 
 Room admin (human-only, never reachable from the MCP agent):
@@ -398,6 +399,20 @@ async function main() {
 
   if (args[0] === "login") {
     await login(baseUrl, args.slice(1));
+    return;
+  }
+
+  // Prints just the account token to stdout. Used by the /web login screen
+  // ("paste your token") so users don't have to grep the config file
+  // themselves. Single-line output, no JSON wrapping, no trailing newline
+  // beyond what console.log adds — safe to pipe into other commands.
+  if (args[0] === "token") {
+    const current = account(baseUrl);
+    if (!current?.token) {
+      console.error("not logged in. Run: bashroom login");
+      process.exit(1);
+    }
+    console.log(current.token);
     return;
   }
 
