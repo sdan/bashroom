@@ -1,52 +1,35 @@
 import { DurableObject } from "cloudflare:workers";
 import { createMcpHandler, type TransportState } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Bash, InMemoryFs, defineCommand, type ExecResult, type InitialFiles } from "just-bash/browser";
+import { Sandbox as SandboxBase } from "@cloudflare/sandbox";
 import { z } from "zod";
 import { webIndexHtml } from "./web-ui";
 import { webLandingHtml } from "./web-landing";
 import { webDeviceHtml, webDeviceResultHtml } from "./web-device";
 
 type Env = {
-  ROOMS: DurableObjectNamespace<Room>;
   REGISTRY: DurableObjectNamespace<Registry>;
-  BASHROOM_ENABLE_FULL_NETWORK?: string;
-  INTRACODE_ENABLE_FULL_NETWORK?: string;
+  SANDBOXES: DurableObjectNamespace<Sandbox>;
+  ROOMS_R2: R2Bucket;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   BASHROOM_PUBLIC_URL?: string;
+  R2_BUCKET_NAME?: string;
+  R2_ENDPOINT?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
 };
+
+// Sandbox subclass — wrangler.jsonc declares class_name: "Sandbox" and
+// the container image. We only need to extend SandboxBase and set the
+// idle sleep timer; everything else is provided by @cloudflare/sandbox.
+export class Sandbox extends SandboxBase<Env> {
+  defaultPort = 3000;
+  sleepAfter: string = "15m";
+}
+
 
 type Scope = "read" | "write" | "checkpoint" | "admin";
-
-type WikiFile = {
-  path: string;
-  content: string;
-  updated_at: string;
-  updated_by: string;
-  version: number;
-};
-
-type AuditRow = {
-  id: number;
-  ts: string;
-  actor: string;
-  kind: string;
-  path: string;
-  body: string;
-};
-
-type Mount = {
-  wiki: string;
-  actor: string;
-  scopes: Scope[];
-};
-
-type FileChange = {
-  path: string;
-  content?: string;
-  deleted?: boolean;
-};
 
 type ShellResult = {
   stdout: string;
@@ -76,7 +59,6 @@ type AccountAuth = {
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
-const MAX_FILE_CHARS = 512_000;
 const MAX_COMMAND_CHARS = 32_000;
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
@@ -124,186 +106,7 @@ const SLUG_VERBS = [
   "wrangling", "zesting", "zigzagging",
 ];
 
-export class Room extends DurableObject<Env> {
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS files (
-        path TEXT PRIMARY KEY,
-        content TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        updated_by TEXT NOT NULL,
-        version INTEGER NOT NULL
-      );
-    `);
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS audit (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        actor TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        path TEXT NOT NULL,
-        body TEXT NOT NULL
-      );
-    `);
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const body = request.method === "POST" ? await readJson(request) : {};
-
-    if (url.pathname === "/snapshot") return json({ ok: true, files: this.snapshot() });
-
-    if (request.method === "POST" && url.pathname === "/seed") {
-      const actor = sanitizeActor(String(body.actor || "system"));
-      const wiki = sanitizeWiki(String(body.wiki || "wiki"));
-      return json(this.seed(wiki, actor));
-    }
-
-    if (request.method === "POST" && url.pathname === "/apply") {
-      const actor = sanitizeActor(String(body.actor || "actor"));
-      const command = String(body.command || "");
-      return json(this.apply(actor, parseChanges(body.changes), command));
-    }
-
-    if (request.method === "POST" && url.pathname === "/audit") {
-      return json({ ok: true, events: this.audit(parseLimit(body.limit)) });
-    }
-
-    if (request.method === "POST" && url.pathname === "/delete") {
-      this.ctx.storage.sql.exec("DELETE FROM files");
-      this.ctx.storage.sql.exec("DELETE FROM audit");
-      return json({ ok: true });
-    }
-
-    return json({ ok: false, error: "not_found" }, 404);
-  }
-
-  private snapshot(): WikiFile[] {
-    return this.ctx.storage.sql
-      .exec<WikiFile>(
-        `SELECT path, content, updated_at, updated_by, version
-         FROM files
-         ORDER BY path ASC`,
-      )
-      .toArray();
-  }
-
-  private seed(wiki: string, actor: string): Record<string, unknown> {
-    const now = new Date().toISOString();
-    const today = now.slice(0, 10);
-
-    // Default seed shapes how agents use the room. Per Anthropic + Lance
-    // Martin context-engineering guidance: keep AGENTS.md terse and
-    // rule-based (long convention files get ignored), and ship a directory
-    // pattern that demonstrates folders so agents inherit it.
-    const files: Record<string, string> = {
-      "README.md":
-        `# ${wiki}\n\nA Bashroom room. Multiple agents read and write the files here through ` +
-        `durable bash. Edit this README to describe what this specific room is for.\n`,
-      "AGENTS.md":
-        `# Bashroom room conventions\n\n` +
-        `Shared Markdown filesystem. Multiple agents read and write here.\n` +
-        `Reorganize freely — rename, split, merge, or delete files when the\n` +
-        `structure no longer fits. Every change is in \`room history\`, so\n` +
-        `nothing is ever truly lost.\n\n` +
-        `## Default shape\n\n` +
-        `- Dated entries → \`log/YYYY-MM-DD.md\` (one file per day, append \`## HH:MM topic\` sections)\n` +
-        `- Standalone topics → \`notes/<topic>.md\` (one file per subject)\n` +
-        `- Top-level \`index.md\` is the table of contents — keep it current when files change\n\n` +
-        `## Rules\n\n` +
-        `- IMPORTANT: append to log files (\`>>\`), don't overwrite (\`>\`) — preserves chronology\n` +
-        `- IMPORTANT: update \`index.md\` whenever the file tree changes\n` +
-        `- Markdown only. No binaries.\n` +
-        `- If a file gets long, split it into a folder.\n`,
-      "index.md":
-        `# Index\n\n` +
-        `- [README.md](README.md) — what this room is for\n` +
-        `- [AGENTS.md](AGENTS.md) — conventions for agents working here\n` +
-        `- [log/](log/) — dated entries, newest day at top of folder\n` +
-        `- [notes/](notes/) — topical notes\n`,
-      [`log/${today}.md`]:
-        `# ${today}\n\n` +
-        `## room created\n\n` +
-        `Created by ${actor}. Append further entries under \`## HH:MM topic\` headings.\n`,
-      "notes/README.md":
-        `# notes/\n\n` +
-        `One Markdown file per topic. Filename = topic, kebab-case (e.g. \`auth-flow.md\`).\n` +
-        `Delete this README when the folder has real content.\n`,
-    };
-
-    for (const [path, content] of Object.entries(files)) {
-      this.ctx.storage.sql.exec(
-        `INSERT OR IGNORE INTO files (path, content, updated_at, updated_by, version)
-         VALUES (?, ?, ?, ?, 1)`,
-        path,
-        content,
-        now,
-        actor,
-      );
-    }
-    this.appendAudit(actor, "seed", "", `Seeded ${wiki}.`);
-    return { ok: true, wiki };
-  }
-
-  private apply(actor: string, changes: FileChange[], command: string): Record<string, unknown> {
-    const now = new Date().toISOString();
-    const applied: string[] = [];
-
-    for (const change of changes) {
-      const path = sanitizeFilePath(change.path);
-      if (change.deleted) {
-        this.ctx.storage.sql.exec("DELETE FROM files WHERE path = ?", path);
-        this.appendAudit(actor, "delete", path, compact(command || path));
-        applied.push(path);
-        continue;
-      }
-
-      const content = cleanFileContent(change.content || "");
-      this.ctx.storage.sql.exec(
-        `INSERT INTO files (path, content, updated_at, updated_by, version)
-         VALUES (?, ?, ?, ?, 1)
-         ON CONFLICT(path) DO UPDATE SET
-           content = excluded.content,
-           updated_at = excluded.updated_at,
-           updated_by = excluded.updated_by,
-           version = files.version + 1`,
-        path,
-        content,
-        now,
-        actor,
-      );
-      this.appendAudit(actor, "write", path, compact(command || content));
-      applied.push(path);
-    }
-
-    return { ok: true, changed: applied.length, paths: applied };
-  }
-
-  private audit(limit: number): AuditRow[] {
-    return this.ctx.storage.sql
-      .exec<AuditRow>(
-        `SELECT id, ts, actor, kind, path, body
-         FROM audit
-         ORDER BY id DESC
-         LIMIT ?`,
-        limit,
-      )
-      .toArray()
-      .reverse();
-  }
-
-  private appendAudit(actor: string, kind: string, path: string, body: string): void {
-    this.ctx.storage.sql.exec(
-      "INSERT INTO audit (ts, actor, kind, path, body) VALUES (?, ?, ?, ?, ?)",
-      new Date().toISOString(),
-      actor,
-      kind,
-      path,
-      body,
-    );
-  }
-}
+// (Room DO removed in v4 — files now live in R2, audit in Registry.)
 
 export class Registry extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -400,6 +203,24 @@ export class Registry extends DurableObject<Env> {
         token TEXT
       );
     `);
+    // v2 audit log — replaces the per-room Room.audit table. Cross-room
+    // queries (e.g. "show me everything I did today") become a single
+    // SELECT instead of a fan-out over per-room DOs.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        room TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        path TEXT,
+        command TEXT,
+        exit_code INTEGER
+      );
+    `);
+    this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS audit_room_idx ON audit(room, id DESC)`);
+    this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS audit_user_idx ON audit(user_id, id DESC)`);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -505,6 +326,35 @@ export class Registry extends DurableObject<Env> {
       ));
     }
 
+    if (request.method === "POST" && url.pathname === "/audit-append") {
+      // Worker writes one row per shell exec / room control action. The
+      // Worker has already auth'd the user; we trust user_id from the body.
+      return json(this.auditAppend({
+        userId: String(body.user_id || ""),
+        room: String(body.room || ""),
+        actor: String(body.actor || ""),
+        kind: String(body.kind || ""),
+        path: typeof body.path === "string" ? body.path : null,
+        command: typeof body.command === "string" ? body.command : null,
+        exitCode: typeof body.exit_code === "number" ? body.exit_code : null,
+      }));
+    }
+
+    if (request.method === "POST" && url.pathname === "/audit-list") {
+      // `room history` and "show me everything I did" both land here.
+      // Filter by room OR user_id (room takes precedence if both are set).
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
+      if (!account.ok) return json(account, 401);
+      return json({
+        ok: true,
+        events: this.auditList({
+          userId: account.userId || "",
+          room: typeof body.room === "string" && body.room ? sanitizeWiki(body.room) : null,
+          limit: parseLimit(body.limit),
+        }),
+      });
+    }
+
     return json({ ok: false, error: "not_found" }, 404);
   }
 
@@ -530,7 +380,7 @@ export class Registry extends DurableObject<Env> {
       "owner",
       now,
     );
-    return { ok: true, wiki: cleanWiki, actor: cleanActor, scopes, role: "owner" };
+    return { ok: true, wiki: cleanWiki, actor: cleanActor, scopes, role: "owner", user_id: userId };
   }
 
   // Redeem a pair code as the calling user. Inserts into user_rooms with the
@@ -587,7 +437,8 @@ export class Registry extends DurableObject<Env> {
   }
 
   // mounts(userId) = the rooms this user is a member of. Single lookup.
-  private mounts(userId: string): Mount[] {
+  // Wire shape matches v1's Mount[] so /mounts callers don't change.
+  private mounts(userId: string): Array<{ wiki: string; actor: string; scopes: Scope[] }> {
     if (!userId) return [];
     return this.accountRooms(userId)
       .map((row) => ({ wiki: row.room, actor: row.actor, scopes: row.scopes }))
@@ -845,6 +696,44 @@ export class Registry extends DurableObject<Env> {
       }));
   }
 
+  private auditAppend(row: { userId: string; room: string; actor: string; kind: string; path: string | null; command: string | null; exitCode: number | null }): Record<string, unknown> {
+    // user_id and kind required. room is empty string for shell execs that
+    // don't target a specific room — sanitizeWiki would reject "" so we
+    // store it raw and let queries filter on `room != ''` if they want
+    // per-room view.
+    if (!row.userId || !row.kind) return { ok: false, error: "missing_field" };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO audit (ts, user_id, room, actor, kind, path, command, exit_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      new Date().toISOString(),
+      row.userId,
+      row.room ? sanitizeWiki(row.room) : "",
+      sanitizeActor(row.actor),
+      row.kind,
+      row.path ? compact(row.path) : null,
+      row.command ? compact(row.command) : null,
+      row.exitCode,
+    );
+    return { ok: true };
+  }
+
+  private auditList(opts: { userId: string; room: string | null; limit: number }): Array<Record<string, unknown>> {
+    // Room filter takes precedence — `room history <room>` semantics.
+    // Without a room filter, return the user's cross-room history.
+    const rows = opts.room
+      ? this.ctx.storage.sql.exec<{ id: number; ts: string; user_id: string; room: string; actor: string; kind: string; path: string | null; command: string | null; exit_code: number | null }>(
+          `SELECT id, ts, user_id, room, actor, kind, path, command, exit_code
+           FROM audit WHERE room = ? ORDER BY id DESC LIMIT ?`,
+          opts.room, opts.limit,
+        ).toArray()
+      : this.ctx.storage.sql.exec<{ id: number; ts: string; user_id: string; room: string; actor: string; kind: string; path: string | null; command: string | null; exit_code: number | null }>(
+          `SELECT id, ts, user_id, room, actor, kind, path, command, exit_code
+           FROM audit WHERE user_id = ? ORDER BY id DESC LIMIT ?`,
+          opts.userId, opts.limit,
+        ).toArray();
+    // Reverse so caller sees chronological order, matching the old Room.audit shape.
+    return rows.reverse();
+  }
+
   private actors(wiki: string): string[] {
     const cleanWiki = sanitizeWiki(wiki);
     const rows = this.ctx.storage.sql
@@ -932,9 +821,9 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
 
   server.tool(
     "bashroom",
-    "Run bash against durable Bashroom files. Use `room help` inside bash for create, join, pair, mounts, who, and history.",
+    "Run bash against /rooms, a FUSE-mounted filesystem backed by Cloudflare R2. Real Linux shell with bash, git, ripgrep, jq, find, less, tree, fd, rsync. Use ls /rooms to see your rooms; everything else is normal bash.",
     {
-      command: z.string().min(1).max(MAX_COMMAND_CHARS).describe("Bash command to run, for example: room mounts; cat /rooms/my-room/index.md"),
+      command: z.string().min(1).max(MAX_COMMAND_CHARS).describe("Bash command to run, for example: ls /rooms; cat /rooms/my-room/index.md"),
       stdin: z.string().optional().describe("Optional standard input for the command."),
     },
     async ({ command, stdin }) => {
@@ -995,10 +884,99 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
         actor: input.actor || defaultActor("cli"),
         ip: clientIp(request),
       });
-      if (result.ok && typeof result.wiki === "string" && typeof result.actor === "string") {
-        await seedWiki(env, result.wiki, result.actor);
+      if (result.ok && typeof result.wiki === "string" && typeof result.actor === "string" && typeof result.user_id === "string") {
+        await seedR2Room(env, result.user_id, result.wiki, result.actor);
       }
       return json(result, result.ok === false ? 400 : 200);
+    }
+
+    // Redeem an invite as the calling user — wraps Registry /join.
+    if (url.pathname === "/account/room-join" && request.method === "POST") {
+      const input = await readJson(request);
+      const result = await registry(env, "/join", {
+        token: bearerToken(request),
+        invite: String(input.invite || ""),
+        actor: String(input.actor || defaultActor("cli")),
+        ip: clientIp(request),
+      });
+      return json(result, result.ok === false ? 400 : 200);
+    }
+
+    // Mint a pair-code invite for a room — wraps Registry /pair.
+    if (url.pathname === "/account/room-pair" && request.method === "POST") {
+      const input = await readJson(request);
+      const result = await registry(env, "/pair", {
+        token: bearerToken(request),
+        wiki: String(input.wiki || input.room || ""),
+        ip: clientIp(request),
+      });
+      return json(result, result.ok === false ? 400 : 200);
+    }
+
+    // Destroy a room: drop Registry membership/rows, then purge R2 prefix.
+    // Order matters — Registry /delete authorizes; only on success do we
+    // touch R2. We look up the user_id via /account-rooms because
+    // r2DeletePrefix is keyed by user.
+    if (url.pathname === "/account/room-delete" && request.method === "POST") {
+      const input = await readJson(request);
+      const wiki = String(input.wiki || input.room || "");
+      const token = bearerToken(request);
+      const ip = clientIp(request);
+      const account = await registry(env, "/account-rooms", { token, ip });
+      if (account.ok === false) return json(account, 401);
+      const userId = String(account.user_id || "");
+      if (!userId) return json({ ok: false, error: "no_account" }, 400);
+      const result = await registry(env, "/delete", { token, wiki, ip });
+      if (result.ok && typeof result.wiki === "string") {
+        await r2DeletePrefix(env, userId, result.wiki);
+      }
+      return json(result, result.ok === false ? 400 : 200);
+    }
+
+    // List the calling user's room mounts — wraps Registry /mounts.
+    if (url.pathname === "/account/room-mounts" && request.method === "POST") {
+      const result = await registry(env, "/mounts", {
+        token: bearerToken(request),
+        ip: clientIp(request),
+      });
+      return json(result, result.ok === false ? 400 : 200);
+    }
+
+    // List the actors present in a room — wraps Registry /actors.
+    if (url.pathname === "/account/room-who" && request.method === "POST") {
+      const input = await readJson(request);
+      const result = await registry(env, "/actors", {
+        token: bearerToken(request),
+        wiki: String(input.wiki || input.room || ""),
+        ip: clientIp(request),
+      });
+      return json(result, result.ok === false ? 400 : 200);
+    }
+
+    // Per-room audit history — wraps Registry /audit-list.
+    if (url.pathname === "/account/room-history" && request.method === "POST") {
+      const input = await readJson(request);
+      const result = await registry(env, "/audit-list", {
+        token: bearerToken(request),
+        room: String(input.room || input.wiki || ""),
+        limit: input.limit,
+        ip: clientIp(request),
+      });
+      return json(result, result.ok === false ? 400 : 200);
+    }
+
+    // Force the calling user's sandbox to shut down so the next request
+    // boots fresh on the latest image. Useful after a Dockerfile change.
+    // Auth: account token (same as /bash).
+    if (url.pathname === "/sandbox/restart" && request.method === "POST") {
+      const account = await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) });
+      if (account.ok === false) return json({ ok: false, error: account.error || "unauthorized" }, 401);
+      const userId = String(account.user_id || "");
+      if (!userId) return json({ ok: false, error: "no_account" }, 400);
+      const { getSandbox } = await import("@cloudflare/sandbox");
+      const sandbox = getSandbox(env.SANDBOXES, userId, { normalizeId: true });
+      await sandbox.destroy().catch(() => undefined);
+      return json({ ok: true, user_id: userId, message: "sandbox destroyed; next request boots fresh" });
     }
 
     if (url.pathname === "/web" || url.pathname === "/web/") return html(webIndexHtml());
@@ -1007,10 +985,11 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       // Pass ?active=ROOM to also fetch that room's snapshot in the same
       // response — saves a round-trip on initial page load.
       const account = await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) });
+      const userId = String(account.user_id || "");
       const requested = parseOptionalWiki(url.searchParams.get("active"));
       const memberRooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
       const activeRoom = requested && memberRooms.some((row) => row.room === requested) ? requested : "";
-      const snapshot = activeRoom ? await wikiSnapshot(env, activeRoom) : null;
+      const snapshot = activeRoom && userId ? await r2Snapshot(env, userId, activeRoom) : null;
       return json({ ...account, active: activeRoom || null, snapshot });
     }
 
@@ -1019,9 +998,10 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       const room = parseOptionalWiki(url.searchParams.get("room"));
       if (!room) return json({ ok: false, error: "room_required" }, 400);
       const account = await registry(env, "/account-rooms", { token, ip: clientIp(request) });
+      const userId = String(account.user_id || "");
       const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
-      if (!rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
-      return json({ ok: true, files: await wikiSnapshot(env, room) });
+      if (!userId || !rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
+      return json({ ok: true, files: await r2Snapshot(env, userId, room) });
     }
 
     // ─── Device-flow OAuth ────────────────────────────────────────────────
@@ -1121,311 +1101,18 @@ function publicBaseUrl(env: Env, request: Request): string {
   return `${url.protocol}//${url.host}`;
 }
 
-async function runShell(env: Env, headerToken: string, mcpSessionId: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
-  const initialMounts = await registry(env, "/mounts", { token: headerToken, ip });
-  const mounts = normalizeMounts(initialMounts.mounts);
-  const before = new Map<string, Map<string, string>>();
-  const fs = new InMemoryFs(initialShellFiles(mounts));
-
-  await fs.mkdir("/rooms", { recursive: true });
-  await fs.mkdir("/tmp", { recursive: true });
-  for (const mount of mounts) await loadMount(env, fs, mount, mounts, before);
-
-  const addMount = async (mount: Mount): Promise<void> => {
-    const existing = mounts.find((entry) => entry.wiki === mount.wiki);
-    if (existing) {
-      existing.actor = mount.actor;
-      existing.scopes = mount.scopes;
-    } else {
-      mounts.push(mount);
-      mounts.sort((left, right) => mountPath(left.wiki).localeCompare(mountPath(right.wiki)));
-    }
-    await loadMount(env, fs, mount, mounts, before);
-  };
-
-  const bash = new Bash({
-    fs,
-    cwd: "/",
-    customCommands: [defineCommand("room", (args) => roomCommand(env, fs, mounts, before, addMount, headerToken, mcpSessionId, ip, args))],
-    executionLimits: {
-      maxCommandCount: 2_000,
-      maxLoopIterations: 5_000,
-      maxCallDepth: 50,
-      maxStringLength: 2_000_000,
-      maxArrayElements: 20_000,
-      maxGlobOperations: 50_000,
-      maxAwkIterations: 10_000,
-      maxSedIterations: 10_000,
-      maxJqIterations: 10_000,
-      maxSubstitutionDepth: 30,
-      maxHeredocSize: 1_000_000,
-    },
-    defenseInDepth: true,
-    network: env.BASHROOM_ENABLE_FULL_NETWORK === "1" || env.INTRACODE_ENABLE_FULL_NETWORK === "1"
-      ? { dangerouslyAllowFullInternetAccess: true, maxRedirects: 5, timeoutMs: 10_000, maxResponseSize: 1_000_000 }
-      : undefined,
-  });
-
-  const exec = await bash.exec(command.slice(0, MAX_COMMAND_CHARS), { cwd: "/", stdin });
-  const persisted = await persistMounts(env, fs, mounts, before, command);
-  return {
-    stdout: exec.stdout,
-    stderr: [exec.stderr, persisted.stderr].filter(Boolean).join(""),
-    exitCode: exec.exitCode === 0 ? persisted.exitCode : exec.exitCode,
-    changed: persisted.changed,
-    changed_paths: persisted.changed_paths,
-  };
-}
-
-async function roomCommand(
-  env: Env,
-  fs: InMemoryFs,
-  mounts: Mount[],
-  before: Map<string, Map<string, string>>,
-  addMount: (mount: Mount) => Promise<void>,
-  headerToken: string,
-  mcpSessionId: string,
-  ip: string,
-  args: string[],
-): Promise<ExecResult> {
-  const [subcommand = "help", ...rest] = args;
-
-  try {
-    if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") return cmdOk(roomHelp());
-
-    if (subcommand === "mounts") {
-      if (!mounts.length) return cmdOk("No mounted rooms.\n\nRun: room create\nOr:  room join <invite>\n");
-      return cmdOk(mounts.map((mount) => `${mountPath(mount.wiki)}\t${mount.actor}\t${mount.scopes.join(",")}`).join("\n") + "\n");
-    }
-
-    if (subcommand === "create") {
-      const parsed = parseCommandFlags(rest);
-      const result = await registry(env, "/create", { wiki: parsed.positionals[0] || "", actor: parsed.actor || "", token: headerToken, ip });
-      if (result.ok === false) return cmdErr(String(result.error || "create_failed"));
-      const mount = resultMount(result);
-      await seedWiki(env, mount.wiki, mount.actor);
-      await addMount(mount);
-      return cmdOk(`created ${mount.wiki}\nmounted ${mountPath(mount.wiki)}\n`);
-    }
-
-    if (subcommand === "join") {
-      const parsed = parseCommandFlags(rest);
-      const invite = parsed.positionals[0];
-      if (!invite) return cmdErr("usage: room join <invite> [--actor <actor>]\n");
-      const result = await registry(env, "/join", { invite, actor: parsed.actor || "", token: headerToken, ip });
-      if (result.ok === false) return cmdErr(String(result.error || "join_failed"));
-      const mount = resultMount(result);
-      await addMount(mount);
-      return cmdOk(`joined ${mount.wiki}\nmounted ${mountPath(mount.wiki)}\n`);
-    }
-
-    if (subcommand === "pair") {
-      const wiki = resolveWikiArg(rest[0], mounts);
-      if (!wiki.ok) return cmdErr(wiki.error);
-      const result = await registry(env, "/pair", { wiki: wiki.value, token: headerToken, ip });
-      if (result.ok === false) return cmdErr(String(result.error || "pair_failed"));
-      return cmdOk(`${result.invite}\ncode ${result.code}\nexpires ${result.expires_at}\n`);
-    }
-
-    if (subcommand === "who") {
-      const wiki = resolveWikiArg(rest[0], mounts);
-      if (!wiki.ok) return cmdErr(wiki.error);
-      const result = await registry(env, "/actors", { wiki: wiki.value, token: headerToken, ip });
-      if (result.ok === false) return cmdErr(String(result.error || "who_failed"));
-      return cmdOk(`${(Array.isArray(result.actors) ? result.actors : []).join("\n")}\n`);
-    }
-
-    if (subcommand === "history") {
-      const wiki = resolveWikiArg(rest[0], mounts);
-      if (!wiki.ok) return cmdErr(wiki.error);
-      const events = await wikiAudit(env, wiki.value, parseLimit(rest[1]));
-      const output = events.map((event) => {
-        const path = String(event.path || "");
-        return `#${event.id} ${event.ts} ${event.actor} ${event.kind}${path ? ` ${path}` : ""}: ${event.body}`;
-      }).join("\n");
-      return cmdOk(output ? `${output}\n` : "No history.\n");
-    }
-
-    if (subcommand === "delete") {
-      const wiki = resolveWikiArg(rest[0], mounts);
-      if (!wiki.ok) return cmdErr(wiki.error);
-      const result = await registry(env, "/delete", { wiki: wiki.value, token: headerToken, ip });
-      if (result.ok === false) return cmdErr(String(result.error || "delete_failed"));
-      await deleteWikiFiles(env, wiki.value);
-      return cmdOk(`deleted ${wiki.value}\n`);
-    }
-
-    return cmdErr(`unknown room subcommand: ${subcommand}\n\n${roomHelp()}`);
-  } catch (error) {
-    return cmdErr(`${error instanceof Error ? error.message : String(error)}\n`);
-  } finally {
-    await fs.mkdir("/rooms", { recursive: true }).catch(() => undefined);
+// v2 entrypoint. Resolves user_id via Registry, then delegates to
+// runShellV2 (sandbox + R2). The MCP and /bash routes both call this.
+async function runShell(env: Env, headerToken: string, _mcpSessionId: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
+  const account = await registry(env, "/account-rooms", { token: headerToken, ip });
+  if (account.ok === false) {
+    return { stdout: "", stderr: `bashroom: ${account.error || "unauthorized"}\n`, exitCode: 1, changed: 0, changed_paths: [] };
   }
-}
-
-async function loadMount(env: Env, fs: InMemoryFs, mount: Mount, mounts: Mount[], before: Map<string, Map<string, string>>): Promise<void> {
-  await fs.mkdir(mountPath(mount.wiki), { recursive: true });
-  const snapshot = await wikiSnapshot(env, mount.wiki);
-  for (const file of snapshot) {
-    const fullPath = `${mountPath(mount.wiki)}/${file.path}`;
-    await fs.writeFile(fullPath, file.content);
+  const userId = String(account.user_id || "");
+  if (!userId) {
+    return { stdout: "", stderr: "bashroom: no account\n", exitCode: 1, changed: 0, changed_paths: [] };
   }
-  before.set(mount.wiki, await mountedFiles(fs, mount.wiki, mounts));
-}
-
-async function persistMounts(env: Env, fs: InMemoryFs, mounts: Mount[], before: Map<string, Map<string, string>>, command: string): Promise<Omit<ShellResult, "stdout">> {
-  const changedPaths: string[] = [];
-  let stderr = "";
-  let exitCode = 0;
-
-  for (const mount of mounts) {
-    const previous = before.get(mount.wiki) || new Map<string, string>();
-    const current = await mountedFiles(fs, mount.wiki, mounts);
-    const changes = diffFiles(previous, current);
-    if (!changes.length) continue;
-
-    if (!hasScope(mount.scopes, "write")) {
-      stderr += `bashroom: ${mount.wiki}: write permission denied\n`;
-      exitCode = 1;
-      continue;
-    }
-
-    const result = await applyWikiChanges(env, mount.wiki, mount.actor, changes, command);
-    if (result.ok === false) {
-      stderr += `bashroom: ${mount.wiki}: ${result.error || "persist failed"}\n`;
-      exitCode = 1;
-      continue;
-    }
-    changedPaths.push(...changes.map((change) => `${mountPath(mount.wiki)}/${change.path}`));
-  }
-
-  return { stderr, exitCode, changed: changedPaths.length, changed_paths: changedPaths };
-}
-
-async function mountedFiles(fs: InMemoryFs, wiki: string, mounts: Mount[]): Promise<Map<string, string>> {
-  const files = new Map<string, string>();
-  const prefix = `${mountPath(wiki)}/`;
-  for (const fullPath of fs.getAllPaths()) {
-    if (!fullPath.startsWith(prefix)) continue;
-    if (ownerForPath(fullPath, mounts) !== wiki) continue;
-    const stat = await fs.stat(fullPath).catch(() => undefined);
-    if (!stat?.isFile) continue;
-    const relativePath = sanitizeFilePath(fullPath.slice(prefix.length));
-    files.set(relativePath, await fs.readFile(fullPath));
-  }
-  return files;
-}
-
-function diffFiles(previous: Map<string, string>, current: Map<string, string>): FileChange[] {
-  const changes: FileChange[] = [];
-  for (const [path, content] of current) {
-    if (previous.get(path) !== content) changes.push({ path, content });
-  }
-  for (const path of previous.keys()) {
-    if (!current.has(path)) changes.push({ path, deleted: true });
-  }
-  return changes;
-}
-
-function ownerForPath(path: string, mounts: Mount[]): string | undefined {
-  let owner: string | undefined;
-  let bestLength = -1;
-  for (const mount of mounts) {
-    const prefix = `${mountPath(mount.wiki)}/`;
-    if (path.startsWith(prefix) && prefix.length > bestLength) {
-      owner = mount.wiki;
-      bestLength = prefix.length;
-    }
-  }
-  return owner;
-}
-
-function initialShellFiles(mounts: Mount[]): InitialFiles {
-  const mountList = mounts.length
-    ? mounts.map((mount) => `- ${mountPath(mount.wiki)} (${mount.actor})`).join("\n")
-    : "No mounted rooms yet.";
-  return {
-    "/README.md": `# Bashroom Shell\n\nDurable bash rooms for coding agents.\n\n${mountList}\n\nRun room help.\n`,
-  };
-}
-
-function normalizeMounts(value: unknown): Mount[] {
-  if (!Array.isArray(value)) return [];
-  const mounts: Mount[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    const wiki = typeof record.wiki === "string" ? sanitizeWiki(record.wiki) : "";
-    const actor = typeof record.actor === "string" ? sanitizeActor(record.actor) : "actor";
-    const scopes = parseScopes(record.scopes, ["read"]);
-    if (wiki) mounts.push({ wiki, actor, scopes });
-  }
-  return mounts;
-}
-
-function resultMount(result: Record<string, unknown>): Mount {
-  return {
-    wiki: sanitizeWiki(String(result.wiki || "")),
-    actor: sanitizeActor(String(result.actor || "actor")),
-    scopes: parseScopes(result.scopes, ["read"]),
-  };
-}
-
-function resolveWikiArg(value: string | undefined, mounts: Mount[]): { ok: true; value: string } | { ok: false; error: string } {
-  if (value) return { ok: true, value: wikiFromPathOrName(value) };
-  if (mounts.length === 1) return { ok: true, value: mounts[0].wiki };
-  return { ok: false, error: "usage: pass a room name or mount path\n" };
-}
-
-function wikiFromPathOrName(value: string): string {
-  const clean = value.startsWith("/rooms/") ? value.slice("/rooms/".length) : value;
-  return sanitizeWiki(clean);
-}
-
-function parseCommandFlags(args: string[]): { actor?: string; positionals: string[] } {
-  const positionals = [...args];
-  let actor: string | undefined;
-  for (let index = 0; index < positionals.length; index += 1) {
-    if (positionals[index] === "--actor") {
-      actor = sanitizeActor(positionals[index + 1] || "");
-      positionals.splice(index, 2);
-      index -= 1;
-    }
-  }
-  return { actor, positionals };
-}
-
-async function wikiSnapshot(env: Env, wiki: string): Promise<WikiFile[]> {
-  const result = await roomControl(env, wiki, "/snapshot");
-  return Array.isArray(result.files) ? result.files.filter(isWikiFile) : [];
-}
-
-async function seedWiki(env: Env, wiki: string, actor: string): Promise<void> {
-  await roomControl(env, wiki, "/seed", { wiki, actor });
-}
-
-async function deleteWikiFiles(env: Env, wiki: string): Promise<void> {
-  await roomControl(env, wiki, "/delete");
-}
-
-async function applyWikiChanges(env: Env, wiki: string, actor: string, changes: FileChange[], command: string): Promise<Record<string, unknown>> {
-  return roomControl(env, wiki, "/apply", { actor, changes, command });
-}
-
-async function wikiAudit(env: Env, wiki: string, limit: number): Promise<Array<Record<string, unknown>>> {
-  const result = await roomControl(env, wiki, "/audit", { limit });
-  return Array.isArray(result.events) ? result.events as Array<Record<string, unknown>> : [];
-}
-
-async function roomControl(env: Env, wiki: string, path: string, body?: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const id = env.ROOMS.idFromName(sanitizeWiki(wiki));
-  const stub = env.ROOMS.get(id);
-  const response = await stub.fetch(`https://wiki.local${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
-  return response.json();
+  return runShellV2(env, userId, headerToken, ip, command, stdin);
 }
 
 async function registry(env: Env, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -1455,27 +1142,9 @@ function mcpTransportStorage(env: Env, request: Request) {
   };
 }
 
-function parseChanges(value: unknown): FileChange[] {
-  if (!Array.isArray(value)) return [];
-  return value.map((entry) => {
-    const record = entry && typeof entry === "object" ? entry as Record<string, unknown> : {};
-    return {
-      path: String(record.path || ""),
-      content: typeof record.content === "string" ? record.content : undefined,
-      deleted: record.deleted === true,
-    };
-  });
-}
-
 async function readJson(request: Request): Promise<Record<string, unknown>> {
   const value = await request.json().catch(() => ({}));
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function isWikiFile(value: unknown): value is WikiFile {
-  if (!value || typeof value !== "object") return false;
-  const record = value as Record<string, unknown>;
-  return typeof record.path === "string" && typeof record.content === "string";
 }
 
 function parseScopes(value: unknown, fallback: Scope[]): Scope[] {
@@ -1493,10 +1162,6 @@ function parseLimit(value: unknown): number {
   const parsed = typeof value === "number" ? value : Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_LIMIT;
   return Math.min(parsed, MAX_LIMIT);
-}
-
-function cleanFileContent(value: string): string {
-  return value.slice(0, MAX_FILE_CHARS);
 }
 
 function sanitizeWiki(wiki: string): string {
@@ -1543,6 +1208,206 @@ function bearerToken(request: Request): string {
   const header = request.headers.get("authorization") || "";
   return header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
 }
+
+// ─── R2 helpers ─────────────────────────────────────────────────────────
+// All keys are users/<user_id>/<room>/<path>. These helpers own the
+// prefix layout so callers never construct the key string themselves.
+function r2KeyForRoom(userId: string, room: string): string {
+  return `users/${userId}/${sanitizeWiki(room)}/`;
+}
+
+function r2KeyForFile(userId: string, room: string, path: string): string {
+  return `users/${userId}/${sanitizeWiki(room)}/${sanitizeFilePath(path)}`;
+}
+
+async function r2List(env: Env, userId: string, room?: string): Promise<R2Object[]> {
+  const prefix = room ? r2KeyForRoom(userId, room) : `users/${userId}/`;
+  const out: R2Object[] = [];
+  let cursor: string | undefined;
+  // R2 caps a single list at 1000; loop until we have everything for the user.
+  // For v2.0 single-user usage this is always one page in practice.
+  do {
+    const page = await env.ROOMS_R2.list({ prefix, cursor, limit: 1000 });
+    out.push(...page.objects);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return out;
+}
+
+async function r2Get(env: Env, userId: string, room: string, path: string): Promise<string | null> {
+  const obj = await env.ROOMS_R2.get(r2KeyForFile(userId, room, path));
+  return obj ? await obj.text() : null;
+}
+
+async function r2Put(env: Env, userId: string, room: string, path: string, content: string): Promise<void> {
+  await env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content);
+}
+
+// ─── v2 shell exec ──────────────────────────────────────────────────
+// Entrypoint replacing v1's runShell(). Every command goes to a fresh
+// session inside the per-user warm sandbox — control-plane verbs live
+// on dedicated /account/room-* HTTP endpoints, not in bash.
+async function runShellV2(env: Env, userId: string, headerToken: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
+  // Real bash via the sandbox. One sandbox per user, fresh session per call.
+  const sandbox = await ensureSandboxReady(env, userId);
+  const sessionId = `cmd-${crypto.randomUUID()}`;
+  let exitCode = 0;
+  let stdout = "";
+  let stderr = "";
+  let session: Awaited<ReturnType<Sandbox["createSession"]>> | undefined;
+  try {
+    session = await sandbox.createSession({
+      id: sessionId,
+      cwd: "/",
+      env: { HOME: "/tmp/bashroom-home" },
+    });
+    const result = await session.exec(command.slice(0, MAX_COMMAND_CHARS), {
+      timeout: 30_000,
+      ...(stdin ? { stdin } : {}),
+    });
+    stdout = result.stdout ?? "";
+    stderr = result.stderr ?? "";
+    exitCode = result.exitCode ?? 0;
+  } catch (error) {
+    stderr = `bashroom: ${error instanceof Error ? error.message : String(error)}\n`;
+    exitCode = 1;
+  } finally {
+    // Two-step cleanup: killAllProcesses() reaps the in-container process
+    // (a timed-out exec leaves it running per Cloudflare's docs), then
+    // deleteSession() removes the session handle. Both calls are
+    // best-effort — never block the response on cleanup.
+    if (session) {
+      await session.killAllProcesses().catch(() => undefined);
+    }
+    await sandbox.deleteSession(sessionId).catch(() => undefined);
+  }
+
+  // Audit. Best-effort; never block the response on logging.
+  await registry(env, "/audit-append", {
+    user_id: userId, room: "", actor: "sandbox", kind: "exec", path: null, command: compact(command), exit_code: exitCode,
+  }).catch(() => undefined);
+
+  return { stdout, stderr, exitCode, changed: 0, changed_paths: [] };
+}
+
+// ─── Sandbox readiness ──────────────────────────────────────────────
+// One Sandbox DO per user_id. We keep it warm (sleepAfter is set on the
+// class) and mount /rooms lazily — on the first request after a cold
+// start, the FUSE mount is established. Subsequent requests skip the
+// mount call (mountBucket is idempotent-ish; we probe first to avoid
+// the extra round trip).
+async function ensureSandboxReady(env: Env, userId: string): Promise<Sandbox> {
+  const { getSandbox } = await import("@cloudflare/sandbox");
+  // Sandbox IDs are used in preview URLs; normalizeId lowercases them
+  // and matches the SDK's documented future-default.
+  const sandbox = getSandbox(env.SANDBOXES, userId, { normalizeId: true });
+  if (!(await isRoomsMounted(sandbox))) {
+    if (!env.R2_ENDPOINT || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
+      throw new Error("R2 credentials not configured (R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)");
+    }
+    // RemoteMountBucketOptions: production s3fs-FUSE mode. First arg is
+    // the bucket name. R2 credentials are scoped to bashroom-rooms only.
+    await sandbox.mountBucket(env.R2_BUCKET_NAME || "bashroom-rooms", "/rooms", {
+      endpoint: env.R2_ENDPOINT,
+      provider: "r2",
+      prefix: `/users/${userId}/`,
+      credentials: {
+        accessKeyId: env.R2_ACCESS_KEY_ID,
+        secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+      },
+    });
+  }
+  return sandbox;
+}
+
+async function isRoomsMounted(sandbox: Sandbox): Promise<boolean> {
+  try {
+    const result = await sandbox.exec("mountpoint -q /rooms && echo MOUNTED || echo NOT_MOUNTED");
+    return result.stdout.trim() === "MOUNTED";
+  } catch {
+    return false;
+  }
+}
+
+// Default seed shapes how agents use the room. Per Anthropic + Lance
+// Martin context-engineering guidance: keep AGENTS.md terse and
+// rule-based (long convention files get ignored), and ship a directory
+// pattern that demonstrates folders so agents inherit it. Mirrors the
+// v1 Room.seed() output byte-for-byte so existing rooms and new ones
+// look identical.
+async function seedR2Room(env: Env, userId: string, room: string, actor: string): Promise<void> {
+  const today = new Date().toISOString().slice(0, 10);
+  const cleanActor = sanitizeActor(actor || "actor");
+  const files: Record<string, string> = {
+    "README.md":
+      `# ${room}\n\nA Bashroom room. Multiple agents read and write the files here through ` +
+      `durable bash. Edit this README to describe what this specific room is for.\n`,
+    "AGENTS.md":
+      `# Bashroom room conventions\n\n` +
+      `Shared Markdown filesystem. Multiple agents read and write here.\n` +
+      `Reorganize freely — rename, split, merge, or delete files when the\n` +
+      `structure no longer fits. Every change is in \`room history\`, so\n` +
+      `nothing is ever truly lost.\n\n` +
+      `## Default shape\n\n` +
+      `- Dated entries → \`log/YYYY-MM-DD.md\` (one file per day, append \`## HH:MM topic\` sections)\n` +
+      `- Standalone topics → \`notes/<topic>.md\` (one file per subject)\n` +
+      `- Top-level \`index.md\` is the table of contents — keep it current when files change\n\n` +
+      `## Rules\n\n` +
+      `- IMPORTANT: append to log files (\`>>\`), don't overwrite (\`>\`) — preserves chronology\n` +
+      `- IMPORTANT: update \`index.md\` whenever the file tree changes\n` +
+      `- Markdown only. No binaries.\n` +
+      `- If a file gets long, split it into a folder.\n`,
+    "index.md":
+      `# Index\n\n` +
+      `- [README.md](README.md) — what this room is for\n` +
+      `- [AGENTS.md](AGENTS.md) — conventions for agents working here\n` +
+      `- [log/](log/) — dated entries, newest day at top of folder\n` +
+      `- [notes/](notes/) — topical notes\n`,
+    [`log/${today}.md`]:
+      `# ${today}\n\n` +
+      `## room created\n\n` +
+      `Created by ${cleanActor}. Append further entries under \`## HH:MM topic\` headings.\n`,
+    "notes/README.md":
+      `# notes/\n\n` +
+      `One Markdown file per topic. Filename = topic, kebab-case (e.g. \`auth-flow.md\`).\n` +
+      `Delete this README when the folder has real content.\n`,
+  };
+  // Parallel PUTs — each room has ~5 files and R2 PUTs are independent.
+  await Promise.all(Object.entries(files).map(([path, content]) => r2Put(env, userId, room, path, content)));
+  await registry(env, "/audit-append", {
+    user_id: userId, room, actor: cleanActor, kind: "seed", path: null, command: null, exit_code: 0,
+  });
+}
+
+// Snapshot a room's full file tree out of R2 as { path, content }[] —
+// the same shape /web previously got from Room.snapshot(). Reads happen
+// in parallel; this is fine for v2.0 single-user rooms (avg <20 files).
+async function r2Snapshot(env: Env, userId: string, room: string): Promise<Array<{ path: string; content: string }>> {
+  const objects = await r2List(env, userId, room);
+  const prefix = r2KeyForRoom(userId, room);
+  return Promise.all(
+    objects.map(async (o) => {
+      const obj = await env.ROOMS_R2.get(o.key);
+      return { path: o.key.slice(prefix.length), content: obj ? await obj.text() : "" };
+    }),
+  );
+}
+
+async function r2DeletePrefix(env: Env, userId: string, room: string): Promise<number> {
+  // R2 delete() takes up to 1000 keys per call. Page through list() and
+  // batch-delete until the prefix is empty.
+  const prefix = r2KeyForRoom(userId, room);
+  let deleted = 0;
+  while (true) {
+    const page = await env.ROOMS_R2.list({ prefix, limit: 1000 });
+    if (!page.objects.length) break;
+    await env.ROOMS_R2.delete(page.objects.map((o) => o.key));
+    deleted += page.objects.length;
+    if (!page.truncated) break;
+  }
+  return deleted;
+}
+
 
 function mcpSessionId(request: Request): string {
   return request.headers.get("mcp-session-id") || "";
@@ -1627,14 +1492,6 @@ async function sha256(value: string): Promise<string> {
   return base64url(new Uint8Array(hash));
 }
 
-function cmdOk(stdout: string): ExecResult {
-  return { stdout, stderr: "", exitCode: 0 };
-}
-
-function cmdErr(stderr: string): ExecResult {
-  return { stdout: "", stderr, exitCode: 1 };
-}
-
 function formatShellResult(result: ShellResult): string {
   const output = `${result.stdout}${result.stderr ? `${result.stderr}` : ""}`;
   const paths = result.changed_paths.length ? ` ${result.changed_paths.join(" ")}` : "";
@@ -1660,21 +1517,6 @@ function html(value: string, status = 200): Response {
     status,
     headers: { "content-type": "text/html; charset=utf-8" },
   });
-}
-
-function roomHelp(): string {
-  return `Bashroom commands
-
-room create [room] [--actor <actor>]
-room join <invite> [--actor <actor>]
-room pair [room]
-room mounts
-room who [room]
-room history [room] [limit]
-room delete <room>
-
-Room files are mounted at /rooms/<room>. Use normal bash to read and write Markdown files.
-`;
 }
 
 function httpHelpText(): string {

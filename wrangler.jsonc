@@ -7,15 +7,29 @@
   "durable_objects": {
     "bindings": [
       {
-        "name": "ROOMS",
-        "class_name": "Room"
-      },
-      {
         "name": "REGISTRY",
         "class_name": "Registry"
+      },
+      {
+        "name": "SANDBOXES",
+        "class_name": "Sandbox"
       }
     ]
   },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "lite",
+      "max_instances": 50
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ROOMS_R2",
+      "bucket_name": "bashroom-rooms"
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",
@@ -24,11 +38,20 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["Registry"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["Sandbox"]
+    },
+    {
+      "tag": "v4",
+      "deleted_classes": ["Room"]
     }
   ],
   "vars": {
     "GITHUB_CLIENT_ID": "Ov23ligO8e72A6E9MGRx",
-    "BASHROOM_PUBLIC_URL": "https://bashroom.sdan.io"
+    "BASHROOM_PUBLIC_URL": "https://bashroom.sdan.io",
+    "R2_BUCKET_NAME": "bashroom-rooms"
   },
   "observability": {
     "enabled": true

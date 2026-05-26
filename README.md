@@ -1,8 +1,12 @@
 # Bashroom
 
-Bashroom is a durable bash room for coding agents.
+Bashroom is a per-user cloud shell for coding agents.
 
-Agents get one MCP tool. The tool runs sandboxed `just-bash` against Markdown files stored in Cloudflare Durable Objects. Bashroom handles access control and durable invites.
+Agents get one MCP tool. The tool runs real `bash` inside a Cloudflare
+Sandbox, with `/rooms` FUSE-mounted from Cloudflare R2. Bashroom handles
+access control, durable room files, and audit. Room admin (create, join,
+pair, delete) lives in the CLI on the user's terminal — agents only see
+real bash.
 
 ## Connect
 
@@ -31,27 +35,41 @@ bashroom({ command, stdin? })
 Inside bash, authorized rooms appear under `/rooms`:
 
 ```bash
-room create
-room mounts
+ls /rooms
 tree /rooms
-cat /rooms/syncing-reviewing-shipping/index.md
-echo "## note" >> /rooms/syncing-reviewing-shipping/log.md
+cat /rooms/<room>/index.md
+echo "## note" >> /rooms/<room>/log.md
+rg "thing I care about" /rooms
 ```
 
-Each command gets fresh shell state. File changes under `/rooms` persist after the command. Temporary shell variables, functions, cwd changes, and `/tmp` do not persist.
+Each MCP call gets a fresh session — cwd, env, and `/tmp` do not leak
+between calls. Only `/rooms` (R2-backed) persists. The sandbox stays warm
+between calls for ~15 minutes, so subsequent calls skip the cold-start tax.
 
-## Commands
+## Shell tools
 
-```text
-room create [room] [--actor <actor>]
-room join <invite> [--actor <actor>]
-room pair [room]
-room mounts
-room who [room]
-room history [room] [limit]
+The sandbox ships: `bash`, `git`, `ripgrep` (`rg`), `jq`, `curl`, `wget`,
+`find`, `fd`, `less`, `tree`, `vim-tiny`, `rsync`, `diff`, `ps`, `pgrep`,
+`pkill`, `top`, `file`, `openssl`, `node`, `bun`, `zip`, `unzip`, `xz`,
+`ca-certificates`. Standard Linux utilities work as expected.
+
+Outbound network is denied by default.
+
+## Room admin (CLI only)
+
+Room lifecycle is a human operation, not an agent operation. Use the CLI:
+
+```bash
+bashroom mounts                       # list your rooms
+bashroom create-room <name>           # create a new room
+bashroom join <invite>                # redeem a pair-code invite
+bashroom pair <room>                  # mint an invite to share
+bashroom destroy <room> --yes         # remove a room
+bashroom who <room>                   # list actors in a room
+bashroom history <room> [--limit N]   # per-room audit log
 ```
 
-Everything else is normal bash over files. Use `cat`, `grep`, `rg`, `sed`, `jq`, `tree`, redirects, pipes, or heredocs as needed.
+These never reach the MCP agent.
 
 ## Auth
 
@@ -77,16 +95,16 @@ This flag is intentionally explicit because full outbound network makes a public
 
 ## CLI
 
-The CLI is a human fallback for the same bash surface.
+The CLI is the human surface — both for room admin (above) and as a
+fallback for the same bash that the MCP agent sees.
 
 ```bash
 npm install -g bashroom
-bashroom login sdan
-bashroom room create my-room
-bashroom rooms
+bashroom login
+bashroom create-room my-room
+bashroom mounts
 bashroom mcp
-bashroom 'room create'
-bashroom 'room mounts'
+bashroom 'ls /rooms'
 bashroom 'cat /rooms/my-room/index.md'
 ```
 
@@ -100,7 +118,9 @@ Two panes, Notion-shape: sidebar plus content. Single inline HTML served from th
 
 ## Direction
 
-Bashroom is becoming a logged-in shared memory layer for coding agents. The next design target is in `docs/product-roadmap.md`.
+Bashroom is becoming a logged-in cloud shell and shared memory layer for coding
+agents. The v2 architecture is documented in `ARCHITECTURAL.md`; the product
+sequence is in `docs/product-roadmap.md`.
 
 ## Self-host
 

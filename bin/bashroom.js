@@ -16,17 +16,31 @@ Human fallback for Bashroom durable bash rooms.
 Usage:
   bashroom [--url <url>] <bash command>
   bashroom [--url <url>] -- <bash command>
-  bashroom login
-  bashroom rooms
-  bashroom room create [room] [--actor <actor>]
-  bashroom mcp
+
+Account:
+  bashroom login                       Device-flow OAuth login.
+  bashroom rooms                       List rooms you can access (with role + actor).
+
+Room admin (human-only, never reachable from the MCP agent):
+  bashroom create-room [room] [--actor <actor>]
+                                       Create a new room (room name optional; auto-slug if omitted).
+  bashroom join <invite> [--actor <actor>]
+                                       Redeem a pair-code invite.
+  bashroom pair <room>                 Mint an invite for an existing room.
+  bashroom destroy <room> --yes        Destroy a room and purge its R2 storage.
+  bashroom mounts                      List your mounted rooms with actor + scopes.
+  bashroom who <room>                  List the actors present in a room.
+  bashroom history <room> [--limit N]  Per-room audit log (default 20 most recent).
+
+Shell:
+  bashroom <bash command>              Run bash against /rooms (FUSE-mounted R2).
+  bashroom mcp                         Start the stdio MCP server (for agent wiring).
 
 Examples:
   bashroom login
   bashroom rooms
-  bashroom room create suryad
-  bashroom 'room create'
-  bashroom 'room mounts'
+  bashroom create-room suryad
+  bashroom pair suryad
   bashroom 'tree /rooms'
   bashroom 'cat /rooms/my-room/index.md'
   echo '# Notes' | bashroom 'cat > /rooms/my-room/notes.md'
@@ -200,6 +214,109 @@ async function createRoom(baseUrl, args) {
   console.log(`created ${result.wiki}`);
 }
 
+// Redeem a pair-code invite — `bashroom join <invite> [--actor X]`.
+async function joinRoom(baseUrl, args) {
+  const current = account(baseUrl);
+  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
+
+  const mutableArgs = [...args];
+  const actor = parseFlag(mutableArgs, "--actor") || `cli-${os.hostname().replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 32)}`;
+  const invite = mutableArgs[0] || "";
+  if (!invite) throw new Error("usage: bashroom join <invite> [--actor X]");
+  const result = await api(baseUrl, "/account/room-join", { invite, actor }, current.token);
+  console.log(`joined ${result.wiki}`);
+}
+
+// Mint a pair-code invite for an existing room — `bashroom pair <room>`.
+// Output matches v1's `room pair` format exactly: 3 lines (URI, code, expiry).
+async function pairRoom(baseUrl, args) {
+  const current = account(baseUrl);
+  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
+
+  const room = args[0] || "";
+  if (!room) throw new Error("usage: bashroom pair <room>");
+  const result = await api(baseUrl, "/account/room-pair", { wiki: room }, current.token);
+  console.log(result.invite);
+  console.log(`code ${result.code}`);
+  console.log(`expires ${result.expires_at}`);
+}
+
+// Destroy a room (drop Registry rows + purge R2 prefix). Hard-requires --yes.
+async function destroyRoom(baseUrl, args) {
+  const mutableArgs = [...args];
+  const yes = mutableArgs.includes("--yes");
+  if (yes) mutableArgs.splice(mutableArgs.indexOf("--yes"), 1);
+  const room = mutableArgs[0] || "";
+  if (!room || !yes) {
+    process.stderr.write("usage: bashroom destroy <room> --yes\n");
+    process.exit(1);
+  }
+
+  const current = account(baseUrl);
+  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
+
+  const result = await api(baseUrl, "/account/room-delete", { wiki: room }, current.token);
+  console.log(`destroyed ${result.wiki || room}`);
+}
+
+// List the user's mounted rooms — `bashroom mounts`.
+// Output: one line per mount, tab-separated: <path>\t<actor>\t<scopes_csv>.
+async function listMounts(baseUrl) {
+  const current = account(baseUrl);
+  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
+
+  const result = await api(baseUrl, "/account/room-mounts", {}, current.token);
+  const mounts = Array.isArray(result.mounts) ? result.mounts : [];
+  if (!mounts.length) {
+    console.log("No mounted rooms.");
+    return;
+  }
+  for (const mount of mounts) {
+    const scopes = Array.isArray(mount.scopes) ? mount.scopes.join(",") : "";
+    console.log(`/rooms/${mount.wiki}\t${mount.actor}\t${scopes}`);
+  }
+}
+
+// List the actors present in a room — `bashroom who <room>`.
+async function whoInRoom(baseUrl, args) {
+  const current = account(baseUrl);
+  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
+
+  const room = args[0] || "";
+  if (!room) throw new Error("usage: bashroom who <room>");
+  const result = await api(baseUrl, "/account/room-who", { wiki: room }, current.token);
+  const actors = Array.isArray(result.actors) ? result.actors : [];
+  for (const actor of actors) console.log(actor);
+}
+
+// Per-room audit history — `bashroom history <room> [--limit N]`.
+// Line format matches v1: `#<id> <ts> <actor> <kind>[ <path>]: <command-or-body>`.
+async function roomHistory(baseUrl, args) {
+  const current = account(baseUrl);
+  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
+
+  const mutableArgs = [...args];
+  const limitRaw = parseFlag(mutableArgs, "--limit");
+  const room = mutableArgs[0] || "";
+  if (!room) throw new Error("usage: bashroom history <room> [--limit N]");
+  const limit = limitRaw === undefined ? 20 : Number(limitRaw);
+  const result = await api(baseUrl, "/account/room-history", { room, limit }, current.token);
+  const events = Array.isArray(result.events) ? result.events : [];
+  if (!events.length) {
+    console.log("No history.");
+    return;
+  }
+  for (const event of events) {
+    const id = event.id ?? "?";
+    const ts = event.ts || "";
+    const actor = event.actor || "";
+    const kind = event.kind || "";
+    const pathPart = event.path ? ` ${event.path}` : "";
+    const body = event.command ? event.command : "";
+    console.log(`#${id} ${ts} ${actor} ${kind}${pathPart}: ${body}`);
+  }
+}
+
 async function runBash(baseUrl, command, stdin) {
   const headers = {
     "content-type": "application/json",
@@ -289,8 +406,44 @@ async function main() {
     return;
   }
 
+  // Canonical create. `room create` kept below as a back-compat alias.
+  if (args[0] === "create-room") {
+    await createRoom(baseUrl, args.slice(1));
+    return;
+  }
+
   if (args[0] === "room" && args[1] === "create") {
     await createRoom(baseUrl, args.slice(2));
+    return;
+  }
+
+  if (args[0] === "join") {
+    await joinRoom(baseUrl, args.slice(1));
+    return;
+  }
+
+  if (args[0] === "pair") {
+    await pairRoom(baseUrl, args.slice(1));
+    return;
+  }
+
+  if (args[0] === "destroy") {
+    await destroyRoom(baseUrl, args.slice(1));
+    return;
+  }
+
+  if (args[0] === "mounts") {
+    await listMounts(baseUrl);
+    return;
+  }
+
+  if (args[0] === "who") {
+    await whoInRoom(baseUrl, args.slice(1));
+    return;
+  }
+
+  if (args[0] === "history") {
+    await roomHistory(baseUrl, args.slice(1));
     return;
   }
 

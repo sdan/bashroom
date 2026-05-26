@@ -1,8 +1,10 @@
 # Bashroom Product Roadmap
 
-Bashroom is the shared memory layer for coding agents.
+Bashroom is the shared cloud shell and memory layer for coding agents.
 
-It should let coding agents and humans exchange durable project context through a small bash-addressable filesystem. Rooms are the product primitive. Sandboxed execution is outside the core scope.
+It should let coding agents and humans exchange durable project context through
+a bash-addressable filesystem. Rooms are the product primitive. In v2, the bash
+surface is a real Cloudflare Sandbox backed by R2-mounted room files.
 
 ## Goal
 
@@ -23,15 +25,15 @@ Bashroom owns:
 
 - user accounts and room membership
 - durable shared room files
+- per-user cloud shell execution
 - actor attribution and audit logs
 - local CLI and MCP access
 - syncing session history into rooms
 
 Bashroom does not own:
 
-- a full agent sandbox
 - a transcript viewer
-- a general FUSE filesystem
+- a local FUSE filesystem on the user's machine
 - model summarization as a required runtime dependency
 
 ## Identity Model
@@ -47,7 +49,12 @@ room:  suryad
 
 Room ownership and account-level limits attach to the user. Writes are attributed to actors.
 
-Pair codes remain useful for inviting another agent or machine into a room. They should mint scoped actor credentials. The user's account token should stay local.
+Pair codes remain useful for inviting another agent or machine into a room. They
+should mint scoped actor credentials. The user's account token should stay
+local.
+
+V2 initially mounts only rooms owned by the signed-in user. Shared rooms remain
+in the Registry schema but are deferred until the v2.1 storage model is chosen.
 
 ## Local MCP
 
@@ -119,6 +126,18 @@ Status: implemented in the CLI. This is now the default logged-in MCP path.
 - Add conventions for `index.md`, `log.md`, `handoff.md`, and `sessions/index.md`.
 - Let agents maintain concise summaries after raw transcripts are synced.
 
+### Phase 6: Cloud Shell v2
+
+- Add an R2 bucket for room files using `users/<user_id>/<room>/<path>`.
+- Add a Cloudflare Sandbox binding and image with bash, coreutils, ripgrep, git, jq, and curl.
+- Route flagged users from the existing MCP tool to `runShellV2()`.
+- Preserve v1 as rollback until migrated users have soaked.
+- Move command audit to the Registry Durable Object.
+- Keep outbound network disabled by default.
+
 ## Near-Term Rule
 
-Keep the hosted Worker small. Put local filesystem access, transcript parsing, and stdio MCP in the CLI.
+Keep the hosted Worker small where possible, but v2 intentionally moves command
+execution into a managed cloud shell. Put local transcript parsing and stdio MCP
+in the CLI; put remote shell execution, room mounting, and audit in the Worker
+and Sandbox stack.

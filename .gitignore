@@ -7,6 +7,10 @@ npm-debug.log*
 .ai/
 .convx/
 
+# v1 -> v2 migration backups (private room contents).
+# Kept locally as the rollback artifact; not for git history.
+backup/
+
 # Web HTML kept private — landing, device pages, and reader.
 # These exist on the deployed worker but are not source-public.
 src/web-landing.ts
