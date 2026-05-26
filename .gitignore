@@ -16,3 +16,7 @@ backup/
 src/web-landing.ts
 src/web-device.ts
 src/web-ui.ts
+
+# Skills installed via `npx skills add` — vendor cache, not project source.
+.agents/
+skills-lock.json
