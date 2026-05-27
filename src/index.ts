@@ -73,6 +73,10 @@ type AccountAuth = {
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MAX_COMMAND_CHARS = 32_000;
+// Hard cap on bashroom_write content. R2 supports much larger objects,
+// but the MCP tool round-trip is JSON-serialized through the wire, so
+// huge payloads are awkward. 5 MB is well above any reasonable note.
+const MAX_WRITE_BYTES = 5_000_000;
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -922,13 +926,30 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
     "Run bash against /rooms, a FUSE-mounted filesystem backed by Cloudflare R2. Real Linux shell with bash, git, ripgrep, jq, find, less, tree, fd, rsync. Use ls /rooms to see your rooms; everything else is normal bash.",
     {
       command: z.string().min(1).max(MAX_COMMAND_CHARS).describe("Bash command to run, for example: ls /rooms; cat /rooms/my-room/index.md"),
-      stdin: z.string().optional().describe("Optional standard input for the command."),
+      stdin: z.string().optional().describe("Optional standard input for the command. Piped to the command via base64 round-trip so any byte sequence (quotes, newlines, NUL) is safe."),
     },
     async ({ command, stdin }) => {
       const result = await runShell(env, headerToken, mcpSessionId, ip, command, stdin || "");
       return {
         content: [{ type: "text", text: formatShellResult(result) }],
         isError: result.exitCode !== 0,
+      };
+    },
+  );
+
+  server.tool(
+    "bashroom_write",
+    "Write a file to /rooms directly, bypassing bash quoting. Use this instead of `echo ... > file` or heredoc when content contains quotes, backticks, $variables, or arbitrary bytes. The path must be inside /rooms/<room>/.",
+    {
+      path: z.string().min(1).max(1024).describe("Absolute path under /rooms, e.g. /rooms/my-room/notes/today.md"),
+      content: z.string().max(MAX_WRITE_BYTES).describe("File content. UTF-8 by default; pass base64-encoded bytes with encoding='base64' for binary."),
+      encoding: z.enum(["utf-8", "base64"]).optional().describe("'utf-8' (default) treats content as text; 'base64' decodes content as binary before writing."),
+    },
+    async ({ path, content, encoding }) => {
+      const result = await runWriteFile(env, headerToken, mcpSessionId, ip, path, content, encoding ?? "utf-8");
+      return {
+        content: [{ type: "text", text: formatWriteResult(result) }],
+        isError: !result.ok,
       };
     },
   );
@@ -1330,6 +1351,67 @@ async function runShell(env: Env, headerToken: string, _mcpSessionId: string, ip
   return runShellV2(env, userId, headerToken, ip, command, stdin);
 }
 
+// Result of bashroom_write — separate shape from ShellResult since this
+// path doesn't go through bash. `bytes` is the length actually written
+// (after base64 decode if applicable).
+interface WriteResult {
+  ok: boolean;
+  path: string;
+  bytes: number;
+  error?: string;
+}
+
+// bashroom_write — directly call sandbox.writeFile(), bypassing bash
+// quoting. Resolves user_id same way runShell does; writes into the
+// per-user FUSE mount at /rooms/.
+async function runWriteFile(env: Env, headerToken: string, _mcpSessionId: string, ip: string, path: string, content: string, encoding: "utf-8" | "base64"): Promise<WriteResult> {
+  const account = await registry(env, "/account-rooms", { token: headerToken, ip });
+  if (account.ok === false) {
+    return { ok: false, path, bytes: 0, error: String(account.error || "unauthorized") };
+  }
+  const userId = String(account.user_id || "");
+  if (!userId) {
+    return { ok: false, path, bytes: 0, error: "no account" };
+  }
+  // Path must live under /rooms. Anything else is rejected — the sandbox
+  // mounts /rooms from R2; writes elsewhere don't persist anyway.
+  if (!path.startsWith("/rooms/")) {
+    return { ok: false, path, bytes: 0, error: "path must be under /rooms/" };
+  }
+  try {
+    const sandbox = await ensureSandboxReady(env, userId);
+    const sessionId = `write-${crypto.randomUUID()}`;
+    let session: Awaited<ReturnType<Sandbox["createSession"]>> | undefined;
+    try {
+      session = await sandbox.createSession({
+        id: sessionId,
+        cwd: "/",
+        env: { HOME: "/tmp/bashroom-home" },
+      });
+      // SDK accepts encoding: 'utf-8' (default) or 'base64'. We pass through.
+      await session.writeFile(path, content, { encoding });
+      // Best-effort byte count for the audit / response. For base64 it's
+      // the decoded length; for utf-8 it's the UTF-8 byte length.
+      const bytes = encoding === "base64"
+        ? Math.floor((content.length * 3) / 4)
+        : new TextEncoder().encode(content).length;
+      return { ok: true, path, bytes };
+    } finally {
+      await sandbox.deleteSession(sessionId).catch(() => undefined);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, path, bytes: 0, error: message };
+  }
+}
+
+function formatWriteResult(result: WriteResult): string {
+  if (!result.ok) {
+    return `[bashroom_write] error=${result.error || "unknown"} path=${result.path}`;
+  }
+  return `[bashroom_write] wrote ${result.bytes} bytes to ${result.path}`;
+}
+
 async function registry(env: Env, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const stub = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
   const response = await stub.fetch(`https://registry.local${path}`, {
@@ -1557,15 +1639,33 @@ async function runShellV2(env: Env, userId: string, headerToken: string, ip: str
   let stdout = "";
   let stderr = "";
   let session: Awaited<ReturnType<Sandbox["createSession"]>> | undefined;
+  // Stdin via the SDK's ExecOptions does NOT work — `@cloudflare/sandbox`
+  // has no `stdin` field on its ExecOptions interface, so any value spread
+  // there is silently dropped. Wrap the stdin into the command line by
+  // base64-encoding it and piping `base64 -d` into the user's command.
+  // Safe against any byte sequence (including quotes, newlines, NUL) and
+  // adds ~33% encoding overhead for the stdin payload.
+  //
+  // `btoa` requires its input to be a binary string (each char ≤ 0xFF),
+  // so we go UTF-8 → bytes → binary-string first. This handles emoji,
+  // non-ASCII, etc. without errors.
+  function toBase64Utf8(s: string): string {
+    const bytes = new TextEncoder().encode(s);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+  const effectiveCommand = stdin
+    ? `printf %s ${JSON.stringify(toBase64Utf8(stdin))} | base64 -d | (${command})`
+    : command;
   try {
     session = await sandbox.createSession({
       id: sessionId,
       cwd: "/",
       env: { HOME: "/tmp/bashroom-home" },
     });
-    const result = await session.exec(command.slice(0, MAX_COMMAND_CHARS), {
+    const result = await session.exec(effectiveCommand.slice(0, MAX_COMMAND_CHARS), {
       timeout: 30_000,
-      ...(stdin ? { stdin } : {}),
     });
     stdout = result.stdout ?? "";
     stderr = result.stderr ?? "";
