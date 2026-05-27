@@ -5,8 +5,9 @@ Bashroom is a per-user cloud shell for coding agents.
 Agents get one MCP tool. The tool runs real `bash` inside a Cloudflare
 Sandbox, with `/rooms` FUSE-mounted from Cloudflare R2. Bashroom handles
 access control, durable room files, and audit. Room admin (create, join,
-pair, delete) lives in the CLI on the user's terminal — agents only see
-real bash.
+pair, mounts, who, history) is also available inside the sandbox through
+the visible `bashroom` helper. Destructive room deletion stays on the
+laptop CLI.
 
 ## Connect
 
@@ -40,6 +41,8 @@ tree /rooms
 cat /rooms/<room>/index.md
 echo "## note" >> /rooms/<room>/log.md
 rg "thing I care about" /rooms
+bashroom create-room new-room
+bashroom rooms
 ```
 
 Each MCP call gets a fresh session — cwd, env, and `/tmp` do not leak
@@ -55,9 +58,9 @@ The sandbox ships: `bash`, `git`, `ripgrep` (`rg`), `jq`, `curl`, `wget`,
 
 Outbound network is denied by default.
 
-## Room admin (CLI only)
+## Room admin
 
-Room lifecycle is a human operation, not an agent operation. Use the CLI:
+From the laptop CLI:
 
 ```bash
 bashroom mounts                       # list your rooms
@@ -69,7 +72,23 @@ bashroom who <room>                   # list actors in a room
 bashroom history <room> [--limit N]   # per-room audit log
 ```
 
-These never reach the MCP agent.
+Inside the sandbox, `/usr/local/bin/bashroom` supports the non-destructive
+control surface:
+
+```bash
+bashroom rooms
+bashroom create-room <name>
+bashroom mounts
+bashroom who <room>
+bashroom history <room> [--limit N]
+bashroom pair <room>
+bashroom join <invite>
+```
+
+The sandbox helper sends no account token. Calls to `bashroom.internal`
+are intercepted by the Worker, which supplies identity from the
+authenticated sandbox context. `bashroom destroy`, `bashroom login`,
+`bashroom token`, and `bashroom mcp` remain laptop-only.
 
 ## Auth
 
@@ -85,7 +104,9 @@ The public service does not expose global room lists, global actor lists, public
 
 ## Network
 
-Network is disabled in the public shell by default. A self-hosted deployment can opt into full `curl` support with:
+Network is disabled in the public shell by default, except for the
+private `bashroom.internal` control channel used by the sandbox helper.
+A self-hosted deployment can opt into full `curl` support with:
 
 ```text
 BASHROOM_ENABLE_FULL_NETWORK=1
@@ -134,7 +155,7 @@ build time so there's one source of truth.
 ## Direction
 
 Bashroom is becoming a logged-in cloud shell and shared memory layer for coding
-agents. The v2 architecture is documented in `ARCHITECTURAL.md`; the product
+agents. The v3 architecture is documented in `ARCHITECTURAL.md`; the product
 sequence is in `docs/product-roadmap.md`.
 
 ## Self-host

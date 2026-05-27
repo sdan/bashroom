@@ -8,7 +8,8 @@ description: Per-user Linux shell with a durable shared Markdown filesystem at /
 `bashroom({ command, stdin? })` runs real `bash` inside a per-user
 Cloudflare Sandbox. Authorized rooms appear at `/rooms/<room>/...`,
 FUSE-mounted from Cloudflare R2. Use it like any Linux shell — there
-is no special command vocabulary.
+is no hidden command parser. Room admin is exposed through the visible
+`bashroom` executable inside the sandbox.
 
 ## Start
 
@@ -17,8 +18,26 @@ ls /rooms                 # what rooms am I in?
 tree /rooms/<room>        # deeper look at one room
 ```
 
-If no room fits the task, ask the human to create one — `create`,
-`join`, `pair`, `delete` are CLI-only and not reachable from this tool.
+If no room fits the task, create one yourself:
+
+```bash
+bashroom create-room my-room
+```
+
+## Room admin
+
+```bash
+bashroom rooms                    # list rooms you can access
+bashroom create-room my-room      # create and seed a room
+bashroom mounts                   # list mounted rooms with actor + scopes
+bashroom who my-room              # list actors in a room
+bashroom history my-room          # per-room audit log
+bashroom pair my-room             # mint a short-lived invite
+bashroom join <invite>            # redeem an invite
+```
+
+`bashroom login`, `bashroom token`, `bashroom mcp`, and
+`bashroom destroy` are laptop-only.
 
 ## Read and write
 
@@ -69,20 +88,19 @@ Standard Linux utilities work as expected.
 - **`rg /rooms` (all rooms) can time out** over the FUSE mount with
   many rooms or large trees. Scope to one room: `rg pattern /rooms/<room>`.
 - **Outbound network is denied.** `curl https://...` will fail.
+  The `bashroom` helper has a private internal control channel, but
+  arbitrary outbound HTTP remains unavailable.
 - **The 30-second command timeout** applies per call. Long-running work
   must be split, or it gets killed.
 - **R2 is strongly consistent per key**, so a `cat` after `>>` in the
   next session sees the appended content. But `ls` listings may briefly
   lag a write — re-run if a freshly-written file isn't visible.
-- **No `room` command in bash.** Earlier versions intercepted `room
-  <subcommand>` from the shell; that's removed. `ls /rooms` is the
-  orientation primitive.
+- **No hidden command interception.** `bashroom create-room ...` works
+  because `/usr/local/bin/bashroom` is on `PATH`; ordinary commands still
+  run as real bash.
 
 ## What this tool does NOT do
 
-- Create, join, pair, or delete rooms — those are human operations
-  run from the `bashroom` CLI.
-- Show room history or actor lists — ask the human if attribution
-  matters.
+- Delete rooms — destructive room removal is laptop-only.
 - Reach outbound network by default.
 - Persist shell state between calls.

@@ -20,3 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xz-utils \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
+
+COPY bin/sandbox-bashroom.js /usr/local/bin/bashroom
+RUN chmod +x /usr/local/bin/bashroom
+ENV BASHROOM_URL=http://bashroom.internal

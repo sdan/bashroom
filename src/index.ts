@@ -11,6 +11,8 @@ import { webIndexHtml } from "./web-ui";
 import { webLandingHtml } from "./web-landing";
 import { webDeviceHtml, webDeviceResultHtml } from "./web-device";
 
+export { ContainerProxy } from "@cloudflare/sandbox";
+
 type Env = {
   REGISTRY: DurableObjectNamespace<Registry>;
   SANDBOXES: DurableObjectNamespace<Sandbox>;
@@ -31,6 +33,13 @@ export class Sandbox extends SandboxBase<Env> {
   defaultPort = 3000;
   sleepAfter: string = "15m";
 }
+
+// Match the SDK's own pattern (see @cloudflare/sandbox's R2EgressProxyTarget):
+// assign outboundHandlers after the class declaration so the runtime lookup
+// finds it on the constructor, not buried in a transpiled static initializer.
+(Sandbox as unknown as { outboundHandlers: Record<string, unknown> }).outboundHandlers = {
+  bashroomControl: handleSandboxBashroomControl,
+};
 
 
 type Scope = "read" | "write" | "checkpoint" | "admin";
@@ -300,6 +309,66 @@ export class Registry extends DurableObject<Env> {
       return json(await this.createWiki(account.userId || "", account.handle || "user", String(body.room || body.wiki || ""), String(body.actor || "")));
     }
 
+    // Internal sandbox-control paths. These are not exposed by handleRequest();
+    // only Worker code calls them after the Sandbox outbound handler supplies
+    // a trusted user_id through per-sandbox outbound params.
+    if (request.method === "POST" && url.pathname === "/internal-account-rooms") {
+      const userId = String(body.user_id || "");
+      const user = this.userById(userId);
+      if (!user) return json({ ok: false, error: "unknown_user" }, 401);
+      return json({ ok: true, user_id: userId, handle: user.handle, rooms: this.accountRooms(userId) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal-room-create") {
+      const userId = String(body.user_id || "");
+      const user = this.userById(userId);
+      if (!user) return json({ ok: false, error: "unknown_user" }, 401);
+      return json(await this.createWiki(userId, user.handle, String(body.room || body.wiki || ""), String(body.actor || "")));
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal-room-join") {
+      const userId = String(body.user_id || "");
+      const user = this.userById(userId);
+      if (!user) return json({ ok: false, error: "unknown_user" }, 401);
+      return json(await this.join(userId, user.handle, String(body.invite || body.code || ""), String(body.actor || "")));
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal-room-pair") {
+      const userId = String(body.user_id || "");
+      const wiki = String(body.wiki || body.room || "");
+      const auth = this.authorizeUser(wiki, userId, "admin");
+      if (!auth.ok) return json(auth, 401);
+      return json(await this.createPairCode(wiki, parseScopes(body.scopes, ["read", "write", "checkpoint"])));
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal-room-mounts") {
+      const userId = String(body.user_id || "");
+      if (!this.userById(userId)) return json({ ok: false, error: "unknown_user" }, 401);
+      return json({ ok: true, mounts: this.mounts(userId) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal-room-who") {
+      const userId = String(body.user_id || "");
+      const wiki = String(body.wiki || body.room || "");
+      const auth = this.authorizeUser(wiki, userId, "read");
+      if (!auth.ok) return json(auth, 401);
+      return json({ ok: true, actors: this.actors(wiki) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal-room-history") {
+      const userId = String(body.user_id || "");
+      const room = typeof body.room === "string" && body.room ? sanitizeWiki(body.room) : null;
+      if (!this.userById(userId)) return json({ ok: false, error: "unknown_user" }, 401);
+      if (room) {
+        const auth = this.authorizeUser(room, userId, "read");
+        if (!auth.ok) return json(auth, 401);
+      }
+      return json({
+        ok: true,
+        events: this.auditList({ userId, room, limit: parseLimit(body.limit) }),
+      });
+    }
+
     if (request.method === "POST" && url.pathname === "/device-start") {
       const ip = String(body.ip || "unknown");
       const limited = this.checkBucket(`device:start:ip:${ip}`, CREATE_IP_CAPACITY, CREATE_IP_REFILL);
@@ -365,6 +434,14 @@ export class Registry extends DurableObject<Env> {
   // Create a room owned by the calling user. Inserts into wikis (the room
   // exists) and user_rooms (the user owns it). Returns the mount info — no
   // tokens are minted; access is via the user's account token.
+  private userById(userId: string): { handle: string } | null {
+    if (!userId) return null;
+    const row = this.ctx.storage.sql
+      .exec<{ handle: string }>("SELECT handle FROM users WHERE user_id = ?", userId)
+      .toArray()[0];
+    return row || null;
+  }
+
   private async createWiki(userId: string, handle: string, wiki: string, actor: string): Promise<Record<string, unknown>> {
     const cleanWiki = wiki.trim() ? sanitizeWiki(wiki) : this.generateWikiSlug();
     const cleanActor = sanitizeActor(actor || handle);
@@ -385,6 +462,23 @@ export class Registry extends DurableObject<Env> {
       now,
     );
     return { ok: true, wiki: cleanWiki, actor: cleanActor, scopes, role: "owner", user_id: userId };
+  }
+
+  private authorizeUser(wiki: string, userId: string, scope: Scope): AuthResult {
+    const cleanWiki = sanitizeWiki(wiki);
+    if (!this.userById(userId)) return { ok: false, error: "unknown_user" };
+    const row = this.ctx.storage.sql
+      .exec<{ actor: string; scopes: string }>(
+        "SELECT actor, scopes FROM user_rooms WHERE user_id = ? AND room = ?",
+        userId,
+        cleanWiki,
+      )
+      .toArray()[0];
+    if (!row) return { ok: false, error: "wrong_room" };
+
+    const scopes = row.scopes.split(",") as Scope[];
+    if (!hasScope(scopes, scope)) return { ok: false, error: "insufficient_scope" };
+    return { ok: true, wiki: cleanWiki, actor: row.actor, scopes, tokenId: userId };
   }
 
   // Redeem a pair code as the calling user. Inserts into user_rooms with the
@@ -1246,6 +1340,93 @@ async function registry(env: Env, path: string, body: Record<string, unknown>): 
   return response.json();
 }
 
+type SandboxOutboundContext = {
+  containerId?: string;
+  params?: unknown;
+};
+
+async function handleSandboxBashroomControl(request: Request, env: Env, context: SandboxOutboundContext): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.hostname !== "bashroom.internal") return json({ ok: false, error: "blocked_host" }, 403);
+  if (request.method !== "POST") return json({ ok: false, error: "method_not_allowed" }, 405);
+
+  const userId = sandboxOutboundUserId(context);
+  if (!userId) return json({ ok: false, error: "missing_sandbox_identity" }, 401);
+
+  const input = await readJson(request);
+  const result = await handleSandboxAccountRequest(env, userId, url.pathname, input);
+  return json(result, result.ok === false ? 400 : 200);
+}
+
+function sandboxOutboundUserId(context: SandboxOutboundContext): string {
+  const params = context.params && typeof context.params === "object"
+    ? context.params as { userId?: unknown }
+    : {};
+  return typeof params.userId === "string" ? params.userId : "";
+}
+
+async function handleSandboxAccountRequest(env: Env, userId: string, path: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (path === "/account/rooms") {
+    return registry(env, "/internal-account-rooms", { user_id: userId });
+  }
+
+  if (path === "/account/room-create") {
+    return createRoomForUser(env, userId, {
+      room: input.room || input.wiki || "",
+      actor: input.actor || defaultActor("agent"),
+    });
+  }
+
+  if (path === "/account/room-join") {
+    return registry(env, "/internal-room-join", {
+      user_id: userId,
+      invite: String(input.invite || ""),
+      actor: String(input.actor || defaultActor("agent")),
+    });
+  }
+
+  if (path === "/account/room-pair") {
+    return registry(env, "/internal-room-pair", {
+      user_id: userId,
+      wiki: String(input.wiki || input.room || ""),
+      scopes: input.scopes,
+    });
+  }
+
+  if (path === "/account/room-mounts") {
+    return registry(env, "/internal-room-mounts", { user_id: userId });
+  }
+
+  if (path === "/account/room-who") {
+    return registry(env, "/internal-room-who", {
+      user_id: userId,
+      wiki: String(input.wiki || input.room || ""),
+    });
+  }
+
+  if (path === "/account/room-history") {
+    return registry(env, "/internal-room-history", {
+      user_id: userId,
+      room: String(input.room || input.wiki || ""),
+      limit: input.limit,
+    });
+  }
+
+  return { ok: false, error: "not_found" };
+}
+
+async function createRoomForUser(env: Env, userId: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const result = await registry(env, "/internal-room-create", {
+    user_id: userId,
+    room: input.room || input.wiki || "",
+    actor: input.actor || defaultActor("agent"),
+  });
+  if (result.ok && typeof result.wiki === "string" && typeof result.actor === "string" && typeof result.user_id === "string") {
+    await seedR2Room(env, result.user_id, result.wiki, result.actor);
+  }
+  return result;
+}
+
 function mcpTransportStorage(env: Env, request: Request) {
   const requestSessionId = mcpSessionId(request);
   return {
@@ -1422,6 +1603,7 @@ async function ensureSandboxReady(env: Env, userId: string): Promise<Sandbox> {
   // Sandbox IDs are used in preview URLs; normalizeId lowercases them
   // and matches the SDK's documented future-default.
   const sandbox = getSandbox(env.SANDBOXES, userId, { normalizeId: true });
+  await sandbox.setOutboundByHost("bashroom.internal", "bashroomControl", { userId });
   if (!(await isRoomsMounted(sandbox))) {
     if (!env.R2_ENDPOINT || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
       throw new Error("R2 credentials not configured (R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)");
@@ -1687,15 +1869,15 @@ function llmsTxt(env: Env, request: Request): string {
 > Per-user Linux shell for coding agents. One MCP tool —
 > \`bashroom({ command, stdin? })\` — runs real \`bash\` inside a
 > Cloudflare Sandbox with \`/rooms\` FUSE-mounted from Cloudflare R2.
-> Room admin (create, join, pair, delete) lives in the CLI and is
-> never reachable from the agent.
+> Room admin is available through the visible \`bashroom\` helper inside
+> the sandbox; destructive room deletion stays laptop-only.
 
 ## Use
 
 - [README](${base}/help): one-page overview, install, and MCP wiring
 - [Skill](${base}/skill.md): the SKILL.md a Claude Code / Codex agent should load
 - [Source](https://github.com/sdan/bashroom): full code on GitHub
-- [Architecture](https://github.com/sdan/bashroom/blob/master/ARCHITECTURAL.md): how v2 is built
+- [Architecture](https://github.com/sdan/bashroom/blob/master/ARCHITECTURAL.md): how v3 is built
 
 ## MCP
 

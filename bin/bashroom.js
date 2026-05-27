@@ -22,7 +22,7 @@ Account:
   bashroom token                       Print your account token (for the /web reader).
   bashroom rooms                       List rooms you can access (with role + actor).
 
-Room admin (human-only, never reachable from the MCP agent):
+Room admin:
   bashroom create-room [room] [--actor <actor>]
                                        Create a new room (room name optional; auto-slug if omitted).
   bashroom join <invite> [--actor <actor>]
@@ -350,9 +350,9 @@ async function runStdioMcp(baseUrl) {
 
   server.tool(
     "bashroom",
-    "Run bash against durable Bashroom files. Use `room help` inside bash for create, join, pair, mounts, who, and history.",
+    "Run bash against durable Bashroom files. Use `bashroom create-room`, `bashroom rooms`, `bashroom mounts`, `bashroom who`, or `bashroom history` inside bash for room control.",
     {
-      command: z.string().min(1).describe("Bash command to run, for example: room mounts; cat /rooms/my-room/index.md"),
+      command: z.string().min(1).describe("Bash command to run, for example: bashroom mounts; cat /rooms/my-room/index.md"),
       stdin: z.string().optional().describe("Optional standard input for the command."),
     },
     async ({ command, stdin }) => {
