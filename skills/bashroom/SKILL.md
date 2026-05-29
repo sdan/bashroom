@@ -11,6 +11,11 @@ FUSE-mounted from Cloudflare R2. Use it like any Linux shell — there
 is no hidden command parser. Room admin is exposed through the visible
 `bashroom` executable inside the sandbox.
 
+A second tool, `bashroom_write({ path, content, encoding? })`, writes a
+file directly without going through bash — use it when content has
+quotes, backticks, `$variables`, or arbitrary bytes that would fight
+shell quoting (see [bashroom_write](#bashroom_write) below).
+
 ## Start
 
 ```bash
@@ -58,6 +63,31 @@ printf '%s\n' "## $(date +%H:%M) topic" >> /rooms/<room>/log.md
 Writes flush to R2 through the FUSE mount and are immediately readable
 from the next call.
 
+## bashroom_write
+
+When file content contains quotes, backticks, `$variables`, or arbitrary
+bytes, heredocs and `echo >` get mangled by shell quoting. Use the
+`bashroom_write` tool instead — it calls the sandbox's `writeFile`
+directly, bypassing bash entirely:
+
+```jsonc
+bashroom_write({
+  "path": "/rooms/my-room/notes/snippet.md",  // must be under /rooms/<room>/
+  "content": "anything: `backticks`, $vars, \"quotes\", newlines — all literal",
+  "encoding": "utf-8"   // "utf-8" (default) | "base64" for binary
+})
+```
+
+- **Path must be under `/rooms/`** — writes elsewhere don't persist
+  (the sandbox is ephemeral; only `/rooms` is R2-backed) and are rejected.
+- **No parent-dir creation.** If the target's folder doesn't exist yet,
+  the write fails — `mkdir -p` it first via the `bashroom` tool, or write
+  into an existing folder.
+- **5 MB cap** per write.
+
+Prefer plain `>>`/`cat` for ordinary appends; reach for `bashroom_write`
+specifically when quoting would otherwise corrupt the content.
+
 ## Tools
 
 `bash`, `git`, `ripgrep` (`rg`), `jq`, `find`, `fd`, `less`, `tree`,
@@ -76,6 +106,81 @@ Standard Linux utilities work as expected.
   chronology. Other agents may be writing the same file.
 - Keep entries short and structured for the next agent.
 - Do not write secrets. Files are private but not encrypted at rest.
+
+## Handoff (end of session / before compaction)
+
+> **Canonical source:** the live, authoritative version of this template is
+> `/rooms/bashroom/notes/handoff-template.md` in the apex `bashroom` room.
+> The copy below is a snapshot for offline reference. If the two differ, the
+> room file wins — re-sync this section from it rather than the reverse.
+
+Write a handoff when context quality starts to degrade (roughly past ~120k
+tokens, or before ~30% of a 1M window), at the end of a work session, before
+a `/clear` or compaction, or when handing the baton to another agent
+(Codex / Cursor) or machine.
+
+**The one rule that matters.** Before writing any line, ask: *can the next
+agent get this by reading the code, `git log`, or `CLAUDE.md`/`AGENTS.md`?*
+If yes — cut it, or replace it with a pointer (a path or a commit hash). A
+handoff is *only* the things that live in your head and nowhere else: the
+why, the dead ends, the next move.
+
+- **Coordinates over content.** Prefer commit hashes + file paths over pasted
+  code. Cheaper in tokens, and never goes stale.
+- **No secrets.** No keys, tokens, or PII — rooms are shared and versioned.
+
+**Where.** Append to the project room's `log/YYYY-MM-DD.md` under a
+`## HH:MM <topic> — handoff` heading. Append (`>>`), never overwrite. Update
+that room's `index.md` only if its file tree changed.
+
+**Skeleton:**
+
+```
+## HH:MM <topic> — handoff
+
+### Coordinates
+- Branch: <name> (base: <main>), N commits ahead, pushed? <yes/no>
+- Key commits: <hash> <one-line>, ...
+- Touched: <path>, <path>   (full picture: `git log -p <base>..HEAD`)
+
+### Goal
+<one line — what we're actually trying to achieve>
+
+### Status
+- Done: ...
+- In progress: ...
+- Not started: ...
+
+### Decisions + why
+- <decision> — <rationale>   (only the non-obvious ones)
+
+### What to avoid
+- <failed attempt / dead end / out-of-scope thing the next agent might retry>
+
+### Blockers / open questions
+- <needs a human decision, or an unresolved unknown>
+
+### Next best step
+1. <the single immediate action>
+2. <then the ordered backlog>
+
+### Resume prompt
+<a pasteable one-liner for the next session — see below>
+```
+
+**Trigger prompt** (paste at the end of a session):
+
+> Write a handoff into <room> following bashroom/notes/handoff-template.md:
+> coordinates, goal, status (done/in-progress/todo), key decisions + why, what
+> to avoid, blockers, next step, and a resume prompt. Prefer commit hashes and
+> file paths over pasted code. Include only what the next agent can't get from
+> the code, git log, or CLAUDE.md. Append to today's log; don't overwrite.
+
+**Resume prompt** (paste at the start of the next session):
+
+> Read the latest handoff in <room>/log/. Start with a 2-line summary of your
+> understanding, then continue from the "Next best step" — don't restart from
+> scratch.
 
 ## Gotchas
 
