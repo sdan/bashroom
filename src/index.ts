@@ -1235,7 +1235,53 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       });
     }
 
+    // ─── SPA deep-link fallback ───────────────────────────────────────────
+    // Canonical web-reader URLs are /<room>/<path>, e.g.
+    // /bashroom/notes/handoff-template.md. The Worker has no per-file route —
+    // it serves the same single-page app for any non-reserved GET, and the
+    // client reads location.pathname to open the right room/file (see
+    // web-ui.ts stateFromUrl). This is the standard "server fallback for SPA
+    // deep links" pattern. It MUST come after every real route above so a room
+    // can never shadow /mcp, /help, /auth, etc.
+    //
+    // Guards: GET only (a POST to an unknown path is a real 404, not the app),
+    // and an explicit denylist of reserved first segments — needed because
+    // some reserved routes are method-gated (e.g. POST /create), so a GET to
+    // them would otherwise fall through here and wrongly serve HTML.
+    if (request.method === "GET" && !isAsset(url.pathname)) {
+      const firstSeg = url.pathname.replace(/^\/+/, "").split("/")[0].toLowerCase();
+      if (firstSeg && !RESERVED_FIRST_SEGMENTS.has(firstSeg)) {
+        // The SPA itself enforces membership/auth via /web/api/*; an
+        // unauthorized deep link just renders the login/empty state.
+        return html(webIndexHtml());
+      }
+    }
+
     return json({ ok: false, error: "not_found" }, 404);
+}
+
+// First-path-segments the deep-link fallback must NOT treat as room names.
+// Mirrors every top-level route in fetch() plus a few reserved-for-future
+// surfaces. A room literally named one of these can't be deep-linked (the
+// sidebar still opens it via the API), which is an acceptable trade for never
+// shadowing a real endpoint.
+const RESERVED_FIRST_SEGMENTS = new Set<string>([
+  "web", "mcp", "bash", "help", "device", "auth", "account", "sandbox",
+  "create", "join", "pair", "mounts", "actors", "delete",
+  "skill.md", "llms.txt", "og.svg", "favicon.ico", "robots.txt",
+  "mcp-transport-get", "mcp-transport-set",
+  "account-rooms", "account-room-create",
+  "internal-account-rooms", "internal-room-create", "internal-room-join",
+  "internal-room-pair", "internal-room-mounts", "internal-room-who",
+  "internal-room-history",
+  "device-start", "device-poll", "device-bind-state", "device-lookup-state",
+  "device-claim-by-state", "audit-append", "audit-list",
+]);
+
+// Static-asset-ish paths the SPA fallback should skip (let them 404 cleanly
+// rather than returning HTML with a 200, which breaks <img>/fetch consumers).
+function isAsset(pathname: string): boolean {
+  return /\.(png|jpe?g|gif|svg|ico|webp|css|js|map|json|txt|woff2?|ttf|xml)$/i.test(pathname);
 }
 
 function ogSvg(): string {
