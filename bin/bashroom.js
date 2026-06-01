@@ -7,6 +7,12 @@ import path from "node:path";
 
 const DEFAULT_URL = "https://bashroom.sdan.io";
 const CONFIG_PATH = path.join(os.homedir(), ".bashroom", "config.json");
+const MAX_WRITE_BYTES = 5_000_000;
+const MAX_MCP_READ_BYTES = 512_000;
+const MAX_MCP_TREE_ENTRIES = 1_000;
+const MAX_MCP_SEARCH_MATCHES = 200;
+const MAX_MCP_SEARCH_FILES = 1_000;
+const MAX_MCP_SEARCH_FILE_BYTES = 1_000_000;
 
 function usage() {
   return `bashroom
@@ -339,6 +345,74 @@ async function runBash(baseUrl, command, stdin) {
   return result;
 }
 
+function accountToken(baseUrl) {
+  return process.env.BASHROOM_TOKEN || process.env.INTRACODE_TOKEN || account(baseUrl)?.token || "";
+}
+
+function parseMcpSse(text) {
+  const dataLines = text
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => line.slice(6));
+  if (!dataLines.length) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`invalid MCP response: ${text.slice(0, 200)}`);
+    }
+  }
+  return JSON.parse(dataLines.join("\n"));
+}
+
+async function createRemoteMcpClient(baseUrl) {
+  const token = accountToken(baseUrl);
+  if (!token) throw new Error("not logged in. Run: bashroom login");
+  let remoteSessionId = "";
+  let nextId = 1;
+
+  async function post(body) {
+    const headers = {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${token}`,
+    };
+    if (remoteSessionId) headers["mcp-session-id"] = remoteSessionId;
+    const response = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(text || response.statusText || "MCP request failed");
+    remoteSessionId = response.headers.get("mcp-session-id") || remoteSessionId;
+    const message = parseMcpSse(text);
+    if (message.error) throw new Error(message.error.message || "MCP error");
+    return message.result;
+  }
+
+  await post({
+    jsonrpc: "2.0",
+    id: nextId++,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "bashroom-cli", version: "2.0.0" },
+    },
+  });
+
+  return {
+    async callTool(name, args) {
+      return post({
+        jsonrpc: "2.0",
+        id: nextId++,
+        method: "tools/call",
+        params: { name, arguments: args },
+      });
+    },
+  };
+}
+
 async function runStdioMcp(baseUrl) {
   const [{ McpServer }, { StdioServerTransport }, { z }] = await Promise.all([
     import("@modelcontextprotocol/sdk/server/mcp.js"),
@@ -347,6 +421,28 @@ async function runStdioMcp(baseUrl) {
   ]);
 
   const server = new McpServer({ name: "bashroom", version: "0.2.0" });
+  let remotePromise;
+  function remoteClient() {
+    remotePromise ||= createRemoteMcpClient(baseUrl);
+    return remotePromise;
+  }
+
+  async function forwardTool(name, args) {
+    try {
+      const remote = await remoteClient();
+      const result = await remote.callTool(name, args);
+      return {
+        content: result.content || [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        isError: Boolean(result.isError),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text", text: `bashroom: ${message}` }],
+        isError: true,
+      };
+    }
+  }
 
   server.tool(
     "bashroom",
@@ -365,7 +461,7 @@ async function runStdioMcp(baseUrl) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const hint = message.toLowerCase().includes("token") || message.toLowerCase().includes("auth")
-          ? "\n\nHint: run `bashroom login` then `bashroom room create` to set up auth."
+          ? "\n\nHint: run `bashroom login` then `bashroom create-room` to set up auth."
           : "";
         return {
           content: [{ type: "text", text: `bashroom: ${message}${hint}` }],
@@ -373,6 +469,61 @@ async function runStdioMcp(baseUrl) {
         };
       }
     },
+  );
+
+  server.tool(
+    "bashroom_write",
+    "Write a file to /rooms directly, bypassing bash quoting. Use this instead of `echo ... > file` or heredoc when content contains quotes, backticks, $variables, or arbitrary bytes. The path must be inside /rooms/<room>/.",
+    {
+      path: z.string().min(1).max(1024).describe("Absolute path under /rooms, e.g. /rooms/my-room/notes/today.md"),
+      content: z.string().max(MAX_WRITE_BYTES).describe("File content. UTF-8 by default; pass base64-encoded bytes with encoding='base64' for binary."),
+      encoding: z.enum(["utf-8", "base64"]).optional().describe("'utf-8' (default) treats content as text; 'base64' decodes content as binary before writing."),
+    },
+    async (args) => forwardTool("bashroom_write", { ...args, encoding: args.encoding ?? "utf-8" }),
+  );
+
+  server.tool(
+    "bashroom_tree",
+    "List rooms or files directly from R2 without starting bash. Use path='/rooms' to list rooms, or path='/rooms/<room>/<prefix>' to list bounded file metadata.",
+    {
+      path: z.string().default("/rooms").describe("Absolute path: /rooms to list rooms, or /rooms/<room>/<optional-prefix> to list files."),
+      max_entries: z.number().int().min(1).max(MAX_MCP_TREE_ENTRIES).optional().describe(`Maximum files to return, up to ${MAX_MCP_TREE_ENTRIES}.`),
+    },
+    async (args) => forwardTool("bashroom_tree", { ...args, path: args.path || "/rooms" }),
+  );
+
+  server.tool(
+    "bashroom_read",
+    "Read a bounded text range directly from R2 without starting bash. Use this instead of `cat` when you want predictable context size.",
+    {
+      path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/ARCHITECTURAL.md."),
+      offset: z.number().int().min(0).optional().describe("Byte offset to start reading from. Defaults to 0."),
+      max_bytes: z.number().int().min(1).max(MAX_MCP_READ_BYTES).optional().describe(`Maximum bytes to return, up to ${MAX_MCP_READ_BYTES}.`),
+    },
+    async (args) => forwardTool("bashroom_read", args),
+  );
+
+  server.tool(
+    "bashroom_search",
+    "Bounded literal text search over R2-backed room files without starting bash. Use bashroom for advanced rg/regex workflows.",
+    {
+      path: z.string().min(1).describe("Absolute room or prefix path under /rooms/<room>/, e.g. /rooms/bashroom/notes."),
+      query: z.string().min(1).max(256).describe("Literal text to search for."),
+      case_sensitive: z.boolean().optional().describe("Defaults to false."),
+      max_matches: z.number().int().min(1).max(MAX_MCP_SEARCH_MATCHES).optional().describe(`Maximum matches to return, up to ${MAX_MCP_SEARCH_MATCHES}.`),
+      max_files: z.number().int().min(1).max(MAX_MCP_SEARCH_FILES).optional().describe(`Maximum files to scan, up to ${MAX_MCP_SEARCH_FILES}.`),
+      max_bytes_per_file: z.number().int().min(1).max(MAX_MCP_SEARCH_FILE_BYTES).optional().describe(`Maximum bytes to scan per file, up to ${MAX_MCP_SEARCH_FILE_BYTES}.`),
+    },
+    async (args) => forwardTool("bashroom_search", args),
+  );
+
+  server.tool(
+    "bashroom_stat",
+    "Return R2 metadata for one file without reading its body: size, modified time, etag, version, content type, and custom metadata.",
+    {
+      path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/index.md."),
+    },
+    async (args) => forwardTool("bashroom_stat", args),
   );
 
   await server.connect(new StdioServerTransport());
@@ -421,14 +572,8 @@ async function main() {
     return;
   }
 
-  // Canonical create. `room create` kept below as a back-compat alias.
   if (args[0] === "create-room") {
     await createRoom(baseUrl, args.slice(1));
-    return;
-  }
-
-  if (args[0] === "room" && args[1] === "create") {
-    await createRoom(baseUrl, args.slice(2));
     return;
   }
 

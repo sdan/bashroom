@@ -1,13 +1,15 @@
 # Bashroom
 
-Bashroom is a per-user cloud shell for coding agents.
+Bashroom is a cloud shell for coding agents: save notes, share files,
+and hand off work between running sessions.
 
-Agents get one MCP tool. The tool runs real `bash` inside a Cloudflare
-Sandbox, with `/rooms` FUSE-mounted from Cloudflare R2. Bashroom handles
-access control, durable room files, and audit. Room admin (create, join,
-pair, mounts, who, history) is also available inside the sandbox through
-the visible `bashroom` helper. Destructive room deletion stays on the
-laptop CLI.
+Agents get real `bash` plus structured R2-backed file/context tools. The
+shell runs inside a Cloudflare Sandbox, with `/rooms` FUSE-mounted from
+Cloudflare R2. The structured tools (`tree`, `read`, `search`, `stat`) read
+directly from R2 without booting a sandbox. Bashroom handles access control,
+durable room files, and audit. Room admin (create, join, pair, mounts, who,
+history) is also available inside the sandbox through the visible `bashroom`
+helper. Destructive room deletion stays on the laptop CLI.
 
 ## Connect
 
@@ -23,15 +25,24 @@ claude mcp add --scope user bashroom -- bashroom mcp
 codex mcp add bashroom -- bashroom mcp
 ```
 
-The local MCP proxy reads `~/.bashroom/config.json` and sends auth to the hosted Worker. The model only sees the `bashroom` tool call.
+The local MCP proxy reads `~/.bashroom/config.json` and sends auth to the hosted Worker. The model only sees Bashroom MCP tool calls, never the account token.
 
 ## Model
 
-The MCP exposes one tool:
+The MCP exposes six tools:
 
 ```text
 bashroom({ command, stdin? })
+bashroom_write({ path, content, encoding? })
+bashroom_tree({ path, max_entries? })
+bashroom_read({ path, offset?, max_bytes? })
+bashroom_search({ path, query, case_sensitive?, max_matches?, max_files?, max_bytes_per_file? })
+bashroom_stat({ path })
 ```
+
+Use `bashroom` when you need real command execution. Use the structured tools
+for routine file/context retrieval and exact writes; they are bounded and avoid
+shell quoting hazards.
 
 Inside bash, authorized rooms appear under `/rooms`:
 
@@ -43,6 +54,15 @@ echo "## note" >> /rooms/<room>/log.md
 rg "thing I care about" /rooms
 bashroom create-room new-room
 bashroom rooms
+```
+
+For bounded context:
+
+```jsonc
+bashroom_tree({ "path": "/rooms/my-room", "max_entries": 200 })
+bashroom_read({ "path": "/rooms/my-room/index.md", "max_bytes": 64000 })
+bashroom_search({ "path": "/rooms/my-room", "query": "decision" })
+bashroom_stat({ "path": "/rooms/my-room/index.md" })
 ```
 
 Each MCP call gets a fresh session — cwd, env, and `/tmp` do not leak
@@ -96,7 +116,7 @@ Rooms are private by default. `bashroom login` creates an account token and stor
 
 The recommended MCP setup is local stdio: `bashroom mcp` reads the local token and injects it into Worker requests. The token does not appear in model-visible tool arguments or room files.
 
-Remote HTTP MCP is still available at `https://bashroom.sdan.io/mcp` for simple hosted pairing flows. Logged-in use should prefer local stdio until Bashroom has OAuth.
+Remote HTTP MCP is also available at `https://bashroom.sdan.io/mcp`.
 
 Pair codes are one-time invites. They expire after 10 minutes and mint a token when redeemed. Pair codes are case-insensitive, and `join` accepts invite URIs such as `bashroom://join/syncing-reviewing-shipping?code=M2Q4-K7P9`.
 
@@ -154,9 +174,9 @@ build time so there's one source of truth.
 
 ## Direction
 
-Bashroom is becoming a logged-in cloud shell and shared memory layer for coding
-agents. The v3 architecture is documented in `ARCHITECTURAL.md`; the product
-sequence is in `docs/product-roadmap.md`.
+Bashroom is a cloud shell for coding agents: save notes, share files,
+and hand off work between running sessions. The v3 architecture is documented
+in `ARCHITECTURAL.md`; the product sequence is in `docs/product-roadmap.md`.
 
 ## Self-host
 

@@ -20,3 +20,8 @@ src/web-ui.ts
 # Skills installed via `npx skills add` — vendor cache, not project source.
 .agents/
 skills-lock.json
+
+# OG card: only the bundled PNG (assets/og.png) is committed — it's imported
+# by the worker. The source of truth is ogSvg() in src/og.ts; any scratch SVG
+# rendered alongside it (e.g. via curl) is regenerated, not tracked.
+assets/og.svg

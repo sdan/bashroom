@@ -6,3 +6,10 @@ declare module "*.md" {
   const content: string;
   export default content;
 }
+
+// *.png files bundle in as an ArrayBuffer via the wrangler.jsonc `rules`
+// block (type: "Data"). Same trick, binary payload — used for the OG card.
+declare module "*.png" {
+  const content: ArrayBuffer;
+  export default content;
+}

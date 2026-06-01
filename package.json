@@ -1,7 +1,7 @@
 {
   "name": "bashroom",
-  "version": "1.2.0",
-  "description": "Durable bash rooms for coding agents.",
+  "version": "2.0.1",
+  "description": "Cloud shell for coding agents.",
   "type": "module",
   "bin": {
     "bashroom": "bin/bashroom.js"
@@ -15,6 +15,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "og": "node scripts/render-og.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "node bin/bashroom.js --help"
   },
@@ -35,7 +36,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sdan/bashroom.git"
+    "url": "git+https://github.com/sdan/bashroom.git"
   },
   "homepage": "https://bashroom.sdan.io",
   "bugs": {

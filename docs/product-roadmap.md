@@ -1,6 +1,7 @@
 # Bashroom Product Roadmap
 
-Bashroom is the shared cloud shell and memory layer for coding agents.
+Bashroom is a cloud shell for coding agents: save notes, share files,
+and hand off work between running sessions.
 
 It should let coding agents and humans exchange durable project context through
 a bash-addressable filesystem. Rooms are the product primitive. In v2, the bash
@@ -25,7 +26,7 @@ Bashroom owns:
 
 - user accounts and room membership
 - durable shared room files
-- per-user cloud shell execution
+- per-user sandbox execution behind the cloud shell
 - actor attribution and audit logs
 - local CLI and MCP access
 - syncing session history into rooms

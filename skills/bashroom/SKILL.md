@@ -1,6 +1,6 @@
 ---
 name: bashroom
-description: Per-user Linux shell with a durable shared Markdown filesystem at /rooms backed by Cloudflare R2. Use when the task needs notes that persist across agent sessions, when handing off work between Claude / Codex / Cursor, when keeping a project scratch wiki, when other agents may continue this work, or when the user mentions "bashroom", "room", "shared notes", or "agent handoff".
+description: Cloud shell for coding agents with durable Markdown files at /rooms backed by Cloudflare R2. Use when the task needs notes that persist across agent sessions, when handing off work between running sessions, when keeping a project scratch wiki, when other agents may continue this work, or when the user mentions "bashroom", "room", "shared notes", or "agent handoff".
 ---
 
 # Bashroom
@@ -15,6 +15,11 @@ A second tool, `bashroom_write({ path, content, encoding? })`, writes a
 file directly without going through bash — use it when content has
 quotes, backticks, `$variables`, or arbitrary bytes that would fight
 shell quoting (see [bashroom_write](#bashroom_write) below).
+
+Read-only context tools (`bashroom_tree`, `bashroom_read`,
+`bashroom_search`, `bashroom_stat`) read directly from R2 without
+starting bash. Prefer them over `tree`, `cat`, or broad `rg` when you
+want bounded, predictable model context.
 
 ## Start
 
@@ -45,6 +50,17 @@ bashroom join <invite>            # redeem an invite
 `bashroom destroy` are laptop-only.
 
 ## Read and write
+
+Prefer structured tools for routine context retrieval:
+
+```jsonc
+bashroom_tree({ "path": "/rooms/my-room", "max_entries": 200 })
+bashroom_read({ "path": "/rooms/my-room/index.md", "max_bytes": 64000 })
+bashroom_search({ "path": "/rooms/my-room", "query": "decision" })
+bashroom_stat({ "path": "/rooms/my-room/index.md" })
+```
+
+Use shell when you need real command behavior:
 
 ```bash
 cat /rooms/<room>/index.md
@@ -87,6 +103,18 @@ bashroom_write({
 
 Prefer plain `>>`/`cat` for ordinary appends; reach for `bashroom_write`
 specifically when quoting would otherwise corrupt the content.
+
+## Read-only context tools
+
+- `bashroom_tree({ path, max_entries? })` lists rooms when `path` is
+  `/rooms`, or file metadata under `/rooms/<room>/<prefix>`.
+- `bashroom_read({ path, offset?, max_bytes? })` reads a bounded text
+  range. Default `max_bytes` is 64 KB; hard cap is 512 KB.
+- `bashroom_search({ path, query, case_sensitive?, max_matches?,
+  max_files?, max_bytes_per_file? })` performs bounded literal search
+  over text files. Use `bashroom` + `rg` for regex or advanced search.
+- `bashroom_stat({ path })` returns R2 metadata for one file without
+  reading its body.
 
 ## Tools
 

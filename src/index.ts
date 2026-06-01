@@ -7,6 +7,12 @@ import { z } from "zod";
 // rule. Serving /skill.md from this same string guarantees no drift
 // between the bundled skill and what the worker hands out.
 import skillMarkdown from "../skills/bashroom/SKILL.md";
+// Rasterized OG card (1200×630). Bundled as an ArrayBuffer via wrangler's
+// Data-import rule. Twitter/iMessage/Slack reject SVG for og:image, so the
+// social card points at this PNG; /og.svg stays for in-app/landing use.
+// Re-render after editing ogSvg(): `npm run og` (rsvg-convert → assets/og.png).
+import ogPng from "../assets/og.png";
+import { ogSvg } from "./og";
 import { webIndexHtml } from "./web-ui";
 import { webLandingHtml } from "./web-landing";
 import { webDeviceHtml, webDeviceResultHtml } from "./web-device";
@@ -15,6 +21,7 @@ export { ContainerProxy } from "@cloudflare/sandbox";
 
 type Env = {
   REGISTRY: DurableObjectNamespace<Registry>;
+  ACCOUNTS: DurableObjectNamespace<AccountDO>;
   SANDBOXES: DurableObjectNamespace<Sandbox>;
   ROOMS_R2: R2Bucket;
   GITHUB_CLIENT_ID?: string;
@@ -41,6 +48,264 @@ export class Sandbox extends SandboxBase<Env> {
   bashroomControl: handleSandboxBashroomControl,
 };
 
+export class AccountDO extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS account_profile (
+        user_id TEXT PRIMARY KEY,
+        handle TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS account_tokens (
+        token_hash TEXT PRIMARY KEY,
+        token_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT,
+        revoked_at TEXT
+      );
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS account_rooms (
+        room TEXT PRIMARY KEY,
+        actor TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS rate_buckets (
+        key TEXT PRIMARY KEY,
+        credits REAL NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS daily_usage (
+        day TEXT NOT NULL,
+        route TEXT NOT NULL,
+        request_count INTEGER NOT NULL,
+        input_bytes INTEGER NOT NULL,
+        write_bytes INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (day, route)
+      );
+    `);
+  }
+
+  async syncAccount(input: {
+    userId: string;
+    handle: string;
+    tokenHash?: string;
+    tokenId?: string;
+    createdAt?: string;
+    rooms?: AccountRoom[];
+  }): Promise<{ ok: true }> {
+    const now = input.createdAt || new Date().toISOString();
+    this.upsertProfile(input.userId, input.handle, now);
+
+    if (input.tokenHash) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO account_tokens (token_hash, token_id, created_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(token_hash) DO UPDATE SET
+           token_id = excluded.token_id`,
+        input.tokenHash,
+        input.tokenId || "synced",
+        now,
+      );
+    }
+
+    if (input.rooms) {
+      this.ctx.storage.sql.exec("DELETE FROM account_rooms");
+      for (const room of input.rooms) this.upsertRoomRow(room);
+    }
+
+    return { ok: true };
+  }
+
+  async upsertRoom(input: {
+    userId: string;
+    handle: string;
+    room: string;
+    actor: string;
+    scopes: Scope[];
+    role: string;
+    createdAt?: string;
+  }): Promise<{ ok: true }> {
+    const now = input.createdAt || new Date().toISOString();
+    this.upsertProfile(input.userId, input.handle, now);
+    this.upsertRoomRow({
+      room: input.room,
+      actor: input.actor,
+      scopes: input.scopes,
+      role: input.role,
+      created_at: now,
+    });
+    return { ok: true };
+  }
+
+  async deleteRoom(room: string): Promise<{ ok: true }> {
+    this.ctx.storage.sql.exec("DELETE FROM account_rooms WHERE room = ?", sanitizeWiki(room));
+    return { ok: true };
+  }
+
+  async authorizeAndCharge(input: {
+    tokenHash: string;
+    ip: string;
+    route: string;
+    cost?: number;
+    inputBytes?: number;
+    writeBytes?: number;
+    includeRooms?: boolean;
+  }): Promise<AccountWire> {
+    const tokenHash = input.tokenHash || "";
+    if (!tokenHash) return { ok: false, error: "missing_token" };
+
+    // Pre-auth abuse brake only. Signed-in product limits happen after the
+    // token proves account ownership; this keeps random token guesses from
+    // creating one rate_buckets row per bogus token hash.
+    const ipLimited = this.checkBucket(`verify:ip:${input.ip || "unknown"}`, VERIFY_IP_CAPACITY, VERIFY_IP_REFILL);
+    if (ipLimited) return ipLimited;
+
+    const token = this.ctx.storage.sql
+      .exec<{ last_seen_at: string | null; revoked_at: string | null }>(
+        "SELECT last_seen_at, revoked_at FROM account_tokens WHERE token_hash = ?",
+        tokenHash,
+      )
+      .toArray()[0];
+    if (!token || token.revoked_at) return { ok: false, error: "invalid_token" };
+
+    const profile = this.profile();
+    if (!profile) return { ok: false, error: "no_account" };
+
+    const tokenLimited = this.checkBucket(`ops:token:${tokenHash}`, OPS_TOKEN_CAPACITY, OPS_TOKEN_REFILL, input.cost || 1);
+    if (tokenLimited) return tokenLimited;
+
+    const userLimited = this.checkBucket("ops:user", OPS_TOKEN_CAPACITY, OPS_TOKEN_REFILL, input.cost || 1);
+    if (userLimited) return userLimited;
+
+    this.trackDailyUsage(input.route || "unknown", input.inputBytes || 0, input.writeBytes || 0);
+
+    const now = Date.now();
+    if (!token.last_seen_at || now - Date.parse(token.last_seen_at) > LAST_SEEN_WRITE_INTERVAL_MS) {
+      this.ctx.storage.sql.exec("UPDATE account_tokens SET last_seen_at = ? WHERE token_hash = ?", new Date(now).toISOString(), tokenHash);
+    }
+
+    return {
+      ok: true,
+      user_id: profile.user_id,
+      handle: profile.handle,
+      rooms: input.includeRooms ? this.rooms() : undefined,
+    };
+  }
+
+  private profile(): { user_id: string; handle: string } | null {
+    const row = this.ctx.storage.sql
+      .exec<{ user_id: string; handle: string }>("SELECT user_id, handle FROM account_profile LIMIT 1")
+      .toArray()[0];
+    return row || null;
+  }
+
+  private upsertProfile(userId: string, handle: string, now: string): void {
+    if (!userId) throw new Error("missing user");
+    const cleanHandle = sanitizeHandle(handle || "user");
+    this.ctx.storage.sql.exec(
+      `INSERT INTO account_profile (user_id, handle, created_at, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         handle = excluded.handle,
+         updated_at = excluded.updated_at`,
+      userId,
+      cleanHandle,
+      now,
+      now,
+    );
+  }
+
+  private upsertRoomRow(room: AccountRoom): void {
+    const cleanRoom = sanitizeWiki(room.room);
+    const cleanActor = sanitizeActor(room.actor);
+    const scopes = room.scopes.length ? room.scopes : ["read"];
+    this.ctx.storage.sql.exec(
+      `INSERT INTO account_rooms (room, actor, scopes, role, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(room) DO UPDATE SET
+         actor = excluded.actor,
+         scopes = excluded.scopes,
+         role = excluded.role`,
+      cleanRoom,
+      cleanActor,
+      scopes.join(","),
+      room.role || "member",
+      room.created_at || new Date().toISOString(),
+    );
+  }
+
+  private rooms(): AccountRoom[] {
+    return this.ctx.storage.sql
+      .exec<{ room: string; actor: string; scopes: string; role: string; created_at: string }>(
+        "SELECT room, actor, scopes, role, created_at FROM account_rooms ORDER BY created_at DESC",
+      )
+      .toArray()
+      .map((row) => ({
+        room: row.room,
+        actor: row.actor,
+        scopes: row.scopes.split(",") as Scope[],
+        role: row.role,
+        created_at: row.created_at,
+      }));
+  }
+
+  private trackDailyUsage(route: string, inputBytes: number, writeBytes: number): void {
+    const now = new Date();
+    const day = now.toISOString().slice(0, 10);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO daily_usage (day, route, request_count, input_bytes, write_bytes, updated_at)
+       VALUES (?, ?, 1, ?, ?, ?)
+       ON CONFLICT(day, route) DO UPDATE SET
+         request_count = daily_usage.request_count + 1,
+         input_bytes = daily_usage.input_bytes + excluded.input_bytes,
+         write_bytes = daily_usage.write_bytes + excluded.write_bytes,
+         updated_at = excluded.updated_at`,
+      day,
+      route || "unknown",
+      Math.max(0, Math.floor(inputBytes)),
+      Math.max(0, Math.floor(writeBytes)),
+      now.toISOString(),
+    );
+  }
+
+  private checkBucket(key: string, maxCredits: number, creditsPerMs: number, cost = 1): AccountWire | null {
+    const now = Date.now();
+    const existing = this.ctx.storage.sql
+      .exec<{ credits: number; updated_at: number }>("SELECT credits, updated_at FROM rate_buckets WHERE key = ?", key)
+      .toArray()[0];
+
+    if (!existing) {
+      this.ctx.storage.sql.exec("INSERT INTO rate_buckets (key, credits, updated_at) VALUES (?, ?, ?)", key, maxCredits - cost, now);
+      return null;
+    }
+
+    const elapsed = Math.max(0, now - existing.updated_at);
+    const credits = Math.min(maxCredits, existing.credits + elapsed * creditsPerMs);
+    if (credits < cost) {
+      return {
+        ok: false,
+        error: "rate_limited",
+        retry_after_seconds: Math.max(1, Math.ceil((cost - credits) / creditsPerMs / 1000)),
+      };
+    }
+
+    this.ctx.storage.sql.exec("UPDATE rate_buckets SET credits = ?, updated_at = ? WHERE key = ?", credits - cost, now, key);
+    return null;
+  }
+}
+
 
 type Scope = "read" | "write" | "checkpoint" | "admin";
 
@@ -51,6 +316,36 @@ type ShellResult = {
   changed: number;
   changed_paths: string[];
 };
+
+type R2FileMetadata = {
+  path: string;
+  size_bytes: number;
+  updated_at: string;
+  etag: string;
+  http_etag: string;
+  version: string;
+  content_type: string;
+  custom_metadata: Record<string, string>;
+};
+
+type R2File = R2FileMetadata & {
+  content: string;
+  is_binary: boolean;
+};
+
+type ParsedRoomsPath = {
+  root: boolean;
+  room: string;
+  path: string;
+};
+
+type StorageAccountAuth =
+  | { ok: true; userId: string; handle: string; rooms: AccountRoom[] }
+  | { ok: false; error: string; retry_after_seconds?: number };
+
+type StorageRoomAuth =
+  | { ok: true; userId: string; handle: string; room: string; actor: string; scopes: Scope[]; path: string }
+  | { ok: false; error: string; retry_after_seconds?: number };
 
 type AuthResult = {
   ok: boolean;
@@ -70,6 +365,23 @@ type AccountAuth = {
   retry_after_seconds?: number;
 };
 
+type AccountRoom = {
+  room: string;
+  actor: string;
+  scopes: Scope[];
+  role: string;
+  created_at: string;
+};
+
+type AccountWire = {
+  ok: boolean;
+  user_id?: string;
+  handle?: string;
+  rooms?: AccountRoom[];
+  error?: string;
+  retry_after_seconds?: number;
+};
+
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MAX_COMMAND_CHARS = 32_000;
@@ -77,6 +389,16 @@ const MAX_COMMAND_CHARS = 32_000;
 // but the MCP tool round-trip is JSON-serialized through the wire, so
 // huge payloads are awkward. 5 MB is well above any reasonable note.
 const MAX_WRITE_BYTES = 5_000_000;
+const DEFAULT_MCP_READ_BYTES = 64_000;
+const MAX_MCP_READ_BYTES = 512_000;
+const DEFAULT_MCP_TREE_ENTRIES = 200;
+const MAX_MCP_TREE_ENTRIES = 1_000;
+const DEFAULT_MCP_SEARCH_MATCHES = 50;
+const MAX_MCP_SEARCH_MATCHES = 200;
+const DEFAULT_MCP_SEARCH_FILES = 200;
+const MAX_MCP_SEARCH_FILES = 1_000;
+const DEFAULT_MCP_SEARCH_FILE_BYTES = 256_000;
+const MAX_MCP_SEARCH_FILE_BYTES = 1_000_000;
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -297,7 +619,7 @@ export class Registry extends DurableObject<Env> {
       const wiki = String(body.wiki || body.room || "");
       const auth = await this.authorize(wiki, bearerFromUnknown(body.token), "admin", String(body.ip || "unknown"));
       if (!auth.ok) return json(auth, 401);
-      return json(this.deleteWiki(wiki));
+      return json(await this.deleteWiki(wiki));
     }
 
     if (request.method === "POST" && url.pathname === "/account-rooms") {
@@ -307,7 +629,7 @@ export class Registry extends DurableObject<Env> {
     }
 
     if (request.method === "POST" && url.pathname === "/account-room-create") {
-      // Kept as alias for /create. CLI calls this from `bashroom room create`.
+      // Registry-side create path used by the public /account/room-create wrapper.
       const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
       if (!account.ok) return json(account, 401);
       return json(await this.createWiki(account.userId || "", account.handle || "user", String(body.room || body.wiki || ""), String(body.actor || "")));
@@ -465,6 +787,15 @@ export class Registry extends DurableObject<Env> {
       "owner",
       now,
     );
+    await this.env.ACCOUNTS.getByName(accountObjectName(userId)).upsertRoom({
+      userId,
+      handle,
+      room: cleanWiki,
+      actor: cleanActor,
+      scopes,
+      role: "owner",
+      createdAt: now,
+    }).catch(() => undefined);
     return { ok: true, wiki: cleanWiki, actor: cleanActor, scopes, role: "owner", user_id: userId };
   }
 
@@ -516,6 +847,15 @@ export class Registry extends DurableObject<Env> {
       "member",
       now,
     );
+    await this.env.ACCOUNTS.getByName(accountObjectName(userId)).upsertRoom({
+      userId,
+      handle,
+      room: row.room,
+      actor: cleanActor,
+      scopes,
+      role: "member",
+      createdAt: now,
+    }).catch(() => undefined);
     return { ok: true, wiki: row.room, actor: cleanActor, scopes, role: "member" };
   }
 
@@ -680,7 +1020,7 @@ export class Registry extends DurableObject<Env> {
 
     // Mint a fresh token for this device.
     const now = new Date().toISOString();
-    const token = randomAccountToken();
+    const token = randomAccountToken(userId);
     const tokenHash = await sha256(token);
     const tokenId = randomId("utok");
     this.ctx.storage.sql.exec(
@@ -690,6 +1030,14 @@ export class Registry extends DurableObject<Env> {
       userId,
       now,
     );
+    await this.env.ACCOUNTS.getByName(accountObjectName(userId)).syncAccount({
+      userId,
+      handle: githubLogin,
+      tokenHash,
+      tokenId,
+      createdAt: now,
+      rooms: this.accountRooms(userId),
+    }).catch(() => undefined);
     this.ctx.storage.sql.exec(
       "UPDATE device_codes SET claimed_at = ?, user_id = ?, token = ? WHERE code_hash = ?",
       now,
@@ -851,12 +1199,18 @@ export class Registry extends DurableObject<Env> {
     return rows.map((row) => row.actor);
   }
 
-  private deleteWiki(wiki: string): Record<string, unknown> {
+  private async deleteWiki(wiki: string): Promise<Record<string, unknown>> {
     const cleanWiki = sanitizeWiki(wiki);
     const now = new Date().toISOString();
+    const members = this.ctx.storage.sql
+      .exec<{ user_id: string }>("SELECT user_id FROM user_rooms WHERE room = ?", cleanWiki)
+      .toArray();
     this.ctx.storage.sql.exec("DELETE FROM wikis WHERE room = ?", cleanWiki);
     this.ctx.storage.sql.exec("DELETE FROM user_rooms WHERE room = ?", cleanWiki);
     this.ctx.storage.sql.exec("UPDATE wiki_pair_codes SET used_at = ? WHERE room = ? AND used_at IS NULL", now, cleanWiki);
+    for (const member of members) {
+      await this.env.ACCOUNTS.getByName(accountObjectName(member.user_id)).deleteRoom(cleanWiki).catch(() => undefined);
+    }
     return { ok: true, wiki: cleanWiki };
   }
 
@@ -954,6 +1308,69 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
     },
   );
 
+  server.tool(
+    "bashroom_tree",
+    "List rooms or files directly from R2 without starting bash. Use path='/rooms' to list rooms, or path='/rooms/<room>/<prefix>' to list bounded file metadata.",
+    {
+      path: z.string().default("/rooms").describe("Absolute path: /rooms to list rooms, or /rooms/<room>/<optional-prefix> to list files."),
+      max_entries: z.number().int().min(1).max(MAX_MCP_TREE_ENTRIES).optional().describe(`Maximum files to return, up to ${MAX_MCP_TREE_ENTRIES}.`),
+    },
+    async ({ path, max_entries }) => {
+      const result = await mcpTree(env, headerToken, ip, path || "/rooms", max_entries);
+      return mcpJsonResult(result, result.ok === false);
+    },
+  );
+
+  server.tool(
+    "bashroom_read",
+    "Read a bounded text range directly from R2 without starting bash. Use this instead of `cat` when you want predictable context size.",
+    {
+      path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/ARCHITECTURAL.md."),
+      offset: z.number().int().min(0).optional().describe("Byte offset to start reading from. Defaults to 0."),
+      max_bytes: z.number().int().min(1).max(MAX_MCP_READ_BYTES).optional().describe(`Maximum bytes to return, up to ${MAX_MCP_READ_BYTES}.`),
+    },
+    async ({ path, offset, max_bytes }) => {
+      const result = await mcpRead(env, headerToken, ip, path, offset, max_bytes);
+      return mcpJsonResult(result, result.ok === false);
+    },
+  );
+
+  server.tool(
+    "bashroom_search",
+    "Bounded literal text search over R2-backed room files without starting bash. Use bashroom for advanced rg/regex workflows.",
+    {
+      path: z.string().min(1).describe("Absolute room or prefix path under /rooms/<room>/, e.g. /rooms/bashroom/notes."),
+      query: z.string().min(1).max(256).describe("Literal text to search for."),
+      case_sensitive: z.boolean().optional().describe("Defaults to false."),
+      max_matches: z.number().int().min(1).max(MAX_MCP_SEARCH_MATCHES).optional().describe(`Maximum matches to return, up to ${MAX_MCP_SEARCH_MATCHES}.`),
+      max_files: z.number().int().min(1).max(MAX_MCP_SEARCH_FILES).optional().describe(`Maximum files to scan, up to ${MAX_MCP_SEARCH_FILES}.`),
+      max_bytes_per_file: z.number().int().min(1).max(MAX_MCP_SEARCH_FILE_BYTES).optional().describe(`Maximum bytes to scan per file, up to ${MAX_MCP_SEARCH_FILE_BYTES}.`),
+    },
+    async ({ path, query, case_sensitive, max_matches, max_files, max_bytes_per_file }) => {
+      const result = await mcpSearch(env, headerToken, ip, {
+        path,
+        query,
+        caseSensitive: Boolean(case_sensitive),
+        maxMatches: max_matches,
+        maxFiles: max_files,
+        maxBytesPerFile: max_bytes_per_file,
+      });
+      return mcpJsonResult(result, result.ok === false);
+    },
+  );
+
+  server.tool(
+    "bashroom_stat",
+    "Return R2 metadata for one file without reading its body: size, modified time, etag, version, content type, and custom metadata.",
+    {
+      path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/index.md."),
+    },
+    async ({ path }) => {
+      const result = await mcpStat(env, headerToken, ip, path);
+      return mcpJsonResult(result, result.ok === false);
+    },
+  );
+
   return server;
 }
 
@@ -992,7 +1409,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     }
 
     if (url.pathname === "/account/rooms" && request.method === "POST") {
-      return json(await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) }));
+      const account = await authorizeAccount(env, bearerToken(request), clientIp(request), { route: "account.rooms", includeRooms: true });
+      return json(account, account.ok === false ? 401 : 200);
     }
 
     if (url.pathname === "/account/room-create" && request.method === "POST") {
@@ -1034,14 +1452,14 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
     // Destroy a room: drop Registry membership/rows, then purge R2 prefix.
     // Order matters — Registry /delete authorizes; only on success do we
-    // touch R2. We look up the user_id via /account-rooms because
-    // r2DeletePrefix is keyed by user.
+    // touch R2. AccountDO gives us the user id without hitting Registry for
+    // the preflight when the token is routeable.
     if (url.pathname === "/account/room-delete" && request.method === "POST") {
       const input = await readJson(request);
       const wiki = String(input.wiki || input.room || "");
       const token = bearerToken(request);
       const ip = clientIp(request);
-      const account = await registry(env, "/account-rooms", { token, ip });
+      const account = await authorizeAccount(env, token, ip, { route: "account.room-delete", includeRooms: true });
       if (account.ok === false) return json(account, 401);
       const userId = String(account.user_id || "");
       if (!userId) return json({ ok: false, error: "no_account" }, 400);
@@ -1052,13 +1470,14 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       return json(result, result.ok === false ? 400 : 200);
     }
 
-    // List the calling user's room mounts — wraps Registry /mounts.
+    // List the calling user's room mounts from the per-user account mirror.
     if (url.pathname === "/account/room-mounts" && request.method === "POST") {
-      const result = await registry(env, "/mounts", {
-        token: bearerToken(request),
-        ip: clientIp(request),
-      });
-      return json(result, result.ok === false ? 400 : 200);
+      const account = await authorizeAccount(env, bearerToken(request), clientIp(request), { route: "account.room-mounts", includeRooms: true });
+      if (account.ok === false) return json(account, 401);
+      const mounts = (account.rooms || [])
+        .map((row) => ({ wiki: row.room, actor: row.actor, scopes: row.scopes }))
+        .sort((left, right) => mountPath(left.wiki).localeCompare(mountPath(right.wiki)));
+      return json({ ok: true, mounts });
     }
 
     // List the actors present in a room — wraps Registry /actors.
@@ -1088,7 +1507,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     // boots fresh on the latest image. Useful after a Dockerfile change.
     // Auth: account token (same as /bash).
     if (url.pathname === "/sandbox/restart" && request.method === "POST") {
-      const account = await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) });
+      const account = await authorizeAccount(env, bearerToken(request), clientIp(request), { route: "sandbox.restart" });
       if (account.ok === false) return json({ ok: false, error: account.error || "unauthorized" }, 401);
       const userId = String(account.user_id || "");
       if (!userId) return json({ ok: false, error: "no_account" }, 400);
@@ -1101,26 +1520,42 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     if (url.pathname === "/web" || url.pathname === "/web/") return html(webIndexHtml());
 
     if (url.pathname === "/web/api/rooms" && request.method === "GET") {
-      // Pass ?active=ROOM to also fetch that room's snapshot in the same
-      // response — saves a round-trip on initial page load.
-      const account = await registry(env, "/account-rooms", { token: bearerToken(request), ip: clientIp(request) });
+      // Pass ?active=ROOM to also fetch that room's metadata tree in the same
+      // response — saves a round-trip on initial page load without reading
+      // every file body.
+      const account = await authorizeAccount(env, bearerToken(request), clientIp(request), { route: "web.rooms", includeRooms: true });
       const userId = String(account.user_id || "");
       const requested = parseOptionalWiki(url.searchParams.get("active"));
       const memberRooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
       const activeRoom = requested && memberRooms.some((row) => row.room === requested) ? requested : "";
-      const snapshot = activeRoom && userId ? await r2Snapshot(env, userId, activeRoom) : null;
-      return json({ ...account, active: activeRoom || null, snapshot });
+      const tree = activeRoom && userId ? await r2Tree(env, userId, activeRoom) : null;
+      return json({ ...account, active: activeRoom || null, tree });
     }
 
-    if (url.pathname === "/web/api/snapshot" && request.method === "GET") {
+    if (url.pathname === "/web/api/tree" && request.method === "GET") {
       const token = bearerToken(request);
       const room = parseOptionalWiki(url.searchParams.get("room"));
       if (!room) return json({ ok: false, error: "room_required" }, 400);
-      const account = await registry(env, "/account-rooms", { token, ip: clientIp(request) });
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.tree", includeRooms: true });
       const userId = String(account.user_id || "");
       const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
       if (!userId || !rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
-      return json({ ok: true, files: await r2Snapshot(env, userId, room) });
+      return json({ ok: true, files: await r2Tree(env, userId, room) });
+    }
+
+    if (url.pathname === "/web/api/file" && request.method === "GET") {
+      const token = bearerToken(request);
+      const room = parseOptionalWiki(url.searchParams.get("room"));
+      const path = url.searchParams.get("path") || "";
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      if (!path) return json({ ok: false, error: "path_required" }, 400);
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.file", includeRooms: true });
+      const userId = String(account.user_id || "");
+      const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
+      if (!userId || !rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
+      const file = await r2File(env, userId, room, path);
+      if (!file) return json({ ok: false, error: "not_found" }, 404);
+      return json({ ok: true, file });
     }
 
     // ─── Device-flow OAuth ────────────────────────────────────────────────
@@ -1224,8 +1659,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
     // OG / social-preview image. 1200×630 SVG matching the landing's
     // visual identity — cream surface, accent-purple mark, Inter
-    // typography. Twitter / Slack / iMessage render SVG correctly for
-    // link previews; no PNG export needed.
+    // typography. Kept for in-app / landing use; social scrapers get the PNG
+    // below (Twitter / iMessage / Slack reject SVG for og:image).
     if (url.pathname === "/og.svg") {
       return new Response(ogSvg(), {
         headers: {
@@ -1235,112 +1670,47 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       });
     }
 
-    // ─── SPA deep-link fallback ───────────────────────────────────────────
+    // Rasterized OG card for social previews. og:image / twitter:image point
+    // here because Twitter/X, iMessage, Slack, and LinkedIn do not render SVG
+    // and silently drop it (→ blank/placeholder card). Pre-rendered from
+    // ogSvg() into assets/og.png; re-render via `npm run og` after edits.
+    if (url.pathname === "/og.png") {
+      return new Response(ogPng, {
+        headers: {
+          "content-type": "image/png",
+          "cache-control": "public, max-age=3600",
+        },
+      });
+    }
+
+    // ─── SPA deep-link fallback (must be the last check) ──────────────────
     // Canonical web-reader URLs are /<room>/<path>, e.g.
     // /bashroom/notes/handoff-template.md. The Worker has no per-file route —
-    // it serves the same single-page app for any non-reserved GET, and the
-    // client reads location.pathname to open the right room/file (see
-    // web-ui.ts stateFromUrl). This is the standard "server fallback for SPA
-    // deep links" pattern. It MUST come after every real route above so a room
-    // can never shadow /mcp, /help, /auth, etc.
+    // it serves the same single-page app for any unmatched GET, and the client
+    // reads location.pathname to open the right room/file (see web-ui.ts
+    // stateFromUrl). This is the standard "server fallback for SPA deep links"
+    // pattern.
     //
-    // Guards: GET only (a POST to an unknown path is a real 404, not the app),
-    // and an explicit denylist of reserved first segments — needed because
-    // some reserved routes are method-gated (e.g. POST /create), so a GET to
-    // them would otherwise fall through here and wrongly serve HTML.
+    // API paths should never fall through to HTML. This matters when we remove
+    // compatibility endpoints: deleted JSON routes must become real 404s.
+    if (url.pathname.startsWith("/web/api/")) {
+      return json({ ok: false, error: "not_found" }, 404);
+    }
+
+    // For non-API deep links, serve the single-page app. Missing asset-shaped
+    // requests stay clean 404s instead of returning HTML with a 200, which
+    // would break <img>/fetch consumers.
     if (request.method === "GET" && !isAsset(url.pathname)) {
-      const firstSeg = url.pathname.replace(/^\/+/, "").split("/")[0].toLowerCase();
-      if (firstSeg && !RESERVED_FIRST_SEGMENTS.has(firstSeg)) {
-        // The SPA itself enforces membership/auth via /web/api/*; an
-        // unauthorized deep link just renders the login/empty state.
-        return html(webIndexHtml());
-      }
+      return html(webIndexHtml());
     }
 
     return json({ ok: false, error: "not_found" }, 404);
 }
 
-// First-path-segments the deep-link fallback must NOT treat as room names.
-// Mirrors every top-level route in fetch() plus a few reserved-for-future
-// surfaces. A room literally named one of these can't be deep-linked (the
-// sidebar still opens it via the API), which is an acceptable trade for never
-// shadowing a real endpoint.
-const RESERVED_FIRST_SEGMENTS = new Set<string>([
-  "web", "mcp", "bash", "help", "device", "auth", "account", "sandbox",
-  "create", "join", "pair", "mounts", "actors", "delete",
-  "skill.md", "llms.txt", "og.svg", "favicon.ico", "robots.txt",
-  "mcp-transport-get", "mcp-transport-set",
-  "account-rooms", "account-room-create",
-  "internal-account-rooms", "internal-room-create", "internal-room-join",
-  "internal-room-pair", "internal-room-mounts", "internal-room-who",
-  "internal-room-history",
-  "device-start", "device-poll", "device-bind-state", "device-lookup-state",
-  "device-claim-by-state", "audit-append", "audit-list",
-]);
-
 // Static-asset-ish paths the SPA fallback should skip (let them 404 cleanly
 // rather than returning HTML with a 200, which breaks <img>/fetch consumers).
 function isAsset(pathname: string): boolean {
   return /\.(png|jpe?g|gif|svg|ico|webp|css|js|map|json|txt|woff2?|ttf|xml)$/i.test(pathname);
-}
-
-function ogSvg(): string {
-  // 1200x630 OG image. Tagline top-right, brand bottom-left, room tree
-  // centered. The tree IS the product mental model — top-level room with
-  // files attributed to agents. Composition mirrors the landing footer
-  // (brand bottom-left) so social previews and the site share signature.
-  const fontStack = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif";
-  const monoStack = "ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
-  <rect width="1200" height="630" fill="#F7F7F5"/>
-
-  <!-- Brand block, top-left. Same mark/wordmark proportions as the
-       site nav (gap ≈ 45% of mark height): mark height 42px, gap 19px,
-       last square ends at x=122, wordmark starts at x=141. -->
-  <g transform="translate(80, 80)">
-    <g fill="#37352F">
-      <rect x="0"   y="0" width="42" height="42" rx="10" opacity="0.12"/>
-      <rect x="16"  y="0" width="42" height="42" rx="10" opacity="0.22"/>
-      <rect x="32"  y="0" width="42" height="42" rx="10" opacity="0.36"/>
-      <rect x="48"  y="0" width="42" height="42" rx="10" opacity="0.55"/>
-      <rect x="64"  y="0" width="42" height="42" rx="10" opacity="0.78"/>
-      <rect x="80"  y="0" width="42" height="42" rx="10" opacity="1"/>
-    </g>
-    <text x="141" y="32" font-family="${fontStack}" font-size="36" font-weight="500" fill="#37352F" letter-spacing="-0.5">bashroom</text>
-  </g>
-
-  <!-- Room tree, centered. Mirrors the landing diagram. -->
-  <g transform="translate(380, 200)">
-    <rect x="0" y="0" width="440" height="260" fill="none" stroke="#4F3BD0" stroke-width="2"/>
-    <line x1="0" y1="48" x2="440" y2="48" stroke="#EBEAE6" stroke-width="1"/>
-    <text x="22" y="32" font-family="${monoStack}" font-size="20" fill="#4F3BD0">sdan/quickquack</text>
-    <g font-family="${monoStack}" font-size="18" fill="#37352F">
-      <text x="22" y="86" fill="#A3A29C">▾</text>
-      <rect x="44" y="74" width="20" height="16" fill="#D8A23A" rx="2"/>
-      <path d="M 46 78 L 50 78 L 52 80 L 62 80 L 62 88 L 46 88 Z" fill="#D8A23A"/>
-      <text x="72" y="88" fill="#37352F">notes/</text>
-      <rect x="74" y="106" width="18" height="18" fill="none" stroke="#1CA1C7" stroke-width="1.5"/>
-      <text x="100" y="120" fill="#37352F">2026-05-20.md</text>
-      <text x="418" y="120" text-anchor="end" fill="#A3A29C" font-size="14">claude</text>
-      <rect x="74" y="136" width="18" height="18" fill="none" stroke="#1CA1C7" stroke-width="1.5"/>
-      <text x="100" y="150" fill="#37352F">2026-05-21.md</text>
-      <text x="418" y="150" text-anchor="end" fill="#A3A29C" font-size="14">codex</text>
-      <rect x="44" y="166" width="18" height="18" fill="none" stroke="#1CA1C7" stroke-width="1.5"/>
-      <text x="72" y="180" fill="#37352F">index.md</text>
-      <text x="418" y="180" text-anchor="end" fill="#A3A29C" font-size="14">you</text>
-      <rect x="44" y="196" width="18" height="18" fill="none" stroke="#1CA1C7" stroke-width="1.5"/>
-      <text x="72" y="210" fill="#37352F">log.md</text>
-      <text x="418" y="210" text-anchor="end" fill="#A3A29C" font-size="14">claude</text>
-      <rect x="44" y="226" width="18" height="18" fill="none" stroke="#1CA1C7" stroke-width="1.5"/>
-      <text x="72" y="240" fill="#37352F">README.md</text>
-      <text x="418" y="240" text-anchor="end" fill="#A3A29C" font-size="14">you</text>
-    </g>
-  </g>
-
-  <!-- Tagline, bottom-right — diagonal pair to the top-left brand. -->
-  <text x="1120" y="555" text-anchor="end" font-family="${fontStack}" font-size="26" font-weight="400" fill="#6F6E69">a shared filesystem for coding agents</text>
-</svg>`;
 }
 
 // Pulls the top viewing-city list from pingpong.sdan.io for the landing
@@ -1383,10 +1753,12 @@ function publicBaseUrl(env: Env, request: Request): string {
   return `${url.protocol}//${url.host}`;
 }
 
-// v2 entrypoint. Resolves user_id via Registry, then delegates to
-// runShellV2 (sandbox + R2). The MCP and /bash routes both call this.
+// v2 entrypoint. Resolves user_id through the per-user AccountDO when the
+// token is routeable, then delegates to runShellV2 (sandbox + R2). Legacy
+// tokens fall back to Registry during migration.
 async function runShell(env: Env, headerToken: string, _mcpSessionId: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
-  const account = await registry(env, "/account-rooms", { token: headerToken, ip });
+  const inputBytes = utf8ByteLength(command) + utf8ByteLength(stdin);
+  const account = await authorizeAccount(env, headerToken, ip, { route: "mcp.exec", inputBytes });
   if (account.ok === false) {
     return { stdout: "", stderr: `bashroom: ${account.error || "unauthorized"}\n`, exitCode: 1, changed: 0, changed_paths: [] };
   }
@@ -1411,7 +1783,10 @@ interface WriteResult {
 // quoting. Resolves user_id same way runShell does; writes into the
 // per-user FUSE mount at /rooms/.
 async function runWriteFile(env: Env, headerToken: string, _mcpSessionId: string, ip: string, path: string, content: string, encoding: "utf-8" | "base64"): Promise<WriteResult> {
-  const account = await registry(env, "/account-rooms", { token: headerToken, ip });
+  const bytes = encoding === "base64"
+    ? Math.floor((content.length * 3) / 4)
+    : utf8ByteLength(content);
+  const account = await authorizeAccount(env, headerToken, ip, { route: "mcp.write", inputBytes: utf8ByteLength(path), writeBytes: bytes });
   if (account.ok === false) {
     return { ok: false, path, bytes: 0, error: String(account.error || "unauthorized") };
   }
@@ -1438,9 +1813,6 @@ async function runWriteFile(env: Env, headerToken: string, _mcpSessionId: string
       await session.writeFile(path, content, { encoding });
       // Best-effort byte count for the audit / response. For base64 it's
       // the decoded length; for utf-8 it's the UTF-8 byte length.
-      const bytes = encoding === "base64"
-        ? Math.floor((content.length * 3) / 4)
-        : new TextEncoder().encode(content).length;
       return { ok: true, path, bytes };
     } finally {
       await sandbox.deleteSession(sessionId).catch(() => undefined);
@@ -1466,6 +1838,371 @@ async function registry(env: Env, path: string, body: Record<string, unknown>): 
     body: JSON.stringify(body),
   });
   return response.json();
+}
+
+function accountObjectName(userId: string): string {
+  return `acct:${userId}`;
+}
+
+function routeUserIdFromToken(token: string): string {
+  const parts = token.split(".");
+  return parts[0] === "br" && parts[1]?.startsWith("usr_") ? parts[1] : "";
+}
+
+async function authorizeAccount(
+  env: Env,
+  token: string,
+  ip: string,
+  opts: { route: string; cost?: number; inputBytes?: number; writeBytes?: number; includeRooms?: boolean },
+): Promise<AccountWire> {
+  if (!token) return { ok: false, error: "missing_token" };
+  const routeUserId = routeUserIdFromToken(token);
+  const tokenHash = await sha256(token);
+
+  if (routeUserId) {
+    const account = env.ACCOUNTS.getByName(accountObjectName(routeUserId));
+    const decision = await account.authorizeAndCharge({
+      tokenHash,
+      ip,
+      route: opts.route,
+      cost: opts.cost,
+      inputBytes: opts.inputBytes,
+      writeBytes: opts.writeBytes,
+      includeRooms: opts.includeRooms,
+    });
+    if (decision.ok) {
+      if (!opts.includeRooms || !decision.user_id) return decision;
+      const canonical = accountWireFromRegistry(await registry(env, "/internal-account-rooms", { user_id: decision.user_id }));
+      if (!canonical.ok) return decision;
+      await account.syncAccount({
+        userId: decision.user_id,
+        handle: canonical.handle || decision.handle || "user",
+        rooms: canonical.rooms || [],
+      }).catch(() => undefined);
+      return canonical;
+    }
+    if (decision.error !== "invalid_token" && decision.error !== "no_account") return decision;
+
+    // Migration fallback: routeable tokens are mirrored into AccountDO, but
+    // Registry remains the cold AuthDO while existing deployments roll forward.
+    // If Registry accepts the token, hydrate AccountDO so the next request is
+    // served by the per-user gate.
+    const legacy = accountWireFromRegistry(await registry(env, "/account-rooms", { token, ip }));
+    if (legacy.ok && legacy.user_id === routeUserId) {
+      await account.syncAccount({
+        userId: routeUserId,
+        handle: legacy.handle || "user",
+        tokenHash,
+        tokenId: "lazy-sync",
+        rooms: legacy.rooms || [],
+      }).catch(() => undefined);
+    }
+    return legacy;
+  }
+
+  return accountWireFromRegistry(await registry(env, "/account-rooms", { token, ip }));
+}
+
+function accountWireFromRegistry(result: Record<string, unknown>): AccountWire {
+  if (result.ok === false) {
+    return {
+      ok: false,
+      error: String(result.error || "unauthorized"),
+      retry_after_seconds: typeof result.retry_after_seconds === "number" ? result.retry_after_seconds : undefined,
+    };
+  }
+  return {
+    ok: true,
+    user_id: typeof result.user_id === "string" ? result.user_id : "",
+    handle: typeof result.handle === "string" ? result.handle : "",
+    rooms: accountRoomsFromUnknown(result.rooms),
+  };
+}
+
+function accountRoomsFromUnknown(value: unknown): AccountRoom[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((row) => {
+      const room = row && typeof row === "object" && "room" in row ? String((row as { room?: unknown }).room || "") : "";
+      if (!room) return null;
+      const actor = row && typeof row === "object" && "actor" in row ? String((row as { actor?: unknown }).actor || "user") : "user";
+      const scopesValue = row && typeof row === "object" && "scopes" in row ? (row as { scopes?: unknown }).scopes : [];
+      const scopes = Array.isArray(scopesValue)
+        ? parseScopes(scopesValue, ["read"])
+        : String(scopesValue || "").split(",").filter((scope): scope is Scope => ["read", "write", "checkpoint", "admin"].includes(scope));
+      const role = row && typeof row === "object" && "role" in row ? String((row as { role?: unknown }).role || "member") : "member";
+      const createdAt = row && typeof row === "object" && "created_at" in row ? String((row as { created_at?: unknown }).created_at || new Date().toISOString()) : new Date().toISOString();
+      return { room, actor, scopes: scopes.length ? scopes : ["read"], role, created_at: createdAt };
+    })
+    .filter((row): row is AccountRoom => Boolean(row));
+}
+
+function mcpJsonResult(value: unknown, isError = false): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
+  return {
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    isError,
+  };
+}
+
+async function mcpTree(env: Env, token: string, ip: string, path: string, maxEntries?: number): Promise<Record<string, unknown>> {
+  try {
+    const inputBytes = utf8ByteLength(path || "/rooms");
+    const parsed = parseMcpRoomsPath(path || "/rooms", true);
+    const account = await authorizeMcpStorageAccount(env, token, ip, "mcp.tree", inputBytes);
+    if (!account.ok) return account;
+
+    if (parsed.root) {
+      return {
+        ok: true,
+        path: "/rooms",
+        rooms: account.rooms.map((room) => ({
+          room: room.room,
+          path: mountPath(room.room),
+          actor: room.actor,
+          scopes: room.scopes,
+          role: room.role,
+        })),
+      };
+    }
+
+    const roomAuth = authorizeMcpStorageRoom(account, parsed.room, parsed.path);
+    if (!roomAuth.ok) return roomAuth;
+
+    const limit = clampInt(maxEntries, DEFAULT_MCP_TREE_ENTRIES, MAX_MCP_TREE_ENTRIES);
+    const listed = await r2ListPrefix(env, roomAuth.userId, roomAuth.room, roomAuth.path, true, limit + 1);
+    const prefix = r2KeyForRoom(roomAuth.userId, roomAuth.room);
+    const objects = listed.objects.slice(0, limit);
+    return {
+      ok: true,
+      path: formatRoomsPath(roomAuth.room, roomAuth.path),
+      room: roomAuth.room,
+      files: objects.map((object) => r2MetadataForObject(object, prefix)),
+      truncated: listed.truncated || listed.objects.length > limit,
+      max_entries: limit,
+    };
+  } catch (error) {
+    return mcpError(error);
+  }
+}
+
+async function mcpRead(env: Env, token: string, ip: string, path: string, offset?: number, maxBytes?: number): Promise<Record<string, unknown>> {
+  try {
+    const parsed = parseMcpRoomsPath(path, false);
+    if (parsed.root || !parsed.path) return { ok: false, error: "file_path_required" };
+    const roomAuth = await authorizeMcpStoragePath(env, token, ip, "mcp.read", parsed, utf8ByteLength(path));
+    if (!roomAuth.ok) return roomAuth;
+
+    const key = r2KeyForFile(roomAuth.userId, roomAuth.room, roomAuth.path);
+    const object = await env.ROOMS_R2.head(key);
+    if (!object) return { ok: false, error: "not_found", path: formatRoomsPath(roomAuth.room, roomAuth.path) };
+
+    const prefix = r2KeyForRoom(roomAuth.userId, roomAuth.room);
+    const metadata = r2MetadataForObject(object, prefix);
+    const isBinary = !isTextFile(metadata.path, metadata.content_type);
+    if (isBinary) return { ok: false, error: "binary_file", file: { ...metadata, is_binary: true } };
+
+    const start = clampInt(offset, 0, Math.max(0, metadata.size_bytes));
+    const limit = clampInt(maxBytes, DEFAULT_MCP_READ_BYTES, MAX_MCP_READ_BYTES);
+    if (start >= metadata.size_bytes) {
+      return {
+        ok: true,
+        file: { ...metadata, is_binary: false },
+        offset: start,
+        max_bytes: limit,
+        bytes_returned: 0,
+        truncated: false,
+        content: "",
+      };
+    }
+
+    const length = Math.min(limit, metadata.size_bytes - start);
+    const body = await env.ROOMS_R2.get(key, { range: { offset: start, length } });
+    if (!body || !("text" in body)) return { ok: false, error: "not_found", path: formatRoomsPath(roomAuth.room, roomAuth.path) };
+    const content = await body.text();
+    return {
+      ok: true,
+      file: { ...metadata, is_binary: false },
+      offset: start,
+      max_bytes: limit,
+      bytes_returned: utf8ByteLength(content),
+      truncated: start + length < metadata.size_bytes,
+      content,
+    };
+  } catch (error) {
+    return mcpError(error);
+  }
+}
+
+async function mcpSearch(
+  env: Env,
+  token: string,
+  ip: string,
+  input: {
+    path: string;
+    query: string;
+    caseSensitive: boolean;
+    maxMatches?: number;
+    maxFiles?: number;
+    maxBytesPerFile?: number;
+  },
+): Promise<Record<string, unknown>> {
+  try {
+    const parsed = parseMcpRoomsPath(input.path, false);
+    if (parsed.root) return { ok: false, error: "room_path_required" };
+    const inputBytes = utf8ByteLength(input.path) + utf8ByteLength(input.query);
+    const roomAuth = await authorizeMcpStoragePath(env, token, ip, "mcp.search", parsed, inputBytes);
+    if (!roomAuth.ok) return roomAuth;
+
+    const maxMatches = clampInt(input.maxMatches, DEFAULT_MCP_SEARCH_MATCHES, MAX_MCP_SEARCH_MATCHES);
+    const maxFiles = clampInt(input.maxFiles, DEFAULT_MCP_SEARCH_FILES, MAX_MCP_SEARCH_FILES);
+    const maxBytesPerFile = clampInt(input.maxBytesPerFile, DEFAULT_MCP_SEARCH_FILE_BYTES, MAX_MCP_SEARCH_FILE_BYTES);
+    const listed = await r2ListPrefix(env, roomAuth.userId, roomAuth.room, roomAuth.path, true, maxFiles + 1);
+    const objects = listed.objects.slice(0, maxFiles);
+    const prefix = r2KeyForRoom(roomAuth.userId, roomAuth.room);
+    const needle = input.caseSensitive ? input.query : input.query.toLowerCase();
+    const matches: Array<{ path: string; line: number; preview: string }> = [];
+    const skipped: Array<{ path: string; reason: string; size_bytes: number }> = [];
+    let scannedFiles = 0;
+
+    for (const object of objects) {
+      if (matches.length >= maxMatches) break;
+      const metadata = r2MetadataForObject(object, prefix);
+      if (!isTextFile(metadata.path, metadata.content_type)) {
+        skipped.push({ path: metadata.path, reason: "binary_file", size_bytes: metadata.size_bytes });
+        continue;
+      }
+      if (metadata.size_bytes > maxBytesPerFile) {
+        skipped.push({ path: metadata.path, reason: "file_too_large", size_bytes: metadata.size_bytes });
+        continue;
+      }
+      const body = await env.ROOMS_R2.get(object.key, { range: { offset: 0, length: Math.min(metadata.size_bytes, maxBytesPerFile) } });
+      if (!body || !("text" in body)) continue;
+      scannedFiles += 1;
+      const content = await body.text();
+      const lines = content.split(/\r?\n/);
+      for (let index = 0; index < lines.length; index += 1) {
+        const haystack = input.caseSensitive ? lines[index] : lines[index].toLowerCase();
+        if (!haystack.includes(needle)) continue;
+        matches.push({ path: metadata.path, line: index + 1, preview: previewLine(lines[index]) });
+        if (matches.length >= maxMatches) break;
+      }
+    }
+
+    return {
+      ok: true,
+      path: formatRoomsPath(roomAuth.room, roomAuth.path),
+      room: roomAuth.room,
+      query: input.query,
+      case_sensitive: input.caseSensitive,
+      matches,
+      scanned_files: scannedFiles,
+      skipped_files: skipped,
+      truncated: matches.length >= maxMatches || listed.truncated || listed.objects.length > maxFiles,
+      max_matches: maxMatches,
+      max_files: maxFiles,
+      max_bytes_per_file: maxBytesPerFile,
+    };
+  } catch (error) {
+    return mcpError(error);
+  }
+}
+
+async function mcpStat(env: Env, token: string, ip: string, path: string): Promise<Record<string, unknown>> {
+  try {
+    const parsed = parseMcpRoomsPath(path, false);
+    if (parsed.root || !parsed.path) return { ok: false, error: "file_path_required" };
+    const roomAuth = await authorizeMcpStoragePath(env, token, ip, "mcp.stat", parsed, utf8ByteLength(path));
+    if (!roomAuth.ok) return roomAuth;
+
+    const object = await env.ROOMS_R2.head(r2KeyForFile(roomAuth.userId, roomAuth.room, roomAuth.path));
+    if (!object) return { ok: false, error: "not_found", path: formatRoomsPath(roomAuth.room, roomAuth.path) };
+    const metadata = r2MetadataForObject(object, r2KeyForRoom(roomAuth.userId, roomAuth.room));
+    return {
+      ok: true,
+      path: formatRoomsPath(roomAuth.room, roomAuth.path),
+      file: {
+        ...metadata,
+        is_binary: !isTextFile(metadata.path, metadata.content_type),
+      },
+    };
+  } catch (error) {
+    return mcpError(error);
+  }
+}
+
+async function authorizeMcpStorageAccount(env: Env, token: string, ip: string, route: string, inputBytes: number): Promise<StorageAccountAuth> {
+  const account = await authorizeAccount(env, token, ip, { route, includeRooms: true, inputBytes });
+  if (account.ok === false) {
+    return { ok: false, error: account.error || "unauthorized", retry_after_seconds: account.retry_after_seconds };
+  }
+  const userId = String(account.user_id || "");
+  if (!userId) return { ok: false, error: "no_account" };
+  return {
+    ok: true,
+    userId,
+    handle: account.handle || "user",
+    rooms: Array.isArray(account.rooms) ? account.rooms : [],
+  };
+}
+
+async function authorizeMcpStoragePath(
+  env: Env,
+  token: string,
+  ip: string,
+  route: string,
+  parsed: ParsedRoomsPath,
+  inputBytes: number,
+): Promise<StorageRoomAuth> {
+  const account = await authorizeMcpStorageAccount(env, token, ip, route, inputBytes);
+  if (!account.ok) return account;
+  return authorizeMcpStorageRoom(account, parsed.room, parsed.path);
+}
+
+function authorizeMcpStorageRoom(account: Extract<StorageAccountAuth, { ok: true }>, room: string, path: string): StorageRoomAuth {
+  const match = account.rooms.find((candidate) => candidate.room === room);
+  if (!match) return { ok: false, error: "forbidden" };
+  if (!hasScope(match.scopes, "read")) return { ok: false, error: "insufficient_scope" };
+  return {
+    ok: true,
+    userId: account.userId,
+    handle: account.handle,
+    room: match.room,
+    actor: match.actor,
+    scopes: match.scopes,
+    path,
+  };
+}
+
+function parseMcpRoomsPath(raw: string, allowRoomsRoot: boolean): ParsedRoomsPath {
+  const value = (raw || "").trim().replace(/\/+$/g, "") || "/rooms";
+  if (value === "/rooms") {
+    if (!allowRoomsRoot) throw new Error("room_path_required");
+    return { root: true, room: "", path: "" };
+  }
+  if (!value.startsWith("/rooms/")) throw new Error("path must start with /rooms/");
+  const rest = value.slice("/rooms/".length);
+  const slash = rest.indexOf("/");
+  const room = sanitizeWiki(slash === -1 ? rest : rest.slice(0, slash));
+  const path = slash === -1 ? "" : sanitizeFilePath(rest.slice(slash + 1));
+  return { root: false, room, path };
+}
+
+function formatRoomsPath(room: string, path: string): string {
+  return path ? `/rooms/${room}/${path}` : `/rooms/${room}`;
+}
+
+function clampInt(value: number | undefined, fallback: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(Math.floor(value), max));
+}
+
+function previewLine(value: string): string {
+  const normalized = value.replace(/\t/g, " ").trim();
+  return normalized.length <= 300 ? normalized : `${normalized.slice(0, 300)}...`;
+}
+
+function mcpError(error: unknown): Record<string, unknown> {
+  return { ok: false, error: error instanceof Error ? error.message : String(error) };
 }
 
 type SandboxOutboundContext = {
@@ -1650,18 +2387,56 @@ function r2KeyForFile(userId: string, room: string, path: string): string {
   return `users/${userId}/${sanitizeWiki(room)}/${sanitizeFilePath(path)}`;
 }
 
-async function r2List(env: Env, userId: string, room?: string): Promise<R2Object[]> {
+function r2KeyPrefixForPath(userId: string, room: string, pathPrefix: string): string {
+  return pathPrefix
+    ? `${r2KeyForRoom(userId, room)}${sanitizeFilePath(pathPrefix)}`
+    : r2KeyForRoom(userId, room);
+}
+
+async function r2List(env: Env, userId: string, room?: string, includeMetadata = false): Promise<R2Object[]> {
   const prefix = room ? r2KeyForRoom(userId, room) : `users/${userId}/`;
   const out: R2Object[] = [];
   let cursor: string | undefined;
   // R2 caps a single list at 1000; loop until we have everything for the user.
   // For v2.0 single-user usage this is always one page in practice.
   do {
-    const page = await env.ROOMS_R2.list({ prefix, cursor, limit: 1000 });
+    const options: R2ListOptions & { include?: Array<"httpMetadata" | "customMetadata"> } = {
+      prefix,
+      cursor,
+      limit: 1000,
+    };
+    if (includeMetadata) options.include = ["httpMetadata", "customMetadata"];
+    const page = await env.ROOMS_R2.list(options);
     out.push(...page.objects);
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   return out;
+}
+
+async function r2ListPrefix(
+  env: Env,
+  userId: string,
+  room: string,
+  pathPrefix: string,
+  includeMetadata: boolean,
+  maxObjects: number,
+): Promise<{ objects: R2Object[]; truncated: boolean }> {
+  const prefix = r2KeyPrefixForPath(userId, room, pathPrefix);
+  const out: R2Object[] = [];
+  let cursor: string | undefined;
+  do {
+    const remaining = Math.max(1, maxObjects - out.length);
+    const options: R2ListOptions & { include?: Array<"httpMetadata" | "customMetadata"> } = {
+      prefix,
+      cursor,
+      limit: Math.min(1000, remaining),
+    };
+    if (includeMetadata) options.include = ["httpMetadata", "customMetadata"];
+    const page = await env.ROOMS_R2.list(options);
+    out.push(...page.objects);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor && out.length < maxObjects);
+  return { objects: out, truncated: Boolean(cursor) };
 }
 
 async function r2Get(env: Env, userId: string, room: string, path: string): Promise<string | null> {
@@ -1670,7 +2445,9 @@ async function r2Get(env: Env, userId: string, room: string, path: string): Prom
 }
 
 async function r2Put(env: Env, userId: string, room: string, path: string, content: string): Promise<void> {
-  await env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content);
+  await env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content, {
+    httpMetadata: { contentType: contentTypeForPath(path) },
+  });
 }
 
 // ─── v2 shell exec ──────────────────────────────────────────────────
@@ -1828,18 +2605,62 @@ async function seedR2Room(env: Env, userId: string, room: string, actor: string)
   });
 }
 
-// Snapshot a room's full file tree out of R2 as { path, content }[] —
-// the same shape /web previously got from Room.snapshot(). Reads happen
-// in parallel; this is fine for v2.0 single-user rooms (avg <20 files).
-async function r2Snapshot(env: Env, userId: string, room: string): Promise<Array<{ path: string; content: string }>> {
-  const objects = await r2List(env, userId, room);
+async function r2Tree(env: Env, userId: string, room: string): Promise<R2FileMetadata[]> {
+  const objects = await r2List(env, userId, room, true);
   const prefix = r2KeyForRoom(userId, room);
-  return Promise.all(
-    objects.map(async (o) => {
-      const obj = await env.ROOMS_R2.get(o.key);
-      return { path: o.key.slice(prefix.length), content: obj ? await obj.text() : "" };
-    }),
-  );
+  return objects.map((object) => r2MetadataForObject(object, prefix));
+}
+
+async function r2File(env: Env, userId: string, room: string, path: string): Promise<R2File | null> {
+  const obj = await env.ROOMS_R2.get(r2KeyForFile(userId, room, path));
+  if (!obj) return null;
+  const prefix = r2KeyForRoom(userId, room);
+  const metadata = r2MetadataForObject(obj, prefix);
+  const isBinary = !isTextFile(metadata.path, metadata.content_type);
+  return {
+    ...metadata,
+    content: isBinary ? "" : await obj.text(),
+    is_binary: isBinary,
+  };
+}
+
+function r2MetadataForObject(object: R2Object, prefix: string): R2FileMetadata {
+  const path = object.key.slice(prefix.length);
+  return {
+    path,
+    size_bytes: object.size,
+    updated_at: object.uploaded.toISOString(),
+    etag: object.etag,
+    http_etag: object.httpEtag,
+    version: object.version,
+    content_type: object.httpMetadata?.contentType || contentTypeForPath(path),
+    custom_metadata: object.customMetadata || {},
+  };
+}
+
+function contentTypeForPath(path: string): string {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "text/markdown; charset=utf-8";
+  if (lower.endsWith(".txt") || lower.endsWith(".log")) return "text/plain; charset=utf-8";
+  if (lower.endsWith(".json")) return "application/json; charset=utf-8";
+  if (lower.endsWith(".csv")) return "text/csv; charset=utf-8";
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "text/html; charset=utf-8";
+  if (lower.endsWith(".css")) return "text/css; charset=utf-8";
+  if (lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".ts")) return "text/javascript; charset=utf-8";
+  if (lower.endsWith(".svg")) return "image/svg+xml; charset=utf-8";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  return "application/octet-stream";
+}
+
+function isTextFile(path: string, contentType: string): boolean {
+  const lowerType = contentType.toLowerCase();
+  if (lowerType.startsWith("text/")) return true;
+  if (lowerType.includes("json") || lowerType.includes("xml") || lowerType.includes("javascript")) return true;
+  return /\.(md|markdown|txt|log|json|csv|ts|tsx|js|jsx|mjs|cjs|css|html|htm|xml|svg|yaml|yml|toml)$/i.test(path);
 }
 
 async function r2DeletePrefix(env: Env, userId: string, room: string): Promise<number> {
@@ -1874,6 +2695,10 @@ function bearerFromUnknown(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
 function defaultActor(prefix: string): string {
   return `${prefix}-${randomSuffix(4)}`;
 }
@@ -1882,8 +2707,10 @@ function randomToken(): string {
   return `ic_tok_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-function randomAccountToken(): string {
-  return `br_user_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
+function randomAccountToken(userId: string): string {
+  // Routeable but still secret: user_id chooses AccountDO; the random
+  // suffix is hashed and verified inside that DO.
+  return `br.${userId}.${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
 function randomId(prefix: string): string {
@@ -1971,7 +2798,7 @@ function html(value: string, status = 200): Response {
 function httpHelpText(): string {
   return `# Bashroom
 
-Per-user Linux shell for coding agents. \`/rooms\` is FUSE-mounted from
+Cloud shell for coding agents. \`/rooms\` is FUSE-mounted from
 Cloudflare R2 and persists across calls.
 
 ## Agent-readable
@@ -1996,9 +2823,12 @@ Or remote MCP for hosted use (no local CLI):
 claude mcp add --scope user --transport http bashroom https://bashroom.sdan.io/mcp
 \`\`\`
 
-## Tool
+## Tools
 
-\`bashroom({ command, stdin? })\` — runs bash inside your sandbox.
+- \`bashroom({ command, stdin? })\` — runs bash inside your sandbox.
+- \`bashroom_write({ path, content, encoding? })\` — writes a file directly.
+- \`bashroom_tree/read/search/stat(...)\` — reads bounded R2 context without
+  starting bash.
 
 ## Source
 
@@ -2012,11 +2842,11 @@ function llmsTxt(env: Env, request: Request): string {
   const base = publicBaseUrl(env, request);
   return `# Bashroom
 
-> Per-user Linux shell for coding agents. One MCP tool —
-> \`bashroom({ command, stdin? })\` — runs real \`bash\` inside a
-> Cloudflare Sandbox with \`/rooms\` FUSE-mounted from Cloudflare R2.
-> Room admin is available through the visible \`bashroom\` helper inside
-> the sandbox; destructive room deletion stays laptop-only.
+> Cloud shell for coding agents. MCP exposes real \`bash\` plus
+> bounded R2 file tools for tree, read, search, stat, and direct writes.
+> \`/rooms\` is FUSE-mounted from Cloudflare R2 inside the sandbox.
+> Room admin is available through the visible \`bashroom\` helper; destructive
+> room deletion stays laptop-only.
 
 ## Use
 
@@ -2028,7 +2858,8 @@ function llmsTxt(env: Env, request: Request): string {
 ## MCP
 
 - [MCP endpoint](${base}/mcp): streamable HTTP transport
-- Tool: \`bashroom({ command, stdin? })\` — bash in your sandbox
+- Tools: \`bashroom\`, \`bashroom_write\`, \`bashroom_tree\`,
+  \`bashroom_read\`, \`bashroom_search\`, \`bashroom_stat\`
 
 ## Optional
 
