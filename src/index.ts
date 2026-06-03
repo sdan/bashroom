@@ -542,6 +542,36 @@ export class Registry extends DurableObject<Env> {
         token TEXT
       );
     `);
+    // ─── MCP OAuth (RFC 7591 + OAuth 2.1 + PKCE) ──────────────────────────
+    // Dynamically-registered MCP clients (e.g. claude.ai's connector). The
+    // connector has no pre-shared client_id, so it self-registers here; we
+    // store its allowed redirect_uris to validate the authorize/token dance.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS oauth_clients (
+        client_id TEXT PRIMARY KEY,
+        redirect_uris TEXT NOT NULL,   -- JSON array of allowed redirect URIs
+        client_name TEXT,
+        created_at TEXT NOT NULL
+      );
+    `);
+    // Short-lived authorization codes. Bound to a client, a redirect_uri, the
+    // PKCE code_challenge, and (once GitHub auth completes) the resolved
+    // user_id + minted br_user_ token. github_state stitches the in-flight
+    // GitHub round-trip back to the pending code (mirrors device_codes).
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS oauth_codes (
+        code_hash TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        redirect_uri TEXT NOT NULL,
+        code_challenge TEXT NOT NULL,  -- PKCE S256 challenge
+        github_state TEXT,             -- ties the GitHub callback back to this code
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        user_id TEXT,                  -- set after GitHub auth resolves
+        token TEXT,                    -- the br_user_ token to hand to the client
+        claimed_at TEXT                -- set when /token burns the code
+      );
+    `);
     // v2 audit log — replaces the per-room Room.audit table. Cross-room
     // queries (e.g. "show me everything I did today") become a single
     // SELECT instead of a fan-out over per-room DOs.
@@ -723,6 +753,37 @@ export class Registry extends DurableObject<Env> {
         Number(body.github_id || 0),
         String(body.github_login || ""),
       ));
+    }
+
+    // ─── MCP OAuth internal routes ────────────────────────────────────────
+    if (request.method === "POST" && url.pathname === "/oauth-register") {
+      return json(this.oauthRegisterClient(
+        Array.isArray(body.redirect_uris) ? (body.redirect_uris as string[]).map(String) : [],
+        String(body.client_name || ""),
+      ));
+    }
+    if (request.method === "POST" && url.pathname === "/oauth-create-code") {
+      return json(await this.oauthCreateCode({
+        clientId: String(body.client_id || ""),
+        redirectUri: String(body.redirect_uri || ""),
+        codeChallenge: String(body.code_challenge || ""),
+        githubState: String(body.github_state || ""),
+      }));
+    }
+    if (request.method === "POST" && url.pathname === "/oauth-resolve-state") {
+      return json(await this.oauthResolveByGithubState(
+        String(body.state || ""),
+        Number(body.github_id || 0),
+        String(body.github_login || ""),
+      ));
+    }
+    if (request.method === "POST" && url.pathname === "/oauth-exchange") {
+      return json(await this.oauthExchangeCode({
+        code: String(body.code || ""),
+        clientId: String(body.client_id || ""),
+        redirectUri: String(body.redirect_uri || ""),
+        codeVerifier: String(body.code_verifier || ""),
+      }));
     }
 
     if (request.method === "POST" && url.pathname === "/audit-append") {
@@ -1019,6 +1080,22 @@ export class Registry extends DurableObject<Env> {
     const userId = await this.upsertGithubUser(githubId, githubLogin);
 
     // Mint a fresh token for this device.
+    const { token } = await this.mintUserToken(userId, githubLogin);
+    this.ctx.storage.sql.exec(
+      "UPDATE device_codes SET claimed_at = ?, user_id = ?, token = ? WHERE code_hash = ?",
+      new Date().toISOString(),
+      userId,
+      token,
+      codeHash,
+    );
+    return { ok: true, user_id: userId, github_login: githubLogin };
+  }
+
+  // Mint + persist a fresh br_user_ token for a resolved account, and sync it
+  // into the AccountDO so per-request auth resolves. Shared by the device-code
+  // flow and the MCP OAuth flow — both end in "I have a userId, give me a
+  // working token." Returns the plaintext token (caller hands it onward once).
+  private async mintUserToken(userId: string, handle: string): Promise<{ token: string }> {
     const now = new Date().toISOString();
     const token = randomAccountToken(userId);
     const tokenHash = await sha256(token);
@@ -1032,20 +1109,129 @@ export class Registry extends DurableObject<Env> {
     );
     await this.env.ACCOUNTS.getByName(accountObjectName(userId)).syncAccount({
       userId,
-      handle: githubLogin,
+      handle,
       tokenHash,
       tokenId,
       createdAt: now,
       rooms: this.accountRooms(userId),
     }).catch(() => undefined);
+    return { token };
+  }
+
+  // ─── MCP OAuth DO methods ───────────────────────────────────────────────
+
+  // RFC 7591 dynamic client registration. Store the client's redirect_uris so
+  // /authorize and /token can validate them. Returns a fresh client_id.
+  private oauthRegisterClient(redirectUris: string[], clientName: string): Record<string, unknown> {
+    if (!redirectUris.length) return { ok: false, error: "missing_redirect_uris" };
+    const clientId = randomId("oauthcli");
     this.ctx.storage.sql.exec(
-      "UPDATE device_codes SET claimed_at = ?, user_id = ?, token = ? WHERE code_hash = ?",
-      now,
+      "INSERT INTO oauth_clients (client_id, redirect_uris, client_name, created_at) VALUES (?, ?, ?, ?)",
+      clientId,
+      JSON.stringify(redirectUris),
+      clientName || "",
+      new Date().toISOString(),
+    );
+    return { ok: true, client_id: clientId, redirect_uris: redirectUris };
+  }
+
+  // Validate that a client exists and the given redirect_uri is registered to
+  // it (exact match — OAuth 2.1 forbids partial/wildcard matching).
+  private oauthValidateClient(clientId: string, redirectUri: string): Record<string, unknown> {
+    const row = this.ctx.storage.sql
+      .exec<{ redirect_uris: string }>("SELECT redirect_uris FROM oauth_clients WHERE client_id = ?", clientId)
+      .toArray()[0];
+    if (!row) return { ok: false, error: "unknown_client" };
+    let uris: string[] = [];
+    try { uris = JSON.parse(row.redirect_uris); } catch { /* corrupt row */ }
+    if (!uris.includes(redirectUri)) return { ok: false, error: "redirect_uri_mismatch" };
+    return { ok: true };
+  }
+
+  // Create a pending authorization code bound to the client + redirect_uri +
+  // PKCE challenge + the GitHub state we'll use to round-trip identity. The
+  // plaintext `code` is what we ultimately return to the client via redirect.
+  private async oauthCreateCode(input: {
+    clientId: string; redirectUri: string; codeChallenge: string; githubState: string;
+  }): Promise<Record<string, unknown>> {
+    const valid = this.oauthValidateClient(input.clientId, input.redirectUri);
+    if (!valid.ok) return valid;
+    if (!input.codeChallenge) return { ok: false, error: "missing_code_challenge" };
+    const code = `oac_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
+    const codeHash = await sha256(code);
+    const now = new Date();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, github_state, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      codeHash,
+      input.clientId,
+      input.redirectUri,
+      input.codeChallenge,
+      input.githubState,
+      now.toISOString(),
+      new Date(now.getTime() + 10 * 60_000).toISOString(), // 10 min to complete GitHub + redirect
+    );
+    return { ok: true, code };
+  }
+
+  // After GitHub auth resolves, attach the identity (mint a token) to the
+  // pending code keyed by the github_state we set in oauthCreateCode.
+  private async oauthResolveByGithubState(state: string, githubId: number, githubLogin: string): Promise<Record<string, unknown>> {
+    if (!state || !githubId || !githubLogin) return { ok: false, error: "missing_fields" };
+    const row = this.ctx.storage.sql
+      .exec<{ code_hash: string; expires_at: string; user_id: string | null }>(
+        "SELECT code_hash, expires_at, user_id FROM oauth_codes WHERE github_state = ?",
+        state,
+      )
+      .toArray()[0];
+    if (!row) return { ok: false, error: "unknown_state" };
+    if (new Date(row.expires_at) < new Date()) return { ok: false, error: "expired" };
+    if (row.user_id) return { ok: false, error: "already_resolved" };
+
+    const userId = await this.upsertGithubUser(githubId, githubLogin);
+    const { token } = await this.mintUserToken(userId, githubLogin);
+    this.ctx.storage.sql.exec(
+      "UPDATE oauth_codes SET user_id = ?, token = ? WHERE code_hash = ?",
       userId,
       token,
-      codeHash,
+      row.code_hash,
     );
+    // The callback carries redirect_uri + plaintext code through GitHub state,
+    // so it doesn't need them back from here — just confirm identity resolved.
     return { ok: true, user_id: userId, github_login: githubLogin };
+  }
+
+  // /token: exchange the authorization code (+ PKCE verifier) for the access
+  // token. Verifies the S256 challenge, the client_id, and burns the code.
+  private async oauthExchangeCode(input: {
+    code: string; clientId: string; redirectUri: string; codeVerifier: string;
+  }): Promise<Record<string, unknown>> {
+    if (!input.code || !input.codeVerifier) return { ok: false, error: "invalid_request" };
+    const codeHash = await sha256(input.code);
+    const row = this.ctx.storage.sql
+      .exec<{ client_id: string; redirect_uri: string; code_challenge: string; expires_at: string; user_id: string | null; token: string | null; claimed_at: string | null }>(
+        "SELECT client_id, redirect_uri, code_challenge, expires_at, user_id, token, claimed_at FROM oauth_codes WHERE code_hash = ?",
+        codeHash,
+      )
+      .toArray()[0];
+    if (!row) return { ok: false, error: "invalid_grant" };
+    if (row.claimed_at) { // replayed code → revoke defensively
+      this.ctx.storage.sql.exec("DELETE FROM oauth_codes WHERE code_hash = ?", codeHash);
+      return { ok: false, error: "invalid_grant" };
+    }
+    if (new Date(row.expires_at) < new Date()) return { ok: false, error: "invalid_grant" };
+    if (row.client_id !== input.clientId) return { ok: false, error: "invalid_client" };
+    if (input.redirectUri && row.redirect_uri !== input.redirectUri) return { ok: false, error: "invalid_grant" };
+    if (!row.user_id || !row.token) return { ok: false, error: "authorization_pending" };
+
+    // PKCE S256: base64url(sha256(code_verifier)) must equal stored challenge.
+    const computed = await sha256(input.codeVerifier);
+    if (computed !== row.code_challenge) return { ok: false, error: "invalid_grant" };
+
+    // Burn the one-time code; the token lives on in user_tokens.
+    const token = row.token;
+    this.ctx.storage.sql.exec("DELETE FROM oauth_codes WHERE code_hash = ?", codeHash);
+    return { ok: true, token };
   }
 
   // Find-or-create a bashroom account for this GitHub user. Stitches to an
@@ -1396,6 +1582,18 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
     if (url.pathname === "/mcp") {
       const token = bearerToken(request);
+      // MCP OAuth discovery trigger: an unauthenticated request gets a 401
+      // with a WWW-Authenticate header pointing at our protected-resource
+      // metadata (RFC 9728). Clients like claude.ai read this to start the
+      // OAuth dance. A request carrying a token (static br_user_ or one minted
+      // via our OAuth flow) skips this and goes straight to the handler — so
+      // the CLI / Claude Code / curl all keep working unchanged.
+      if (!token) {
+        const base = publicBaseUrl(env, request);
+        return json({ ok: false, error: "unauthorized" }, 401, {
+          "WWW-Authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`,
+        });
+      }
       return createMcpHandler(createServer(env, token, mcpSessionId(request), clientIp(request)), {
         sessionIdGenerator: () => crypto.randomUUID(),
         storage: mcpTransportStorage(env, request),
@@ -1576,6 +1774,187 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     if (url.pathname === "/device") {
       const code = url.searchParams.get("code") || "";
       return html(webDeviceHtml(code));
+    }
+
+    // ─── MCP OAuth 2.1 (RFC 9728 / RFC 8414 / RFC 7591 + PKCE) ────────────
+    // Lets clients that only support OAuth (e.g. the claude.ai connector,
+    // which has no field for a static token) authenticate by URL alone. The
+    // flow bridges to bashroom's existing GitHub identity and mints the same
+    // br_user_ token the CLI uses. Static-token auth on /mcp still works.
+
+    // (1) Protected Resource Metadata — tells the client which auth server to
+    // use. We are our own auth server.
+    if (url.pathname === "/.well-known/oauth-protected-resource") {
+      const base = publicBaseUrl(env, request);
+      return json({
+        resource: `${base}/mcp`,
+        authorization_servers: [base],
+        bearer_methods_supported: ["header"],
+      });
+    }
+
+    // (2) Authorization Server Metadata — advertises the OAuth endpoints and
+    // capabilities. PKCE S256 required; dynamic registration supported.
+    if (url.pathname === "/.well-known/oauth-authorization-server") {
+      const base = publicBaseUrl(env, request);
+      return json({
+        issuer: base,
+        authorization_endpoint: `${base}/oauth/authorize`,
+        token_endpoint: `${base}/oauth/token`,
+        registration_endpoint: `${base}/oauth/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code"],
+        code_challenge_methods_supported: ["S256"],
+        token_endpoint_auth_methods_supported: ["none"], // public client + PKCE
+      });
+    }
+
+    // (3) Dynamic Client Registration (RFC 7591). The connector self-registers
+    // its redirect_uris and gets a client_id back.
+    if (url.pathname === "/oauth/register" && request.method === "POST") {
+      const input = await readJson(request);
+      const redirectUris = Array.isArray(input.redirect_uris) ? input.redirect_uris.map(String) : [];
+      const reg = await registry(env, "/oauth-register", {
+        redirect_uris: redirectUris,
+        client_name: String(input.client_name || ""),
+      });
+      if (reg.ok === false) return json({ error: "invalid_client_metadata", error_description: reg.error }, 400);
+      // RFC 7591 response shape.
+      return json({
+        client_id: reg.client_id,
+        redirect_uris: reg.redirect_uris,
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+      }, 201);
+    }
+
+    // (4) Authorization endpoint. Validates the client + PKCE, stashes a
+    // pending code, then bounces the user through GitHub to establish identity.
+    if (url.pathname === "/oauth/authorize") {
+      const clientId = url.searchParams.get("client_id") || "";
+      const redirectUri = url.searchParams.get("redirect_uri") || "";
+      const responseType = url.searchParams.get("response_type") || "";
+      const codeChallenge = url.searchParams.get("code_challenge") || "";
+      const codeChallengeMethod = url.searchParams.get("code_challenge_method") || "";
+      const clientState = url.searchParams.get("state") || ""; // client's own CSRF state, echoed back
+      if (responseType !== "code") return text("unsupported_response_type", 400);
+      if (codeChallengeMethod !== "S256" || !codeChallenge) return text("PKCE S256 required", 400);
+      if (!env.GITHUB_CLIENT_ID) return text("GitHub OAuth not configured.", 500);
+
+      // github_state ties the upcoming GitHub callback to this pending code.
+      // We also smuggle the client's redirect_uri + state through it so the
+      // callback can complete the redirect — packed as a single opaque token.
+      const githubState = base64url(crypto.getRandomValues(new Uint8Array(18)));
+      const created = await registry(env, "/oauth-create-code", {
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        code_challenge: codeChallenge,
+        github_state: githubState,
+      });
+      if (created.ok === false) {
+        // Per OAuth 2.1, redirect errors back to the client when redirect_uri
+        // is valid; here the client/redirect is what failed, so show plainly.
+        return text(`authorize error: ${created.error}`, 400);
+      }
+      const authCode = String(created.code || "");
+      // Pack everything the callback needs into GitHub's state param, so we
+      // never have to store the plaintext auth code or client redirect/state
+      // server-side: "<githubState>.<b64(redirectUri)>.<b64(authCode)>.<b64(clientState)>".
+      const packedState = [
+        githubState,
+        base64url(new TextEncoder().encode(redirectUri)),
+        base64url(new TextEncoder().encode(authCode)),
+        base64url(new TextEncoder().encode(clientState)),
+      ].join(".");
+      const base = publicBaseUrl(env, request);
+      const ghUrl = new URL("https://github.com/login/oauth/authorize");
+      ghUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+      ghUrl.searchParams.set("redirect_uri", `${base}/oauth/github/callback`);
+      ghUrl.searchParams.set("scope", "read:user");
+      ghUrl.searchParams.set("state", packedState);
+      ghUrl.searchParams.set("allow_signup", "true");
+      return new Response(null, { status: 302, headers: { location: ghUrl.toString() } });
+    }
+
+    // (4b) OAuth-specific GitHub callback. Distinct from /auth/github/callback
+    // (device flow) so the two flows stay independent. Resolves identity, mints
+    // the token onto the pending code, then redirects back to the MCP client.
+    if (url.pathname === "/oauth/github/callback") {
+      const ghCode = url.searchParams.get("code") || "";
+      const packedState = url.searchParams.get("state") || "";
+      if (!ghCode || !packedState) return text("Missing OAuth code or state.", 400);
+      if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) return text("GitHub OAuth not configured.", 500);
+
+      // Unpack "<githubState>.<b64(redirectUri)>.<b64(authCode)>.<b64(clientState)>".
+      const parts = packedState.split(".");
+      if (parts.length !== 4) return text("Malformed state.", 400);
+      const githubState = parts[0];
+      const dec = (s: string) => { try { return new TextDecoder().decode(base64urlDecode(s)); } catch { return ""; } };
+      const redirectUri = dec(parts[1]);
+      const authCode = dec(parts[2]);
+      const clientState = dec(parts[3]);
+      if (!redirectUri || !authCode) return text("Malformed state payload.", 400);
+
+      const base = publicBaseUrl(env, request);
+      const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json", "user-agent": "bashroom" },
+        body: JSON.stringify({
+          client_id: env.GITHUB_CLIENT_ID,
+          client_secret: env.GITHUB_CLIENT_SECRET,
+          code: ghCode,
+          redirect_uri: `${base}/oauth/github/callback`,
+        }),
+      });
+      const tokenJson = await tokenRes.json().catch(() => ({})) as { access_token?: string; error?: string };
+      if (!tokenJson.access_token) return text(`GitHub: ${tokenJson.error || "no access token"}`, 400);
+
+      const userRes = await fetch("https://api.github.com/user", {
+        headers: { authorization: `Bearer ${tokenJson.access_token}`, accept: "application/vnd.github+json", "user-agent": "bashroom" },
+      });
+      const userJson = await userRes.json().catch(() => ({})) as { id?: number; login?: string };
+      if (!userJson.id || !userJson.login) return text("Couldn't read GitHub profile.", 400);
+
+      const resolved = await registry(env, "/oauth-resolve-state", {
+        state: githubState,
+        github_id: userJson.id,
+        github_login: userJson.login,
+      });
+      if (resolved.ok === false) return text(`Authorization failed: ${resolved.error}`, 400);
+
+      // Redirect back to the MCP client with the authorization code (carried
+      // through GitHub's state, so the token never had to be stored plaintext).
+      const back = new URL(redirectUri);
+      back.searchParams.set("code", authCode);
+      if (clientState) back.searchParams.set("state", clientState);
+      return new Response(null, { status: 302, headers: { location: back.toString() } });
+    }
+
+    // (5) Token endpoint. Exchanges the authorization code + PKCE verifier for
+    // the br_user_ access token.
+    if (url.pathname === "/oauth/token" && request.method === "POST") {
+      const form = await request.formData().catch(() => null);
+      const get = (k: string) => (form ? String(form.get(k) || "") : "");
+      if (get("grant_type") !== "authorization_code") {
+        return json({ error: "unsupported_grant_type" }, 400);
+      }
+      const exchanged = await registry(env, "/oauth-exchange", {
+        code: get("code"),
+        client_id: get("client_id"),
+        redirect_uri: get("redirect_uri"),
+        code_verifier: get("code_verifier"),
+      });
+      if (exchanged.ok === false) {
+        const err = String(exchanged.error || "invalid_grant");
+        const status = err === "authorization_pending" ? 400 : 400;
+        return json({ error: err }, status);
+      }
+      return json({
+        access_token: exchanged.token,
+        token_type: "Bearer",
+        scope: "rooms",
+      });
     }
 
     if (url.pathname === "/auth/github") {
@@ -2763,6 +3142,14 @@ function base64url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+function base64urlDecode(value: string): Uint8Array {
+  const b64 = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 async function sha256(value: string): Promise<string> {
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return base64url(new Uint8Array(hash));
@@ -2774,10 +3161,10 @@ function formatShellResult(result: ShellResult): string {
   return `${output}${output && !output.endsWith("\n") ? "\n" : ""}[bashroom] exit=${result.exitCode} changed=${result.changed}${paths}\n`;
 }
 
-function json(value: unknown, status = 200): Response {
+function json(value: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(value, null, 2), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: { "content-type": "application/json; charset=utf-8", ...extraHeaders },
   });
 }
 
