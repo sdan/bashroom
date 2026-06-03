@@ -1870,66 +1870,21 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       const base = publicBaseUrl(env, request);
       const ghUrl = new URL("https://github.com/login/oauth/authorize");
       ghUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
-      ghUrl.searchParams.set("redirect_uri", `${base}/oauth/github/callback`);
+      // Reuse the ONE callback registered in the GitHub OAuth App. The shared
+      // callback disambiguates device-flow vs OAuth-flow by the state shape:
+      // OAuth states are packed with dots ("<gh>.<b64>.<b64>.<b64>"); device
+      // states are plain (no dots). GitHub only allows registered callback
+      // URLs, so a second path would 404 with "redirect_uri not associated".
+      ghUrl.searchParams.set("redirect_uri", `${base}/auth/github/callback`);
       ghUrl.searchParams.set("scope", "read:user");
       ghUrl.searchParams.set("state", packedState);
       ghUrl.searchParams.set("allow_signup", "true");
       return new Response(null, { status: 302, headers: { location: ghUrl.toString() } });
     }
 
-    // (4b) OAuth-specific GitHub callback. Distinct from /auth/github/callback
-    // (device flow) so the two flows stay independent. Resolves identity, mints
-    // the token onto the pending code, then redirects back to the MCP client.
-    if (url.pathname === "/oauth/github/callback") {
-      const ghCode = url.searchParams.get("code") || "";
-      const packedState = url.searchParams.get("state") || "";
-      if (!ghCode || !packedState) return text("Missing OAuth code or state.", 400);
-      if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) return text("GitHub OAuth not configured.", 500);
-
-      // Unpack "<githubState>.<b64(redirectUri)>.<b64(authCode)>.<b64(clientState)>".
-      const parts = packedState.split(".");
-      if (parts.length !== 4) return text("Malformed state.", 400);
-      const githubState = parts[0];
-      const dec = (s: string) => { try { return new TextDecoder().decode(base64urlDecode(s)); } catch { return ""; } };
-      const redirectUri = dec(parts[1]);
-      const authCode = dec(parts[2]);
-      const clientState = dec(parts[3]);
-      if (!redirectUri || !authCode) return text("Malformed state payload.", 400);
-
-      const base = publicBaseUrl(env, request);
-      const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json", "user-agent": "bashroom" },
-        body: JSON.stringify({
-          client_id: env.GITHUB_CLIENT_ID,
-          client_secret: env.GITHUB_CLIENT_SECRET,
-          code: ghCode,
-          redirect_uri: `${base}/oauth/github/callback`,
-        }),
-      });
-      const tokenJson = await tokenRes.json().catch(() => ({})) as { access_token?: string; error?: string };
-      if (!tokenJson.access_token) return text(`GitHub: ${tokenJson.error || "no access token"}`, 400);
-
-      const userRes = await fetch("https://api.github.com/user", {
-        headers: { authorization: `Bearer ${tokenJson.access_token}`, accept: "application/vnd.github+json", "user-agent": "bashroom" },
-      });
-      const userJson = await userRes.json().catch(() => ({})) as { id?: number; login?: string };
-      if (!userJson.id || !userJson.login) return text("Couldn't read GitHub profile.", 400);
-
-      const resolved = await registry(env, "/oauth-resolve-state", {
-        state: githubState,
-        github_id: userJson.id,
-        github_login: userJson.login,
-      });
-      if (resolved.ok === false) return text(`Authorization failed: ${resolved.error}`, 400);
-
-      // Redirect back to the MCP client with the authorization code (carried
-      // through GitHub's state, so the token never had to be stored plaintext).
-      const back = new URL(redirectUri);
-      back.searchParams.set("code", authCode);
-      if (clientState) back.searchParams.set("state", clientState);
-      return new Response(null, { status: 302, headers: { location: back.toString() } });
-    }
+    // (4b) The GitHub callback is shared with the device flow at
+    // /auth/github/callback (GitHub only allows registered callback URLs).
+    // It detects this OAuth flow by the dotted state shape and completes there.
 
     // (5) Token endpoint. Exchanges the authorization code + PKCE verifier for
     // the br_user_ access token.
@@ -1980,6 +1935,56 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       const state = url.searchParams.get("state") || "";
       if (!ghCode || !state) return html(webDeviceResultHtml({ ok: false, message: "Missing OAuth code or state." }), 400);
       if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) return html(webDeviceResultHtml({ ok: false, message: "GitHub OAuth not configured." }), 500);
+
+      // Shared callback for BOTH flows — GitHub only allows registered callback
+      // URLs, so the MCP OAuth flow reuses this one. Disambiguate by state
+      // shape: MCP-OAuth states are packed with dots ("<gh>.<b64>.<b64>.<b64>");
+      // device-flow states are plain base64url (no dots). Branch to OAuth here,
+      // then fall through to the device-flow logic below.
+      if (state.includes(".")) {
+        const parts = state.split(".");
+        if (parts.length !== 4) return text("Malformed state.", 400);
+        const githubState = parts[0];
+        const dec = (s: string) => { try { return new TextDecoder().decode(base64urlDecode(s)); } catch { return ""; } };
+        const redirectUri = dec(parts[1]);
+        const authCode = dec(parts[2]);
+        const clientState = dec(parts[3]);
+        if (!redirectUri || !authCode) return text("Malformed state payload.", 400);
+
+        const cbBase = publicBaseUrl(env, request);
+        const ghTok = await fetch("https://github.com/login/oauth/access_token", {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json", "user-agent": "bashroom" },
+          body: JSON.stringify({
+            client_id: env.GITHUB_CLIENT_ID,
+            client_secret: env.GITHUB_CLIENT_SECRET,
+            code: ghCode,
+            redirect_uri: `${cbBase}/auth/github/callback`,
+          }),
+        });
+        const ghTokJson = await ghTok.json().catch(() => ({})) as { access_token?: string; error?: string };
+        if (!ghTokJson.access_token) return text(`GitHub: ${ghTokJson.error || "no access token"}`, 400);
+
+        const ghUserRes = await fetch("https://api.github.com/user", {
+          headers: { authorization: `Bearer ${ghTokJson.access_token}`, accept: "application/vnd.github+json", "user-agent": "bashroom" },
+        });
+        const ghUser = await ghUserRes.json().catch(() => ({})) as { id?: number; login?: string };
+        if (!ghUser.id || !ghUser.login) return text("Couldn't read GitHub profile.", 400);
+
+        const resolved = await registry(env, "/oauth-resolve-state", {
+          state: githubState,
+          github_id: ghUser.id,
+          github_login: ghUser.login,
+        });
+        if (resolved.ok === false) return text(`Authorization failed: ${resolved.error}`, 400);
+
+        // Redirect back to the MCP client with the auth code (carried through
+        // GitHub's state, so the token was never stored plaintext server-side).
+        const back = new URL(redirectUri);
+        back.searchParams.set("code", authCode);
+        if (clientState) back.searchParams.set("state", clientState);
+        return new Response(null, { status: 302, headers: { location: back.toString() } });
+      }
 
       // Find the device code waiting on this state.
       const lookup = await registry(env, "/device-lookup-state", { state });
