@@ -262,6 +262,23 @@ so an LLM can discover bashroom without HTML parsing:
 Neither endpoint touches the sandbox or R2; they're string constants
 emitted by the worker.
 
+### OG / social-share image
+
+`src/og.ts` exports `ogSvg()` — the single source for the 1200×630
+social-preview image. `scripts/render-og.ts` imports it directly and
+rasterizes via `rsvg-convert`, so `assets/og.png` never drifts from the
+`/og.svg` the worker serves (both come from one function). The hero is the
+room file-tree — the product mental model — with brand top-left and tagline
+bottom-right on the fleet diagonal.
+
+bashroom is the canonical reference for the fleet's **static OG lineage**
+(one SVG → `rsvg-convert` → one PNG asset), shared with pingpong and quack.
+The cross-site playbook — the one-centered-hero rule, the composition
+grammar, the per-site palette freedom, the static-vs-dynamic render split,
+and the font/URL/crop gotchas — lives in [`docs/OG-DESIGN.md`](docs/OG-DESIGN.md).
+That doc is the shared design source so a new fleet site's OG lands in the
+family without re-deriving it.
+
 ## Wrangler config (`wrangler.jsonc`)
 
 Bindings:
