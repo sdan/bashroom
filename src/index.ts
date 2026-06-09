@@ -2485,11 +2485,11 @@ async function authorizeAccount(
   const routeUserId = routeUserIdFromToken(token);
   const tokenHash = await sha256(token);
 
-  // All live tokens are routeable (br.usr_…). The AccountDO is the single
-  // authority on the hot path: it authorizes, meters, AND returns the room
-  // mirror in one round trip. The mirror is kept current by syncAccount /
-  // upsertRoom / removeRoom on every room mutation, so reads never re-fetch
-  // canonical rooms from the Registry singleton.
+  // Routeable tokens (br.usr_… shape) carry their user id inline, so the
+  // per-user AccountDO can authorize, meter, AND return the room mirror in
+  // one round trip — no Registry hit on the hot path. The mirror is kept
+  // current by syncAccount / upsertRoom / removeRoom on every room mutation.
+  // Tokens without an inline id fall through to the Registry path below.
   if (routeUserId) {
     const account = env.ACCOUNTS.getByName(accountObjectName(routeUserId));
     const decision = await account.authorizeAndCharge({
@@ -2519,9 +2519,11 @@ async function authorizeAccount(
     return decision;
   }
 
-  // Non-routeable token shape — not minted anymore. Reject rather than walk
-  // the retired Registry auth path.
-  return { ok: false, error: "invalid_token" };
+  // Tokens that don't carry an inline route id (the live br_user_… format)
+  // are authorized by the Registry, which owns the token→user mapping and
+  // the room membership. This is the primary path for current tokens, not a
+  // legacy fallback.
+  return accountWireFromRegistry(await registry(env, "/account-rooms", { token, ip }));
 }
 
 function accountWireFromRegistry(result: Record<string, unknown>): AccountWire {
@@ -3325,12 +3327,15 @@ async function ensureSandboxReady(env: Env, userId: string): Promise<Sandbox> {
     if (!env.R2_ENDPOINT || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
       throw new Error("R2 credentials not configured (R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)");
     }
-    // RemoteMountBucketOptions: production s3fs-FUSE mode. First arg is the
-    // bucket name. credentialProxy keeps the real R2 keys in the Durable
-    // Object — the container gets dummy creds and s3fs's outbound requests
-    // are intercepted and re-signed by the DO (backed by the ContainerProxy
-    // export above). Untrusted bash in the sandbox can no longer recover a
-    // bucket-wide key. Requires `export { ContainerProxy }` (present).
+    // RemoteMountBucketOptions: production s3fs-FUSE mode. First arg is
+    // the bucket name. R2 credentials are scoped to bashroom-rooms only.
+    //
+    // NOTE: credentialProxy: true is the goal (keeps R2 keys out of the
+    // untrusted container) but in the 0.12.1 deploy it left /rooms mounted
+    // yet every read/write through the mount hung to timeout — the re-signing
+    // proxy wasn't completing S3 requests. Reverted to direct credentials
+    // until that's diagnosed; see the backlog. Direct creds work; the
+    // credential-scope hardening is re-queued, not abandoned.
     await sandbox.mountBucket(env.R2_BUCKET_NAME || "bashroom-rooms", "/rooms", {
       endpoint: env.R2_ENDPOINT,
       provider: "r2",
@@ -3339,7 +3344,6 @@ async function ensureSandboxReady(env: Env, userId: string): Promise<Sandbox> {
         accessKeyId: env.R2_ACCESS_KEY_ID,
         secretAccessKey: env.R2_SECRET_ACCESS_KEY,
       },
-      credentialProxy: true,
     });
   }
   return sandbox;
