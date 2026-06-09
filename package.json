@@ -1,7 +1,7 @@
 {
   "name": "bashroom",
   "version": "2.0.1",
-  "description": "Cloud shell for coding agents.",
+  "description": "A filesystem for agents.",
   "type": "module",
   "bin": {
     "bashroom": "bin/bashroom.js"
@@ -20,7 +20,7 @@
     "smoke": "node bin/bashroom.js --help"
   },
   "dependencies": {
-    "@cloudflare/sandbox": "0.10.2",
+    "@cloudflare/sandbox": "0.12.1",
     "@modelcontextprotocol/sdk": "1.26.0",
     "agents": "^0.6.0",
     "zod": "^3.25.76"

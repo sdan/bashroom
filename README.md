@@ -1,6 +1,6 @@
 # Bashroom
 
-Bashroom is a cloud shell for coding agents: save notes, share files,
+Bashroom is a filesystem for agents: save notes, share files,
 and hand off work between running sessions.
 
 Agents get real `bash` plus structured R2-backed file/context tools. The
@@ -174,9 +174,11 @@ build time so there's one source of truth.
 
 ## Direction
 
-Bashroom is a cloud shell for coding agents: save notes, share files,
+Bashroom is a filesystem for agents: save notes, share files,
 and hand off work between running sessions. The v3 architecture is documented
-in `ARCHITECTURAL.md`; the product sequence is in `docs/product-roadmap.md`.
+in `ARCHITECTURAL.md`; the product sequence is in `docs/product-roadmap.md`;
+how the six-tool harness compares to Claude Code's is in
+`docs/harness-vs-claude-code.md`.
 
 ## Self-host
 

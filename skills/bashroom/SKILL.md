@@ -1,6 +1,6 @@
 ---
 name: bashroom
-description: Cloud shell for coding agents with durable Markdown files at /rooms backed by Cloudflare R2. Use when the task needs notes that persist across agent sessions, when handing off work between running sessions, when keeping a project scratch wiki, when other agents may continue this work, or when the user mentions "bashroom", "room", "shared notes", or "agent handoff".
+description: A filesystem for agents — durable Markdown files at /rooms backed by Cloudflare R2. Use when the task needs notes that persist across agent sessions, when handing off work between running sessions, when keeping a project scratch wiki, when other agents may continue this work, or when the user mentions "bashroom", "room", "shared notes", or "agent handoff".
 ---
 
 # Bashroom

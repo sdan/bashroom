@@ -57,6 +57,6 @@ export function ogSvg(): string {
   </g>
 
   <!-- Tagline, bottom-right — diagonal pair to the top-left brand. -->
-  <text x="1120" y="555" text-anchor="end" font-family="${fontStack}" font-size="26" font-weight="400" fill="#6F6E69">cloud shell for coding agents</text>
+  <text x="1120" y="555" text-anchor="end" font-family="${fontStack}" font-size="26" font-weight="400" fill="#6F6E69">a filesystem for agents</text>
 </svg>`;
 }

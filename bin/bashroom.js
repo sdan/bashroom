@@ -39,6 +39,10 @@ Room admin:
   bashroom who <room>                  List the actors present in a room.
   bashroom history <room> [--limit N]  Per-room audit log (default 20 most recent).
 
+Data:
+  bashroom export [dir] [--room R]     Download rooms to a local directory tree
+                                       (default ./bashroom-export). One room with --room.
+
 Shell:
   bashroom <bash command>              Run bash against /rooms (FUSE-mounted R2).
   bashroom mcp                         Start the stdio MCP server (for agent wiring).
@@ -324,6 +328,74 @@ async function roomHistory(baseUrl, args) {
   }
 }
 
+// Authenticated GET against the /web/api/* read surface. Used by export so
+// it reuses the same membership-gated endpoints the reader uses.
+async function apiGet(baseUrl, path, token) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const text = await response.text();
+  const result = text ? JSON.parse(text) : {};
+  if (!response.ok || result.ok === false) {
+    throw new Error(result.error || response.statusText || "request failed");
+  }
+  return result;
+}
+
+// Download every room (or one with --room) to a local directory tree,
+// preserving room/path layout. Files come down via /web/api/raw so binary
+// content survives byte-for-byte. This is the offline backup of the R2 data.
+async function exportData(baseUrl, args) {
+  const current = account(baseUrl);
+  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
+  const token = current.token;
+
+  const mutableArgs = [...args];
+  const onlyRoom = parseFlag(mutableArgs, "--room");
+  const destDir = path.resolve(mutableArgs[0] || "bashroom-export");
+
+  const roomsResult = await apiGet(baseUrl, "/web/api/rooms", token);
+  let rooms = (Array.isArray(roomsResult.rooms) ? roomsResult.rooms : []).map((r) => r.room);
+  if (onlyRoom) rooms = rooms.filter((r) => r === onlyRoom);
+  if (!rooms.length) {
+    console.log(onlyRoom ? `No room named ${onlyRoom}.` : "No rooms to export.");
+    return;
+  }
+
+  let fileCount = 0;
+  let byteCount = 0;
+  for (const room of rooms) {
+    const tree = await apiGet(baseUrl, `/web/api/tree?room=${encodeURIComponent(room)}`, token);
+    const files = (Array.isArray(tree.files) ? tree.files : [])
+      .filter((f) => f.path && !f.path.endsWith("/")); // skip directory markers
+    for (const file of files) {
+      // Guard against path traversal in stored keys before writing locally.
+      const safe = file.path.split("/").filter((seg) => seg && seg !== "." && seg !== "..").join("/");
+      if (!safe) continue;
+      const outPath = path.join(destDir, room, safe);
+      const url = `/web/api/raw?room=${encodeURIComponent(room)}&path=${encodeURIComponent(file.path)}`;
+      const response = await fetch(`${baseUrl}${url}`, { headers: { authorization: `Bearer ${token}` } });
+      if (!response.ok) {
+        process.stderr.write(`skip ${room}/${file.path}: ${response.status}\n`);
+        continue;
+      }
+      const bytes = Buffer.from(await response.arrayBuffer());
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.writeFileSync(outPath, bytes);
+      fileCount += 1;
+      byteCount += bytes.length;
+    }
+    console.log(`${room}: ${files.length} files`);
+  }
+  console.log(`\nExported ${fileCount} files (${formatBytes(byteCount)}) to ${destDir}`);
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 async function runBash(baseUrl, command, stdin) {
   const headers = {
     "content-type": "application/json",
@@ -604,6 +676,11 @@ async function main() {
 
   if (args[0] === "history") {
     await roomHistory(baseUrl, args.slice(1));
+    return;
+  }
+
+  if (args[0] === "export") {
+    await exportData(baseUrl, args.slice(1));
     return;
   }
 

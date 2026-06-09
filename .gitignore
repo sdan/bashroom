@@ -25,3 +25,15 @@ skills-lock.json
 # by the worker. The source of truth is ogSvg() in src/og.ts; any scratch SVG
 # rendered alongside it (e.g. via curl) is regenerated, not tracked.
 assets/og.svg
+
+# Local working space — lesson scratch, experiments. Not project source.
+scratch/
+
+# Internal writeups not for the public repo.
+docs/harness-vs-claude-code.md
+
+# Usage/metrics operator tooling kept internal (admin-gated fan-out script
+# + any local report output). The feature lives as a local-only patch in
+# ~/.bashroom-metrics-patch, not in the public repo.
+scripts/usage.ts
+usage-report.*

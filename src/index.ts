@@ -420,6 +420,10 @@ const WRITE_TOKEN_REFILL = 10 / MINUTE_MS;
 const GLOBAL_OPS_CAPACITY = 50_000;
 const GLOBAL_OPS_REFILL = 50_000 / DAY_MS;
 const LAST_SEEN_WRITE_INTERVAL_MS = 5 * MINUTE_MS;
+// Registry cleanup-alarm cadence + per-table TTLs for the sweep.
+const CLEANUP_INTERVAL_MS = HOUR_MS;
+const TRANSPORT_STATE_TTL_MS = 7 * DAY_MS;
+const BUCKET_TTL_MS = DAY_MS;
 const SLUG_VERBS = [
   "accomplishing", "actioning", "actualizing", "architecting", "baking", "beaming", "beboppin", "befuddling",
   "billowing", "blanching", "bloviating", "boogieing", "boondoggling", "booping", "bootstrapping", "brewing",
@@ -456,11 +460,6 @@ export class Registry extends DurableObject<Env> {
         created_at TEXT NOT NULL
       );
     `);
-    // Dead grant tables from the pre-account era. Drop on cold start.
-    // wiki_tokens: per-room access tokens (replaced by user_rooms membership).
-    // wiki_session_tokens: per-MCP-session room grants (replaced by token → user → membership).
-    this.ctx.storage.sql.exec("DROP TABLE IF EXISTS wiki_tokens");
-    this.ctx.storage.sql.exec("DROP TABLE IF EXISTS wiki_session_tokens");
     // Pair codes survive — short-lived invites that bestow membership on
     // redemption by an authenticated user.
     this.ctx.storage.sql.exec(`
@@ -528,6 +527,19 @@ export class Registry extends DurableObject<Env> {
         PRIMARY KEY (user_id, room)
       );
     `);
+    // Public shares: an unguessable slug is the whole capability. It maps to
+    // one (user, room, prefix) subtree; anyone holding the URL can read that
+    // subtree anonymously. prefix '' shares the whole room.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS shares (
+        slug TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        room TEXT NOT NULL,
+        prefix TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+    `);
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS shares_user_idx ON shares(user_id, created_at DESC)");
     // Device codes for OAuth device flow. Lifecycle: minted by /auth/device/start,
     // displayed at /device, claimed by /auth/github/callback, polled by CLI.
     // Single row per code; deleted by background sweep or on first claim.
@@ -590,6 +602,35 @@ export class Registry extends DurableObject<Env> {
     `);
     this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS audit_room_idx ON audit(room, id DESC)`);
     this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS audit_user_idx ON audit(user_id, id DESC)`);
+  }
+
+  // Arm the hourly cleanup alarm if one isn't already pending. Called after
+  // inserting any row with a TTL (device/oauth codes, pair codes) so abandoned
+  // rows — which hold short-lived plaintext tokens — don't accrete forever.
+  private async armCleanup(): Promise<void> {
+    if ((await this.ctx.storage.getAlarm()) === null) {
+      await this.ctx.storage.setAlarm(Date.now() + CLEANUP_INTERVAL_MS);
+    }
+  }
+
+  // Sweep expired/stale rows. Re-arms only while sweepable rows remain, so an
+  // idle Registry stops waking itself.
+  async alarm(): Promise<void> {
+    const now = new Date().toISOString();
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM device_codes WHERE expires_at < ?", now);
+    sql.exec("DELETE FROM oauth_codes WHERE expires_at < ?", now);
+    sql.exec("DELETE FROM wiki_pair_codes WHERE expires_at < ?", now);
+    sql.exec("DELETE FROM mcp_transport_states WHERE updated_at < ?", new Date(Date.now() - TRANSPORT_STATE_TTL_MS).toISOString());
+    // Rate-limit buckets refill over time; a row untouched for a day is at
+    // full credits and carries no state worth keeping.
+    sql.exec("DELETE FROM credit_buckets WHERE updated_at < ?", Date.now() - BUCKET_TTL_MS);
+    const remaining = sql
+      .exec<{ n: number }>(
+        "SELECT (SELECT COUNT(*) FROM device_codes) + (SELECT COUNT(*) FROM oauth_codes) + (SELECT COUNT(*) FROM wiki_pair_codes) AS n",
+      )
+      .toArray()[0]?.n ?? 0;
+    if (remaining > 0) await this.ctx.storage.setAlarm(Date.now() + CLEANUP_INTERVAL_MS);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -663,6 +704,38 @@ export class Registry extends DurableObject<Env> {
       const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
       if (!account.ok) return json(account, 401);
       return json(await this.createWiki(account.userId || "", account.handle || "user", String(body.room || body.wiki || ""), String(body.actor || "")));
+    }
+
+    // ─── Public shares ───────────────────────────────────────────────────
+    // Create/list/delete require the account token; sharing is an access-
+    // control action, so creating one requires admin on the room. Resolve is
+    // anonymous (the slug IS the credential) and rate-limited per IP.
+    if (request.method === "POST" && url.pathname === "/share-create") {
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
+      if (!account.ok) return json(account, 401);
+      const room = String(body.room || body.wiki || "");
+      const auth = this.authorizeUser(room, account.userId || "", "admin");
+      if (!auth.ok) return json(auth, 403);
+      return json(this.createShare(account.userId || "", room, String(body.prefix || "")));
+    }
+
+    if (request.method === "POST" && url.pathname === "/share-list") {
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
+      if (!account.ok) return json(account, 401);
+      return json({ ok: true, shares: this.listShares(account.userId || "") });
+    }
+
+    if (request.method === "POST" && url.pathname === "/share-delete") {
+      const account = await this.verifyAccount(bearerFromUnknown(body.token), String(body.ip || "unknown"));
+      if (!account.ok) return json(account, 401);
+      return json(this.deleteShare(account.userId || "", String(body.slug || "")));
+    }
+
+    if (request.method === "POST" && url.pathname === "/share-resolve") {
+      const ip = String(body.ip || "unknown");
+      const limited = this.checkBucket(`share:ip:${ip}`, VERIFY_IP_CAPACITY, VERIFY_IP_REFILL);
+      if (limited) return json(limited, 429);
+      return json(this.resolveShare(String(body.slug || "")));
     }
 
     // Internal sandbox-control paths. These are not exposed by handleRequest();
@@ -757,6 +830,12 @@ export class Registry extends DurableObject<Env> {
 
     // ─── MCP OAuth internal routes ────────────────────────────────────────
     if (request.method === "POST" && url.pathname === "/oauth-register") {
+      // Unauthenticated by RFC 7591 — gate by IP so it can't be used to grow
+      // the oauth_clients table unbounded on the singleton.
+      const ip = String(body.ip || "unknown");
+      const limited = this.checkBucket(`oauth-register:ip:${ip}`, CREATE_IP_CAPACITY, CREATE_IP_REFILL)
+        || this.checkBucket("oauth-register:global", CREATE_GLOBAL_CAPACITY, CREATE_GLOBAL_REFILL);
+      if (limited) return json(limited, 429);
       return json(this.oauthRegisterClient(
         Array.isArray(body.redirect_uris) ? (body.redirect_uris as string[]).map(String) : [],
         String(body.client_name || ""),
@@ -877,6 +956,54 @@ export class Registry extends DurableObject<Env> {
     return { ok: true, wiki: cleanWiki, actor: row.actor, scopes, tokenId: userId };
   }
 
+  // ─── Public shares ─────────────────────────────────────────────────────
+  private createShare(userId: string, room: string, prefix: string): Record<string, unknown> {
+    const cleanRoom = sanitizeWiki(room);
+    const cleanPrefix = prefix ? sanitizeFilePath(prefix) : "";
+    // Re-sharing the same target returns the same URL instead of minting a
+    // second slug — one revocation kills the only public path to it.
+    const existing = this.ctx.storage.sql
+      .exec<{ slug: string }>("SELECT slug FROM shares WHERE user_id = ? AND room = ? AND prefix = ?", userId, cleanRoom, cleanPrefix)
+      .toArray()[0];
+    if (existing) return { ok: true, slug: existing.slug, room: cleanRoom, prefix: cleanPrefix };
+    const slug = randomSuffix(16);
+    this.ctx.storage.sql.exec(
+      "INSERT INTO shares (slug, user_id, room, prefix, created_at) VALUES (?, ?, ?, ?, ?)",
+      slug,
+      userId,
+      cleanRoom,
+      cleanPrefix,
+      new Date().toISOString(),
+    );
+    return { ok: true, slug, room: cleanRoom, prefix: cleanPrefix };
+  }
+
+  private listShares(userId: string): Array<Record<string, unknown>> {
+    return this.ctx.storage.sql
+      .exec<{ slug: string; room: string; prefix: string; created_at: string }>(
+        "SELECT slug, room, prefix, created_at FROM shares WHERE user_id = ? ORDER BY created_at DESC",
+        userId,
+      )
+      .toArray();
+  }
+
+  private deleteShare(userId: string, slug: string): Record<string, unknown> {
+    // Scoped to the caller's own rows — a user can only revoke their shares.
+    this.ctx.storage.sql.exec("DELETE FROM shares WHERE user_id = ? AND slug = ?", userId, slug);
+    return { ok: true };
+  }
+
+  private resolveShare(slug: string): Record<string, unknown> {
+    if (!slug) return { ok: false, error: "not_found" };
+    const row = this.ctx.storage.sql
+      .exec<{ slug: string; user_id: string; room: string; prefix: string }>(
+        "SELECT slug, user_id, room, prefix FROM shares WHERE slug = ?",
+        slug,
+      )
+      .toArray()[0];
+    return row ? { ok: true, ...row } : { ok: false, error: "not_found" };
+  }
+
   // Redeem a pair code as the calling user. Inserts into user_rooms with the
   // scopes baked into the code. Marks the code used.
   private async join(userId: string, handle: string, invite: string, actor: string): Promise<Record<string, unknown>> {
@@ -935,6 +1062,7 @@ export class Registry extends DurableObject<Env> {
       now.toISOString(),
       expiresAt,
     );
+    await this.armCleanup();
 
     return { ok: true, wiki: cleanWiki, code, invite: inviteUri(cleanWiki, code), expires_at: expiresAt, scopes };
   }
@@ -1002,6 +1130,7 @@ export class Registry extends DurableObject<Env> {
       now.toISOString(),
       expiresAt,
     );
+    await this.armCleanup();
     return {
       ok: true,
       code,
@@ -1171,6 +1300,7 @@ export class Registry extends DurableObject<Env> {
       now.toISOString(),
       new Date(now.getTime() + 10 * 60_000).toISOString(), // 10 min to complete GitHub + redirect
     );
+    await this.armCleanup();
     return { ok: true, code };
   }
 
@@ -1463,7 +1593,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
 
   server.tool(
     "bashroom",
-    "Run bash against /rooms, a FUSE-mounted filesystem backed by Cloudflare R2. Real Linux shell with bash, git, ripgrep, jq, find, less, tree, fd, rsync. Use ls /rooms to see your rooms; everything else is normal bash.",
+    "Run bash against /rooms, a durable filesystem for agents FUSE-mounted from Cloudflare R2. Real Linux shell with bash, git, ripgrep, jq, find, less, tree, fd, rsync — there is no hidden command parser, so anything that works in bash works here.\n\nWhat persists: only files under /rooms/. The shell itself resets between calls — /tmp, env vars, cwd, and background processes are gone next call, and outbound network is blocked. Room admin (create, join, pair, mounts, who, history) is the visible `bashroom` executable inside the shell.\n\nExamples:\n- ls /rooms                                  — see which rooms you can reach\n- cat /rooms/my-app/index.md                 — read a room's index\n- bashroom create my-app                     — make a new room\n- rg -n 'TODO' /rooms/my-app                 — regex search with ripgrep\n- mkdir -p /rooms/my-app/notes               — create dirs before bashroom_write\n\nWhen NOT to use this: if you only need to list, read, search, or stat room files, prefer bashroom_tree / bashroom_read / bashroom_search / bashroom_stat — they read R2 directly without booting the sandbox, return bounded output, and are faster and cheaper.",
     {
       command: z.string().min(1).max(MAX_COMMAND_CHARS).describe("Bash command to run, for example: ls /rooms; cat /rooms/my-room/index.md"),
       stdin: z.string().optional().describe("Optional standard input for the command. Piped to the command via base64 round-trip so any byte sequence (quotes, newlines, NUL) is safe."),
@@ -1479,7 +1609,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
 
   server.tool(
     "bashroom_write",
-    "Write a file to /rooms directly, bypassing bash quoting. Use this instead of `echo ... > file` or heredoc when content contains quotes, backticks, $variables, or arbitrary bytes. The path must be inside /rooms/<room>/.",
+    "Write one file under /rooms directly, bypassing bash quoting entirely. The content lands byte-for-byte — no shell interpolation, no heredoc edge cases. Use this instead of `echo ... > file` or a heredoc whenever content contains quotes, backticks, $variables, markdown code fences, or arbitrary bytes; in practice that means: always prefer this for writing file content.\n\nExample: bashroom_write({ path: '/rooms/my-app/notes/2026-06-09.md', content: '# Handoff\\n\\n## state\\n...' }). For binary, base64-encode the bytes and pass encoding='base64'.\n\nLimits to know up front: max 5MB per write; the path must be inside /rooms/<room>/ (anything else is rejected — writes outside /rooms don't persist anyway); the parent directory must already exist — create it first with the bashroom tool (`mkdir -p /rooms/my-app/notes`). Writes replace the whole file; to append or patch, read first, then write the merged result.",
     {
       path: z.string().min(1).max(1024).describe("Absolute path under /rooms, e.g. /rooms/my-room/notes/today.md"),
       content: z.string().max(MAX_WRITE_BYTES).describe("File content. UTF-8 by default; pass base64-encoded bytes with encoding='base64' for binary."),
@@ -1496,7 +1626,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
 
   server.tool(
     "bashroom_tree",
-    "List rooms or files directly from R2 without starting bash. Use path='/rooms' to list rooms, or path='/rooms/<room>/<prefix>' to list bounded file metadata.",
+    "List rooms or files directly from R2 without starting bash — the fastest way to orient yourself. Returns metadata (path, size, updated_at, etag, content type), never file bodies.\n\nTwo modes:\n- bashroom_tree({ path: '/rooms' })                — list every room you can reach, with your role and scopes\n- bashroom_tree({ path: '/rooms/my-app/notes' })   — list files under a prefix, recursively\n\nA good first call in any session is path='/rooms': it tells you what exists before you read anything. Output is bounded by max_entries (up to 1000) and sets truncated=true when there's more — narrow the prefix rather than raising the cap. For glob patterns or sorting tricks, fall back to the bashroom tool with `fd` or `find`.",
     {
       path: z.string().default("/rooms").describe("Absolute path: /rooms to list rooms, or /rooms/<room>/<optional-prefix> to list files."),
       max_entries: z.number().int().min(1).max(MAX_MCP_TREE_ENTRIES).optional().describe(`Maximum files to return, up to ${MAX_MCP_TREE_ENTRIES}.`),
@@ -1509,7 +1639,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
 
   server.tool(
     "bashroom_read",
-    "Read a bounded text range directly from R2 without starting bash. Use this instead of `cat` when you want predictable context size.",
+    "Read a bounded byte range of one file directly from R2 without starting bash. Use this instead of `cat`: the max_bytes cap (up to 512KB) means a file can never be bigger than you guessed and flood your context window.\n\nExamples:\n- bashroom_read({ path: '/rooms/my-app/index.md' })                          — read from the top\n- bashroom_read({ path: '/rooms/my-app/log/big.md', offset: 64000 })        — page through a large file\n\nThe result includes the file's true size_bytes and truncated=true when there is more past your range — page with offset rather than re-reading from 0. Binary files are flagged is_binary instead of dumped raw. If you don't know the file's size yet, bashroom_stat is a cheaper first call than a read.",
     {
       path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/ARCHITECTURAL.md."),
       offset: z.number().int().min(0).optional().describe("Byte offset to start reading from. Defaults to 0."),
@@ -1523,7 +1653,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
 
   server.tool(
     "bashroom_search",
-    "Bounded literal text search over R2-backed room files without starting bash. Use bashroom for advanced rg/regex workflows.",
+    "Search room files for a literal string directly from R2, without starting bash. Case-insensitive by default; returns file + line + matched text for each hit, so it's the quick 'where did we write about X' tool.\n\nExample: bashroom_search({ path: '/rooms/my-app', query: 'handoff' }) — find every mention under a room or narrower prefix.\n\nThis is literal substring match only — no regex, no globs. For regex, multiline patterns, or anything `rg` can do, use the bashroom tool (`rg -n 'pattern' /rooms/my-app`). Output is bounded by max_matches / max_files / max_bytes_per_file and reports scanned_files, skipped_files, and truncated, so you can tell the difference between 'no matches' and 'didn't look everywhere' — narrow the path prefix when truncated.",
     {
       path: z.string().min(1).describe("Absolute room or prefix path under /rooms/<room>/, e.g. /rooms/bashroom/notes."),
       query: z.string().min(1).max(256).describe("Literal text to search for."),
@@ -1547,7 +1677,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
 
   server.tool(
     "bashroom_stat",
-    "Return R2 metadata for one file without reading its body: size, modified time, etag, version, content type, and custom metadata.",
+    "Return R2 metadata for one file without reading its body: size, modified time, etag, version, content type, and custom metadata. The cheapest call in the harness — no sandbox, no file body.\n\nUse it to answer 'has this changed since I last looked?' (compare etag or updated_at) before re-reading, or 'how big is this?' before choosing bashroom_read offsets. Example: bashroom_stat({ path: '/rooms/my-app/index.md' }).",
     {
       path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/index.md."),
     },
@@ -1577,7 +1707,22 @@ export default {
 
 const VALIDATION_ERRORS = new Set(["invalid room", "invalid file path"]);
 
+// Post-response work (audit logging, session teardown, mirror heals, cache
+// fills) should not add latency to the response. We hold the active request's
+// ExecutionContext so deep call sites can hand such work to the runtime via
+// waitUntil without threading ctx through every signature. Set once at the
+// top of each handleRequest; one request per fetch invocation, so there's no
+// cross-request bleed. defer() falls back to running inline if no ctx is set
+// (e.g. a unit-test path) — correctness never depends on the holder.
+let activeCtx: ExecutionContext | null = null;
+function defer(work: Promise<unknown>): void {
+  const p = Promise.resolve(work).catch(() => undefined);
+  if (activeCtx) activeCtx.waitUntil(p);
+  // else: fire-and-forget; the promise still runs, just untracked.
+}
+
 async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  activeCtx = ctx;
   const url = new URL(request.url);
 
     if (url.pathname === "/mcp") {
@@ -1756,6 +1901,100 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       return json({ ok: true, file });
     }
 
+    // Raw byte download of one file — used by `bashroom export` so binary
+    // files survive intact (the JSON /file endpoint blanks binary bodies).
+    // Same membership gate as the JSON read; streams R2 straight through.
+    if (url.pathname === "/web/api/raw" && request.method === "GET") {
+      const token = bearerToken(request);
+      const room = parseOptionalWiki(url.searchParams.get("room"));
+      const path = url.searchParams.get("path") || "";
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      if (!path) return json({ ok: false, error: "path_required" }, 400);
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.raw", includeRooms: true });
+      const userId = String(account.user_id || "");
+      const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
+      if (!userId || !rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
+      const object = await env.ROOMS_R2.get(r2KeyForFile(userId, room, path));
+      if (!object) return json({ ok: false, error: "not_found" }, 404);
+      return new Response(object.body, {
+        headers: {
+          "content-type": object.httpMetadata?.contentType || "application/octet-stream",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    }
+
+    // Save a file body from the web editor. Same membership gate as the GET
+    // plus a "write" scope check, so read-only members can view but not save.
+    // Writes go straight to R2 (no sandbox boot) — the FUSE mount reads the
+    // same objects, so the next shell call sees the edit.
+    if (url.pathname === "/web/api/file" && request.method === "PUT") {
+      const token = bearerToken(request);
+      const input = await readJson(request);
+      const room = parseOptionalWiki(String(input.room || ""));
+      const path = String(input.path || "");
+      const content = typeof input.content === "string" ? input.content : null;
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      if (!path) return json({ ok: false, error: "path_required" }, 400);
+      if (content === null) return json({ ok: false, error: "content_required" }, 400);
+      const writeBytes = utf8ByteLength(content);
+      if (writeBytes > MAX_WRITE_BYTES) return json({ ok: false, error: "too_large" }, 413);
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.file.write", writeBytes, includeRooms: true });
+      if (account.ok === false) return json({ ok: false, error: account.error || "unauthorized" }, 401);
+      const userId = String(account.user_id || "");
+      const membership = (account.rooms || []).find((row) => row.room === room);
+      if (!userId || !membership) return json({ ok: false, error: "forbidden" }, 403);
+      if (!membership.scopes.includes("write")) return json({ ok: false, error: "read_only" }, 403);
+      // Optimistic concurrency: when the client sends the etag it read, the
+      // write only lands if the file is still at that version. A 412 hands
+      // back the current file so the editor (or an agent) can re-merge —
+      // lost updates become explicit conflicts instead of silent clobbers.
+      const baseEtag = typeof input.base_etag === "string" ? input.base_etag : "";
+      const wrote = await r2Put(env, userId, room, path, content, baseEtag || undefined);
+      if (!wrote) {
+        const current = await r2File(env, userId, room, path);
+        return json({ ok: false, error: "conflict", file: current }, 412);
+      }
+      const file = await r2File(env, userId, room, path);
+      return json({ ok: true, file });
+    }
+
+    // ─── Public shares ────────────────────────────────────────────────────
+    // POST mints (or returns the existing) share link for a page or
+    // directory prefix; GET lists the caller's shares; DELETE revokes one.
+    if (url.pathname === "/web/api/share" && request.method === "POST") {
+      const input = await readJson(request);
+      const room = parseOptionalWiki(String(input.room || ""));
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      const result = await registry(env, "/share-create", {
+        token: bearerToken(request),
+        ip: clientIp(request),
+        room,
+        prefix: String(input.path || ""),
+      });
+      if (result.ok === false) return json(result, 403);
+      const base = publicBaseUrl(env, request);
+      return json({ ...result, url: `${base}/s/${String(result.slug || "")}` });
+    }
+
+    if (url.pathname === "/web/api/shares" && request.method === "GET") {
+      const result = await registry(env, "/share-list", { token: bearerToken(request), ip: clientIp(request) });
+      return json(result, result.ok === false ? 401 : 200);
+    }
+
+    if (url.pathname === "/web/api/share" && request.method === "DELETE") {
+      const slug = url.searchParams.get("slug") || "";
+      if (!slug) return json({ ok: false, error: "slug_required" }, 400);
+      const result = await registry(env, "/share-delete", { token: bearerToken(request), ip: clientIp(request), slug });
+      return json(result, result.ok === false ? 401 : 200);
+    }
+
+    // Anonymous read side of a share. /s/<slug> serves the shared page or a
+    // directory index; /s/<slug>/<path> walks into a shared directory.
+    if (url.pathname.startsWith("/s/") && request.method === "GET") {
+      return servePublicShare(env, request, url);
+    }
+
     // ─── Device-flow OAuth ────────────────────────────────────────────────
     if (url.pathname === "/auth/device/start" && request.method === "POST") {
       const start = await registry(env, "/device-start", { ip: clientIp(request) });
@@ -1817,7 +2056,9 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       const reg = await registry(env, "/oauth-register", {
         redirect_uris: redirectUris,
         client_name: String(input.client_name || ""),
+        ip: clientIp(request),
       });
+      if (reg.error === "rate_limited") return json({ error: "temporarily_unavailable", error_description: "rate limited" }, 429);
       if (reg.ok === false) return json({ error: "invalid_client_metadata", error_description: reg.error }, 400);
       // RFC 7591 response shape.
       return json({
@@ -2121,13 +2362,14 @@ async function pingpongCities(site: string): Promise<string[]> {
     .map((row) => (row.key || "").split(",")[0].trim()) // "New York City, US" -> "New York City"
     .filter(Boolean);
 
-  // 5-minute cache; pingpong's data is rolling-window monthly, no need for tight freshness.
-  await cache.put(
+  // 5-minute cache; pingpong's data is rolling-window monthly, no need for
+  // tight freshness. Deferred — filling the cache shouldn't delay the render.
+  defer(cache.put(
     cacheKey,
     new Response(JSON.stringify({ cities }), {
       headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
     }),
-  );
+  ));
   return cities;
 }
 
@@ -2243,6 +2485,11 @@ async function authorizeAccount(
   const routeUserId = routeUserIdFromToken(token);
   const tokenHash = await sha256(token);
 
+  // All live tokens are routeable (br.usr_…). The AccountDO is the single
+  // authority on the hot path: it authorizes, meters, AND returns the room
+  // mirror in one round trip. The mirror is kept current by syncAccount /
+  // upsertRoom / removeRoom on every room mutation, so reads never re-fetch
+  // canonical rooms from the Registry singleton.
   if (routeUserId) {
     const account = env.ACCOUNTS.getByName(accountObjectName(routeUserId));
     const decision = await account.authorizeAndCharge({
@@ -2254,37 +2501,27 @@ async function authorizeAccount(
       writeBytes: opts.writeBytes,
       includeRooms: opts.includeRooms,
     });
-    if (decision.ok) {
-      if (!opts.includeRooms || !decision.user_id) return decision;
+    // Hydrate-on-miss: if a caller wants rooms but the mirror is empty (a
+    // never-synced account from before mirroring, or membership granted
+    // out-of-band), fall back to the Registry once and heal the mirror. The
+    // common case — a warm mirror — never reaches this and pays no Registry RTT.
+    if (decision.ok && opts.includeRooms && decision.user_id && (decision.rooms?.length ?? 0) === 0) {
       const canonical = accountWireFromRegistry(await registry(env, "/internal-account-rooms", { user_id: decision.user_id }));
-      if (!canonical.ok) return decision;
-      await account.syncAccount({
-        userId: decision.user_id,
-        handle: canonical.handle || decision.handle || "user",
-        rooms: canonical.rooms || [],
-      }).catch(() => undefined);
-      return canonical;
+      if (canonical.ok && (canonical.rooms?.length ?? 0) > 0) {
+        defer(account.syncAccount({
+          userId: decision.user_id,
+          handle: canonical.handle || decision.handle || "user",
+          rooms: canonical.rooms || [],
+        }));
+        return canonical;
+      }
     }
-    if (decision.error !== "invalid_token" && decision.error !== "no_account") return decision;
-
-    // Migration fallback: routeable tokens are mirrored into AccountDO, but
-    // Registry remains the cold AuthDO while existing deployments roll forward.
-    // If Registry accepts the token, hydrate AccountDO so the next request is
-    // served by the per-user gate.
-    const legacy = accountWireFromRegistry(await registry(env, "/account-rooms", { token, ip }));
-    if (legacy.ok && legacy.user_id === routeUserId) {
-      await account.syncAccount({
-        userId: routeUserId,
-        handle: legacy.handle || "user",
-        tokenHash,
-        tokenId: "lazy-sync",
-        rooms: legacy.rooms || [],
-      }).catch(() => undefined);
-    }
-    return legacy;
+    return decision;
   }
 
-  return accountWireFromRegistry(await registry(env, "/account-rooms", { token, ip }));
+  // Non-routeable token shape — not minted anymore. Reject rather than walk
+  // the retired Registry auth path.
+  return { ok: false, error: "invalid_token" };
 }
 
 function accountWireFromRegistry(result: Record<string, unknown>): AccountWire {
@@ -2823,15 +3060,190 @@ async function r2ListPrefix(
   return { objects: out, truncated: Boolean(cursor) };
 }
 
-async function r2Get(env: Env, userId: string, room: string, path: string): Promise<string | null> {
-  const obj = await env.ROOMS_R2.get(r2KeyForFile(userId, room, path));
-  return obj ? await obj.text() : null;
+// Returns false when baseEtag is supplied and the object changed since that
+// read — R2's conditional put (onlyIf.etagMatches) makes this a true
+// compare-and-swap at the source of truth, so it guards against ALL other
+// write paths (web editor, bashroom_write, FUSE writes from shells).
+async function r2Put(env: Env, userId: string, room: string, path: string, content: string, baseEtag?: string): Promise<boolean> {
+  const result = await env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content, {
+    httpMetadata: { contentType: contentTypeForPath(path) },
+    ...(baseEtag ? { onlyIf: { etagMatches: baseEtag } } : {}),
+  });
+  return result !== null;
 }
 
-async function r2Put(env: Env, userId: string, room: string, path: string, content: string): Promise<void> {
-  await env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content, {
-    httpMetadata: { contentType: contentTypeForPath(path) },
-  });
+// ─── Public share serving ───────────────────────────────────────────────
+// GET /s/<slug>[/<path...>] — anonymous, read-only. The slug is the whole
+// capability: the Registry resolves it to (user, room, prefix) and every
+// response is bounded to that subtree. Markdown renders as a minimal HTML
+// page; other files serve raw with their stored content type; a directory
+// renders an index of links. Unknown slug and empty directory both 404
+// identically so the route doesn't leak which slugs exist.
+async function servePublicShare(env: Env, request: Request, url: URL): Promise<Response> {
+  // Edge cache: a hot share link should not wake the Registry singleton on
+  // every hit. Responses carry max-age=60, but Worker responses aren't
+  // edge-cached unless we use the Cache API explicitly. Revocation therefore
+  // propagates within ~60s — acceptable for a read capability.
+  const cache = caches.default;
+  const cacheKey = new Request(url.toString(), { method: "GET" });
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  const segments = url.pathname.split("/").filter(Boolean); // ["s", slug, ...path]
+  const slug = decodeURIComponent(segments[1] || "");
+  if (!slug) return publicShareNotFound();
+  const share = await registry(env, "/share-resolve", { slug, ip: clientIp(request) });
+  if (share.ok === false) {
+    if (share.error === "rate_limited") return json(share, 429);
+    return publicShareNotFound();
+  }
+  const userId = String(share.user_id || "");
+  const room = String(share.room || "");
+  const prefix = String(share.prefix || "");
+  const rest = segments.slice(2).map(decodeURIComponent).join("/");
+  // The visitor's path is relative to the shared prefix — they never see or
+  // choose the room/user part of the key.
+  const target = [prefix, rest].filter(Boolean).join("/");
+
+  // Store a successful render in the edge cache, then return it. 404s are
+  // never cached so revoked/renamed links recover immediately.
+  const store = (response: Response): Response => {
+    defer(cache.put(cacheKey, response.clone()));
+    return response;
+  };
+
+  if (target) {
+    const object = await env.ROOMS_R2.get(r2KeyForFile(userId, room, target));
+    if (object) {
+      const contentType = object.httpMetadata?.contentType || contentTypeForPath(target);
+      if (contentType.startsWith("text/markdown")) {
+        const nonce = crypto.randomUUID();
+        return store(new Response(publicMarkdownHtml(room, target, await object.text(), nonce), {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "public, max-age=60",
+            "x-content-type-options": "nosniff",
+            // Only our nonce'd inline script + the pinned CDN may execute.
+            // Anything injected via shared content has no nonce → blocked.
+            "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src https: data:; base-uri 'none'; form-action 'none'`,
+          },
+        }));
+      }
+      // Raw serving executes on this origin, where the reader keeps its
+      // bearer token in localStorage — so active content types (html/svg/xml)
+      // are downgraded to text/plain. A share is a read capability, not a
+      // hosting service.
+      const rawType = /html|svg|xml/i.test(contentType) ? "text/plain; charset=utf-8" : contentType;
+      return store(new Response(object.body, {
+        headers: { "content-type": rawType, "cache-control": "public, max-age=60", "x-content-type-options": "nosniff" },
+      }));
+    }
+  }
+
+  // No exact file — treat the target as a directory and render an index.
+  const dirPrefix = target ? `${target}/` : "";
+  const { objects } = await r2ListPrefix(env, userId, room, dirPrefix, false, MAX_MCP_TREE_ENTRIES);
+  const roomPrefix = r2KeyForRoom(userId, room);
+  const entries = objects
+    .map((o) => o.key.slice(roomPrefix.length))
+    .filter((p) => p && !p.endsWith("/")) // skip s3fs directory-marker objects
+    .map((p) => p.slice(dirPrefix.length))
+    .sort();
+  if (!entries.length) return publicShareNotFound();
+  // Hrefs stay relative to the slug root: /s/<slug>/<path-beyond-prefix>.
+  const hrefBase = `/s/${encodeURIComponent(slug)}` + (rest ? `/${rest.split("/").map(encodeURIComponent).join("/")}` : "");
+  return store(new Response(publicIndexHtml(room, target, hrefBase, entries), {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=60",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+    },
+  }));
+}
+
+function publicShareNotFound(): Response {
+  return html(publicShellHtml("not found", `<div class="empty">Nothing here. The link may have been revoked.</div>`), 404);
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function publicMarkdownHtml(room: string, path: string, markdown: string, nonce: string): string {
+  // Content is inlined as JSON and rendered client-side with the same marked
+  // build the logged-in reader uses, so shared pages look identical to the
+  // reader. <-escape keeps a literal </script> in the file body from
+  // breaking out of the inline script context. marked passes raw HTML
+  // through, so the output goes through DOMPurify before touching the DOM —
+  // shared markdown is untrusted input on this origin.
+  const payload = JSON.stringify(markdown).replace(/</g, "\\u003c");
+  const body = `
+  <div class="file-meta"><span>${escapeHtml(room)}/${escapeHtml(path)}</span></div>
+  <article id="doc"></article>
+  <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/marked@13.0.2/marked.min.js"></script>
+  <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
+  <script nonce="${nonce}">document.getElementById("doc").innerHTML = DOMPurify.sanitize(marked.parse(${payload}));</script>`;
+  return publicShellHtml(`${room}/${path}`, body);
+}
+
+function publicIndexHtml(room: string, target: string, hrefBase: string, entries: string[]): string {
+  const rows = entries
+    .map((entry) => `<li><a href="${hrefBase}/${entry.split("/").map(encodeURIComponent).join("/")}">${escapeHtml(entry)}</a></li>`)
+    .join("\n");
+  const body = `
+  <div class="file-meta"><span>${escapeHtml(room)}${target ? "/" + escapeHtml(target) : ""}/</span></div>
+  <ul class="index">${rows}</ul>`;
+  return publicShellHtml(`${room}${target ? "/" + target : ""}/`, body);
+}
+
+// Shared chrome for the anonymous pages — the reader's palette and type
+// scale, no sidebar, no scripts beyond marked. Quiet "shared via bashroom"
+// footer instead of navigation.
+function publicShellHtml(title: string, body: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>${escapeHtml(title)} — bashroom</title>
+<meta name="robots" content="noindex" />
+<style>
+  :root { --bg:#ffffff; --side:#f7f7f5; --hover:#efeeec; --ink:#37352f; --ink-dim:#6f6e69; --ink-faint:#a3a29c; --rule:#ebeae6; --link:#4f3bd0; --mono:ui-monospace,"SF Mono","Menlo","Consolas",monospace; --sans:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",Helvetica,Arial,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#191919; --side:#202020; --hover:#2a2a2a; --ink:#e8e6e1; --ink-dim:#9b9a94; --ink-faint:#5c5b56; --rule:#2a2a2a; --link:#c8a8ff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans); font-size:16px; line-height:1.6; -webkit-font-smoothing:antialiased; }
+  main { max-width:820px; margin:0 auto; padding:56px 24px 120px; }
+  .file-meta { font-family:var(--mono); font-size:11px; color:var(--ink-faint); margin-bottom:24px; }
+  .empty { color:var(--ink-dim); }
+  ul.index { list-style:none; margin:0; padding:0; }
+  ul.index li { padding:6px 0; border-bottom:1px solid var(--rule); font-family:var(--mono); font-size:13px; }
+  ul.index a { color:var(--ink); text-decoration:none; }
+  ul.index a:hover { color:var(--link); }
+  article h1, article h2, article h3, article h4 { font-weight:600; line-height:1.3; margin-top:1.6em; margin-bottom:0.4em; letter-spacing:-0.01em; }
+  article h1 { font-size:2.25em; margin-top:0; }
+  article h2 { font-size:1.5em; }
+  article h3 { font-size:1.15em; }
+  article a { color:var(--link); text-decoration:underline; text-decoration-thickness:1px; text-underline-offset:3px; }
+  article code { font-family:var(--mono); font-size:0.85em; background:var(--hover); padding:2px 6px; border-radius:3px; }
+  article pre { font-family:var(--mono); font-size:13px; line-height:1.55; background:var(--side); border:1px solid var(--rule); padding:14px 16px; overflow-x:auto; border-radius:6px; }
+  article pre code { background:transparent; padding:0; }
+  article blockquote { border-left:3px solid var(--ink); margin:1em 0; padding:0 0 0 14px; color:var(--ink-dim); }
+  article img { max-width:100%; }
+  article table { border-collapse:collapse; font-size:14px; }
+  article th, article td { border:1px solid var(--rule); padding:6px 10px; text-align:left; }
+  .foot { margin-top:48px; padding-top:14px; border-top:1px solid var(--rule); font-family:var(--sans); font-size:11px; color:var(--ink-faint); }
+  .foot a { color:var(--ink-dim); text-decoration:none; }
+  .foot a:hover { color:var(--link); }
+</style>
+</head>
+<body>
+<main>
+${body}
+<div class="foot">shared via <a href="https://bashroom.sdan.io">bashroom</a> — a filesystem for agents</div>
+</main>
+</body>
+</html>`;
 }
 
 // ─── v2 shell exec ──────────────────────────────────────────────────
@@ -2883,18 +3295,16 @@ async function runShellV2(env: Env, userId: string, headerToken: string, ip: str
   } finally {
     // Two-step cleanup: killAllProcesses() reaps the in-container process
     // (a timed-out exec leaves it running per Cloudflare's docs), then
-    // deleteSession() removes the session handle. Both calls are
-    // best-effort — never block the response on cleanup.
-    if (session) {
-      await session.killAllProcesses().catch(() => undefined);
-    }
-    await sandbox.deleteSession(sessionId).catch(() => undefined);
+    // deleteSession() removes the session handle. Both are best-effort and
+    // deferred — the response never waits on cleanup.
+    const reap = session ? session.killAllProcesses().catch(() => undefined) : Promise.resolve();
+    defer(reap.then(() => sandbox.deleteSession(sessionId).catch(() => undefined)));
   }
 
-  // Audit. Best-effort; never block the response on logging.
-  await registry(env, "/audit-append", {
+  // Audit. Best-effort; deferred so logging never adds to response latency.
+  defer(registry(env, "/audit-append", {
     user_id: userId, room: "", actor: "sandbox", kind: "exec", path: null, command: compact(command), exit_code: exitCode,
-  }).catch(() => undefined);
+  }));
 
   return { stdout, stderr, exitCode, changed: 0, changed_paths: [] };
 }
@@ -2915,8 +3325,12 @@ async function ensureSandboxReady(env: Env, userId: string): Promise<Sandbox> {
     if (!env.R2_ENDPOINT || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
       throw new Error("R2 credentials not configured (R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)");
     }
-    // RemoteMountBucketOptions: production s3fs-FUSE mode. First arg is
-    // the bucket name. R2 credentials are scoped to bashroom-rooms only.
+    // RemoteMountBucketOptions: production s3fs-FUSE mode. First arg is the
+    // bucket name. credentialProxy keeps the real R2 keys in the Durable
+    // Object — the container gets dummy creds and s3fs's outbound requests
+    // are intercepted and re-signed by the DO (backed by the ContainerProxy
+    // export above). Untrusted bash in the sandbox can no longer recover a
+    // bucket-wide key. Requires `export { ContainerProxy }` (present).
     await sandbox.mountBucket(env.R2_BUCKET_NAME || "bashroom-rooms", "/rooms", {
       endpoint: env.R2_ENDPOINT,
       provider: "r2",
@@ -2925,6 +3339,7 @@ async function ensureSandboxReady(env: Env, userId: string): Promise<Sandbox> {
         accessKeyId: env.R2_ACCESS_KEY_ID,
         secretAccessKey: env.R2_SECRET_ACCESS_KEY,
       },
+      credentialProxy: true,
     });
   }
   return sandbox;
@@ -3087,10 +3502,6 @@ function defaultActor(prefix: string): string {
   return `${prefix}-${randomSuffix(4)}`;
 }
 
-function randomToken(): string {
-  return `ic_tok_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
-}
-
 function randomAccountToken(userId: string): string {
   // Routeable but still secret: user_id chooses AccountDO; the random
   // suffix is hashed and verified inside that DO.
@@ -3190,7 +3601,7 @@ function html(value: string, status = 200): Response {
 function httpHelpText(): string {
   return `# Bashroom
 
-Cloud shell for coding agents. \`/rooms\` is FUSE-mounted from
+A filesystem for agents. \`/rooms\` is FUSE-mounted from
 Cloudflare R2 and persists across calls.
 
 ## Agent-readable
@@ -3234,7 +3645,7 @@ function llmsTxt(env: Env, request: Request): string {
   const base = publicBaseUrl(env, request);
   return `# Bashroom
 
-> Cloud shell for coding agents. MCP exposes real \`bash\` plus
+> A filesystem for agents. MCP exposes real \`bash\` plus
 > bounded R2 file tools for tree, read, search, stat, and direct writes.
 > \`/rooms\` is FUSE-mounted from Cloudflare R2 inside the sandbox.
 > Room admin is available through the visible \`bashroom\` helper; destructive

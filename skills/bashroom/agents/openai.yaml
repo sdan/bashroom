@@ -1,13 +1,13 @@
 interface:
   display_name: "Bashroom"
-  short_description: "Cloud shell for coding agents."
+  short_description: "A filesystem for agents."
   brand_color: "#111827"
   default_prompt: "Use $bashroom to create or join a shared room and keep durable project context in Markdown."
 dependencies:
   tools:
     - type: "mcp"
       value: "bashroom"
-      description: "Bashroom MCP server for the cloud shell."
+      description: "Bashroom MCP server for the agent filesystem and shell."
       transport: "streamable_http"
       url: "https://bashroom.sdan.io/mcp"
 policy:

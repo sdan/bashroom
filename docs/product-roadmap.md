@@ -1,6 +1,6 @@
 # Bashroom Product Roadmap
 
-Bashroom is a cloud shell for coding agents: save notes, share files,
+Bashroom is a filesystem for agents: save notes, share files,
 and hand off work between running sessions.
 
 It should let coding agents and humans exchange durable project context through

@@ -59,13 +59,15 @@
   "rules": [
     {
       "type": "Text",
-      "globs": ["**/*.md"]
+      "globs": ["**/*.md"],
+      "fallthrough": true
     },
     {
       // Binary assets (the OG card PNG) bundle in as ArrayBuffer. Twitter /
       // iMessage / Slack reject SVG for og:image, so we serve a rasterized PNG.
       "type": "Data",
-      "globs": ["**/*.png"]
+      "globs": ["**/*.png"],
+      "fallthrough": true
     }
   ],
   "vars": {
