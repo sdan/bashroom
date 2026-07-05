@@ -1853,6 +1853,24 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       return json({ ok: true, files: await r2Tree(env, userId, room) });
     }
 
+    // Cross-room content search for the web reader. One account authorization,
+    // then a bounded literal scan (the same primitives as the MCP
+    // bashroom_search tool) fanned out across every room the user belongs to.
+    // Budgets keep it interactive: 40 matches total, 200 files/room, 256KB/file.
+    if (url.pathname === "/web/api/search" && request.method === "GET") {
+      const token = bearerToken(request);
+      const q = (url.searchParams.get("q") || "").trim();
+      if (q.length < 2) return json({ ok: false, error: "query_too_short" }, 400);
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.search", includeRooms: true });
+      const userId = String(account.user_id || "");
+      const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
+      if (!userId) return json({ ok: false, error: "unauthorized" }, 401);
+      const budget = { matches: 40 };
+      const perRoom = await Promise.all(rooms.map((row) => webSearchRoom(env, userId, row.room, q, budget)));
+      const results = perRoom.flat();
+      return json({ ok: true, query: q, results, truncated: budget.matches <= 0 });
+    }
+
     if (url.pathname === "/web/api/file" && request.method === "GET") {
       const token = bearerToken(request);
       const room = parseOptionalWiki(url.searchParams.get("room"));
@@ -2620,6 +2638,45 @@ async function mcpRead(env: Env, token: string, ip: string, path: string, offset
     };
   } catch (error) {
     return mcpError(error);
+  }
+}
+
+// Bounded per-room scan behind /web/api/search. Shares the R2 primitives
+// with mcpSearch but skips per-room re-authorization (the caller already
+// verified membership with one authorizeAccount call) and spends from a
+// shared match budget so the all-rooms fan-out stays interactive.
+async function webSearchRoom(
+  env: Env,
+  userId: string,
+  room: string,
+  query: string,
+  budget: { matches: number },
+): Promise<Array<{ room: string; path: string; line: number; preview: string }>> {
+  if (budget.matches <= 0) return [];
+  try {
+    const listed = await r2ListPrefix(env, userId, room, "", true, 200);
+    const prefix = r2KeyForRoom(userId, room);
+    const needle = query.toLowerCase();
+    const out: Array<{ room: string; path: string; line: number; preview: string }> = [];
+    for (const object of listed.objects) {
+      if (budget.matches <= 0) break;
+      const metadata = r2MetadataForObject(object, prefix);
+      if (!metadata.size_bytes) continue;
+      if (!isTextFile(metadata.path, metadata.content_type)) continue;
+      if (metadata.size_bytes > 256_000) continue;
+      const body = await env.ROOMS_R2.get(object.key, { range: { offset: 0, length: Math.min(metadata.size_bytes, 256_000) } });
+      if (!body || !("text" in body)) continue;
+      const lines = (await body.text()).split(/\r?\n/);
+      for (let index = 0; index < lines.length; index += 1) {
+        if (!lines[index].toLowerCase().includes(needle)) continue;
+        out.push({ room, path: metadata.path, line: index + 1, preview: previewLine(lines[index]) });
+        budget.matches -= 1;
+        if (budget.matches <= 0) break;
+      }
+    }
+    return out;
+  } catch {
+    return []; // one broken room must not kill the whole cross-room search
   }
 }
 
