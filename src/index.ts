@@ -1708,8 +1708,12 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       // ever minted, so there is no per-session state to persist and no
       // Registry round-trip per call. Sessions bought us nothing (every tool
       // authorizes per-request off the bearer token), and the spec is
-      // converging on sessionless servers anyway.
-      return createMcpHandler(createServer(env, token, clientIp(request)))(request, env, ctx);
+      // converging on sessionless servers anyway. enableJsonResponse skips
+      // SSE framing too — no tool here streams or emits notifications, so a
+      // plain application/json body is the whole conversation.
+      return createMcpHandler(createServer(env, token, clientIp(request)), {
+        enableJsonResponse: true,
+      })(request, env, ctx);
     }
 
     if (url.pathname === "/bash" && request.method === "POST") {
