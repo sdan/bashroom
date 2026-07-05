@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { createMcpHandler, type TransportState } from "agents/mcp";
+import { createMcpHandler } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Sandbox as SandboxBase } from "@cloudflare/sandbox";
 import { z } from "zod";
@@ -422,7 +422,6 @@ const GLOBAL_OPS_REFILL = 50_000 / DAY_MS;
 const LAST_SEEN_WRITE_INTERVAL_MS = 5 * MINUTE_MS;
 // Registry cleanup-alarm cadence + per-table TTLs for the sweep.
 const CLEANUP_INTERVAL_MS = HOUR_MS;
-const TRANSPORT_STATE_TTL_MS = 7 * DAY_MS;
 const BUCKET_TTL_MS = DAY_MS;
 const SLUG_VERBS = [
   "accomplishing", "actioning", "actualizing", "architecting", "baking", "beaming", "beboppin", "befuddling",
@@ -472,13 +471,11 @@ export class Registry extends DurableObject<Env> {
         used_at TEXT
       );
     `);
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS mcp_transport_states (
-        session_hash TEXT PRIMARY KEY,
-        state_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
+    // The MCP transport is stateless (no Mcp-Session-Id) as of 2026-07 —
+    // per-session transport state is gone, and the spec is converging on
+    // sessionless servers (the 2026-07-28 revision removes sessions
+    // entirely). Drop the old table so existing Registry DOs self-clean.
+    this.ctx.storage.sql.exec("DROP TABLE IF EXISTS mcp_transport_states;");
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS credit_buckets (
         key TEXT PRIMARY KEY,
@@ -621,7 +618,6 @@ export class Registry extends DurableObject<Env> {
     sql.exec("DELETE FROM device_codes WHERE expires_at < ?", now);
     sql.exec("DELETE FROM oauth_codes WHERE expires_at < ?", now);
     sql.exec("DELETE FROM wiki_pair_codes WHERE expires_at < ?", now);
-    sql.exec("DELETE FROM mcp_transport_states WHERE updated_at < ?", new Date(Date.now() - TRANSPORT_STATE_TTL_MS).toISOString());
     // Rate-limit buckets refill over time; a row untouched for a day is at
     // full credits and carries no state worth keeping.
     sql.exec("DELETE FROM credit_buckets WHERE updated_at < ?", Date.now() - BUCKET_TTL_MS);
@@ -636,15 +632,6 @@ export class Registry extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const body = request.method === "POST" ? await readJson(request) : {};
-
-    if (request.method === "POST" && url.pathname === "/mcp-transport-get") {
-      return json({ state: await this.mcpTransportState(bearerFromUnknown(body.mcpSessionId)) });
-    }
-
-    if (request.method === "POST" && url.pathname === "/mcp-transport-set") {
-      await this.setMcpTransportState(bearerFromUnknown(body.mcpSessionId), body.state);
-      return json({ ok: true });
-    }
 
     // Every room operation below requires an account token. No anonymous paths.
     if (request.method === "POST" && url.pathname === "/create") {
@@ -1530,28 +1517,6 @@ export class Registry extends DurableObject<Env> {
     return { ok: true, wiki: cleanWiki };
   }
 
-  private async mcpTransportState(mcpSessionId: string): Promise<unknown | undefined> {
-    if (!mcpSessionId) return undefined;
-    const row = this.ctx.storage.sql
-      .exec<{ state_json: string }>("SELECT state_json FROM mcp_transport_states WHERE session_hash = ?", await sha256(mcpSessionId))
-      .toArray()[0];
-    return row ? JSON.parse(row.state_json) : undefined;
-  }
-
-  private async setMcpTransportState(mcpSessionId: string, state: unknown): Promise<void> {
-    if (!mcpSessionId) return;
-    this.ctx.storage.sql.exec(
-      `INSERT INTO mcp_transport_states (session_hash, state_json, updated_at)
-       VALUES (?, ?, ?)
-       ON CONFLICT(session_hash) DO UPDATE SET
-         state_json = excluded.state_json,
-         updated_at = excluded.updated_at`,
-      await sha256(mcpSessionId),
-      JSON.stringify(state),
-      new Date().toISOString(),
-    );
-  }
-
   private checkBucket(key: string, maxCredits: number, creditsPerMs: number, cost = 1): AuthResult | null {
     const now = Date.now();
     const existing = this.ctx.storage.sql
@@ -1588,7 +1553,7 @@ export class Registry extends DurableObject<Env> {
   }
 }
 
-function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: string): McpServer {
+function createServer(env: Env, headerToken: string, ip: string): McpServer {
   const server = new McpServer({ name: "bashroom", version: "0.2.0" });
 
   server.tool(
@@ -1599,7 +1564,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
       stdin: z.string().optional().describe("Optional standard input for the command. Piped to the command via base64 round-trip so any byte sequence (quotes, newlines, NUL) is safe."),
     },
     async ({ command, stdin }) => {
-      const result = await runShell(env, headerToken, mcpSessionId, ip, command, stdin || "");
+      const result = await runShell(env, headerToken, ip, command, stdin || "");
       return {
         content: [{ type: "text", text: formatShellResult(result) }],
         isError: result.exitCode !== 0,
@@ -1616,7 +1581,7 @@ function createServer(env: Env, headerToken: string, mcpSessionId: string, ip: s
       encoding: z.enum(["utf-8", "base64"]).optional().describe("'utf-8' (default) treats content as text; 'base64' decodes content as binary before writing."),
     },
     async ({ path, content, encoding }) => {
-      const result = await runWriteFile(env, headerToken, mcpSessionId, ip, path, content, encoding ?? "utf-8");
+      const result = await runWriteFile(env, headerToken, ip, path, content, encoding ?? "utf-8");
       return {
         content: [{ type: "text", text: formatWriteResult(result) }],
         isError: !result.ok,
@@ -1739,15 +1704,17 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
           "WWW-Authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`,
         });
       }
-      return createMcpHandler(createServer(env, token, mcpSessionId(request), clientIp(request)), {
-        sessionIdGenerator: () => crypto.randomUUID(),
-        storage: mcpTransportStorage(env, request),
-      })(request, env, ctx);
+      // Stateless transport: no sessionIdGenerator means no Mcp-Session-Id is
+      // ever minted, so there is no per-session state to persist and no
+      // Registry round-trip per call. Sessions bought us nothing (every tool
+      // authorizes per-request off the bearer token), and the spec is
+      // converging on sessionless servers anyway.
+      return createMcpHandler(createServer(env, token, clientIp(request)))(request, env, ctx);
     }
 
     if (url.pathname === "/bash" && request.method === "POST") {
       const input = await readJson(request);
-      const result = await runShell(env, bearerToken(request), mcpSessionId(request), clientIp(request), String(input.command || ""), String(input.stdin || ""));
+      const result = await runShell(env, bearerToken(request), clientIp(request), String(input.command || ""), String(input.stdin || ""));
       return json(result, result.exitCode === 0 ? 200 : 400);
     }
 
@@ -2382,7 +2349,7 @@ function publicBaseUrl(env: Env, request: Request): string {
 // v2 entrypoint. Resolves user_id through the per-user AccountDO when the
 // token is routeable, then delegates to runShellV2 (sandbox + R2). Legacy
 // tokens fall back to Registry during migration.
-async function runShell(env: Env, headerToken: string, _mcpSessionId: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
+async function runShell(env: Env, headerToken: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
   const inputBytes = utf8ByteLength(command) + utf8ByteLength(stdin);
   const account = await authorizeAccount(env, headerToken, ip, { route: "mcp.exec", inputBytes });
   if (account.ok === false) {
@@ -2408,7 +2375,7 @@ interface WriteResult {
 // bashroom_write — directly call sandbox.writeFile(), bypassing bash
 // quoting. Resolves user_id same way runShell does; writes into the
 // per-user FUSE mount at /rooms/.
-async function runWriteFile(env: Env, headerToken: string, _mcpSessionId: string, ip: string, path: string, content: string, encoding: "utf-8" | "base64"): Promise<WriteResult> {
+async function runWriteFile(env: Env, headerToken: string, ip: string, path: string, content: string, encoding: "utf-8" | "base64"): Promise<WriteResult> {
   const bytes = encoding === "base64"
     ? Math.floor((content.length * 3) / 4)
     : utf8ByteLength(content);
@@ -2913,23 +2880,6 @@ async function createRoomForUser(env: Env, userId: string, input: Record<string,
     await seedR2Room(env, result.user_id, result.wiki, result.actor);
   }
   return result;
-}
-
-function mcpTransportStorage(env: Env, request: Request) {
-  const requestSessionId = mcpSessionId(request);
-  return {
-    get: async (): Promise<TransportState | undefined> => {
-      if (!requestSessionId) return undefined;
-      const result = await registry(env, "/mcp-transport-get", { mcpSessionId: requestSessionId });
-      return result.state as TransportState | undefined;
-    },
-    set: async (state: TransportState) => {
-      const stateSessionId = state.sessionId || "";
-      const sessionId = stateSessionId || requestSessionId;
-      if (!sessionId) return;
-      await registry(env, "/mcp-transport-set", { mcpSessionId: sessionId, state });
-    },
-  };
 }
 
 async function readJson(request: Request): Promise<Record<string, unknown>> {
@@ -3481,10 +3431,6 @@ async function r2DeletePrefix(env: Env, userId: string, room: string): Promise<n
   return deleted;
 }
 
-
-function mcpSessionId(request: Request): string {
-  return request.headers.get("mcp-session-id") || "";
-}
 
 function clientIp(request: Request): string {
   return (

@@ -99,7 +99,6 @@ global object for newly issued routeable tokens.
 - `user_rooms` — room ownership and per-room actor names.
 - `wiki_pair_codes` — short-lived join invites (retained for v2.1 sharing).
 - `device_codes` — OAuth device-flow state.
-- `mcp_transport_states` — MCP transport session storage.
 - `credit_buckets` — legacy/global cold-path limiter.
 - `audit` — every shell exec and every room-control HTTP call (replaces
   the per-room audit tables that used to live in Room DOs).
