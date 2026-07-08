@@ -128,9 +128,34 @@ export class RoomHub extends DurableObject<Env> {
     });
   }
 
-  async webSocketMessage(): Promise<void> {
-    // Readers don't send application messages; keepalive pings are handled
-    // by the auto-response pair without reaching this handler.
+  // Live-edit relay: clients stream ephemeral "draft" frames (current
+  // buffer + caret) while typing; the hub fans them out to the room's OTHER
+  // sockets so collaborators watch the document change under the writer's
+  // hands. Never persisted — the activity ring records only durable writes.
+  // Rate-limited per socket via the hibernation attachment; malformed or
+  // oversized frames are dropped. (Keepalive pings are answered by the
+  // auto-response pair without reaching this handler.)
+  async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    if (typeof message !== "string" || message.length > 300_000) return;
+    let frame: { type?: string; path?: unknown; caret?: unknown; content?: unknown };
+    try { frame = JSON.parse(message); } catch (_) { return; }
+    if (!frame || frame.type !== "draft" || typeof frame.path !== "string") return;
+    const attachment = (ws.deserializeAttachment() || {}) as { viewer?: string; since?: number; lastDraft?: number };
+    const now = Date.now();
+    if (attachment.lastDraft && now - attachment.lastDraft < 150) return;
+    ws.serializeAttachment({ ...attachment, lastDraft: now });
+    const out = JSON.stringify({
+      type: "draft",
+      actor: String(attachment.viewer || "someone"),
+      path: frame.path.slice(0, 512),
+      caret: typeof frame.caret === "number" ? frame.caret : 0,
+      content: typeof frame.content === "string" ? frame.content.slice(0, 262_144) : "",
+      ts: now,
+    });
+    for (const socket of this.ctx.getWebSockets()) {
+      if (socket === ws) continue;
+      try { socket.send(out); } catch (_) { /* mid-close */ }
+    }
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
