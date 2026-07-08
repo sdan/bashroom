@@ -2838,22 +2838,36 @@ async function webSearchRoom(
     const prefix = r2KeyForRoom(userId, room);
     const needle = query.toLowerCase();
     const out: Array<{ room: string; path: string; line: number; preview: string }> = [];
-    for (const object of listed.objects) {
-      if (budget.matches <= 0) break;
-      const metadata = r2MetadataForObject(object, prefix);
-      if (!metadata.size_bytes) continue;
-      if (!isTextFile(metadata.path, metadata.content_type)) continue;
-      if (metadata.size_bytes > 256_000) continue;
-      const body = await env.ROOMS_R2.get(object.key, { range: { offset: 0, length: Math.min(metadata.size_bytes, 256_000) } });
-      if (!body || !("text" in body)) continue;
-      const lines = (await body.text()).split(/\r?\n/);
-      for (let index = 0; index < lines.length; index += 1) {
-        if (!lines[index].toLowerCase().includes(needle)) continue;
-        out.push({ room, path: metadata.path, line: index + 1, preview: previewLine(lines[index]) });
-        budget.matches -= 1;
-        if (budget.matches <= 0) break;
+    // Fetch files through a small worker pool instead of one-at-a-time — the
+    // sequential loop made a 100-file room pay ~100 R2 round-trips in series
+    // and the slowest room gated the whole response. The 1000-subrequest cap
+    // was removed platform-wide in 2026-02, so concurrency is free.
+    const objects = listed.objects;
+    let cursor = 0;
+    const scanOne = async (): Promise<void> => {
+      while (budget.matches > 0) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= objects.length) return;
+        const object = objects[index];
+        const metadata = r2MetadataForObject(object, prefix);
+        if (!metadata.size_bytes) continue;
+        if (!isTextFile(metadata.path, metadata.content_type)) continue;
+        if (metadata.size_bytes > 256_000) continue;
+        const body = await env.ROOMS_R2.get(object.key, { range: { offset: 0, length: Math.min(metadata.size_bytes, 256_000) } });
+        if (!body || !("text" in body)) continue;
+        const lines = (await body.text()).split(/\r?\n/);
+        for (let li = 0; li < lines.length; li += 1) {
+          if (!lines[li].toLowerCase().includes(needle)) continue;
+          if (budget.matches <= 0) break;
+          out.push({ room, path: metadata.path, line: li + 1, preview: previewLine(lines[li]) });
+          budget.matches -= 1;
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, objects.length || 1) }, scanOne));
+    // Pool completion order is nondeterministic — stable-sort for the UI.
+    out.sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
     return out;
   } catch {
     return []; // one broken room must not kill the whole cross-room search
