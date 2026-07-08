@@ -1,7 +1,7 @@
 # Pinned to match @cloudflare/sandbox in package.json — the SDK version, this
 # base image's agent binary, and s3fs/fuse3 must move together. Bumped to
-# 0.12.1 for credentialProxy bucket mounts (keeps R2 keys out of the container).
-FROM docker.io/cloudflare/sandbox:0.12.1
+# 0.12.3 to stay in lockstep with the RPC-transport migration (2026-07-07).
+FROM docker.io/cloudflare/sandbox:0.12.3
 
 # Agent CLI toolkit on top of the stock cloudflare/sandbox base.
 # Base image already provides: bash, git, jq, curl, wget, node, bun,
