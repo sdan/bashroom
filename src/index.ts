@@ -105,16 +105,21 @@ export class RoomHub extends DurableObject<Env> {
     }
     const url = new URL(request.url);
     const viewer = url.searchParams.get("viewer") || "reader";
+    // Share-link sockets are capability-scoped: they only receive events for
+    // paths under the shared prefix, and anything they SEND is dropped.
+    const prefix = url.searchParams.get("prefix") || "";
+    const readonly = url.searchParams.get("readonly") === "1";
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ viewer, since: Date.now() });
+    server.serializeAttachment({ viewer, since: Date.now(), prefix, readonly });
     const recent = this.ctx.storage.sql
       .exec<{ ts: number; actor: string; path: string; etag: string; source: string }>(
         "SELECT ts, actor, path, etag, source FROM activity ORDER BY id DESC LIMIT 20",
       )
-      .toArray();
+      .toArray()
+      .filter((row) => this.pathVisible(row.path, prefix));
     server.send(JSON.stringify({ type: "hello", recent, viewers: this.ctx.getWebSockets().length }));
     this.broadcastViewers();
     // The browser requires the response to select one of the offered
@@ -140,7 +145,8 @@ export class RoomHub extends DurableObject<Env> {
     let frame: { type?: string; path?: unknown; caret?: unknown; content?: unknown };
     try { frame = JSON.parse(message); } catch (_) { return; }
     if (!frame || frame.type !== "draft" || typeof frame.path !== "string") return;
-    const attachment = (ws.deserializeAttachment() || {}) as { viewer?: string; since?: number; lastDraft?: number };
+    const attachment = (ws.deserializeAttachment() || {}) as { viewer?: string; since?: number; lastDraft?: number; prefix?: string; readonly?: boolean };
+    if (attachment.readonly) return; // share viewers watch; they don't write
     const now = Date.now();
     if (attachment.lastDraft && now - attachment.lastDraft < 150) return;
     ws.serializeAttachment({ ...attachment, lastDraft: now });
@@ -170,10 +176,25 @@ export class RoomHub extends DurableObject<Env> {
     this.broadcastViewers(ws);
   }
 
+  // A path is visible to a socket when the socket is unscoped (room member)
+  // or the path sits under its share prefix. Room-level touches (path "")
+  // only reach unscoped sockets — a prefix capability shouldn't observe
+  // activity elsewhere in the room.
+  private pathVisible(path: string, prefix: string): boolean {
+    if (!prefix) return true;
+    if (!path) return false;
+    return path === prefix || path.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
+  }
+
   private broadcast(message: Record<string, unknown>, exclude?: WebSocket): void {
     const frame = JSON.stringify(message);
+    const path = typeof message.path === "string" ? message.path : undefined;
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === exclude) continue;
+      if (path !== undefined) {
+        const attachment = (ws.deserializeAttachment() || {}) as { prefix?: string };
+        if (!this.pathVisible(path, attachment.prefix || "")) continue;
+      }
       try { ws.send(frame); } catch (_) { /* socket mid-close; skip */ }
     }
   }
@@ -1996,6 +2017,22 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       if (request.headers.get("Upgrade") !== "websocket") {
         return json({ ok: false, error: "expected_websocket" }, 426);
       }
+      // Share-link viewers connect by capability slug — no account, read-only,
+      // scoped to the shared prefix. share-resolve is IP-rate-limited.
+      const slug = url.searchParams.get("slug") || "";
+      if (slug) {
+        const share = await registry(env, "/share-resolve", { slug, ip: clientIp(request) });
+        if (share.ok === false) return json({ ok: false, error: share.error || "not_found" }, 403);
+        const shareUser = String(share.user_id || "");
+        const shareRoom = String(share.room || "");
+        if (!shareUser || !shareRoom) return json({ ok: false, error: "not_found" }, 403);
+        const stub = env.ROOM_HUBS.get(env.ROOM_HUBS.idFromName(`${shareUser}:${shareRoom}`));
+        const hubUrl = new URL("https://hub.local/connect");
+        hubUrl.searchParams.set("viewer", "reader");
+        hubUrl.searchParams.set("prefix", String(share.prefix || ""));
+        hubUrl.searchParams.set("readonly", "1");
+        return stub.fetch(new Request(hubUrl, request));
+      }
       const room = parseOptionalWiki(url.searchParams.get("room"));
       if (!room) return json({ ok: false, error: "room_required" }, 400);
       const protoHeader = request.headers.get("Sec-WebSocket-Protocol") || "";
@@ -3346,14 +3383,14 @@ async function servePublicShare(env: Env, request: Request, url: URL): Promise<R
       const contentType = object.httpMetadata?.contentType || contentTypeForPath(target);
       if (contentType.startsWith("text/markdown")) {
         const nonce = crypto.randomUUID();
-        return store(new Response(publicMarkdownHtml(room, target, await object.text(), nonce), {
+        return store(new Response(publicMarkdownHtml(room, target, await object.text(), nonce, slug), {
           headers: {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "public, max-age=60",
             "x-content-type-options": "nosniff",
             // Only our nonce'd inline script + the pinned CDN may execute.
             // Anything injected via shared content has no nonce → blocked.
-            "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src https: data:; base-uri 'none'; form-action 'none'`,
+            "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'`,
           },
         }));
       }
@@ -3398,7 +3435,54 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function publicMarkdownHtml(room: string, path: string, markdown: string, nonce: string): string {
+// The live-follow client for share pages: connects to the room hub by
+// capability slug (read-only, prefix-scoped server-side), morphs the article
+// while someone is typing this file, and cache-busts to the fresh page when
+// a durable write lands. Escape discipline: this string is embedded in a
+// template literal — no raw backticks, and \n only as \\n inside JS literals.
+function publicLiveScript(slug: string, livePath: string): string {
+  return `(function(){
+  var slug = ${JSON.stringify(slug)};
+  var path = ${JSON.stringify(livePath)};
+  var flag = null, idleTimer = 0;
+  function ensureFlag(actor){
+    if (!flag) {
+      flag = document.createElement("div");
+      flag.className = "live-flag";
+      document.body.appendChild(flag);
+    }
+    flag.textContent = actor + " \\u00b7 editing\\u2026";
+    flag.style.display = "block";
+  }
+  function hideFlag(){ if (flag) flag.style.display = "none"; }
+  function render(md){
+    try { document.getElementById("doc").innerHTML = DOMPurify.sanitize(marked.parse(md)); } catch (_) {}
+  }
+  function connect(){
+    var scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    var ws = new WebSocket(scheme + location.host + "/web/api/presence?slug=" + encodeURIComponent(slug));
+    var ping = setInterval(function(){ try { ws.send("ping"); } catch (_) {} }, 45000);
+    ws.onmessage = function(e){
+      var m; try { m = JSON.parse(e.data); } catch (_) { return; }
+      if (m.path !== path) return;
+      if (m.type === "draft") {
+        ensureFlag(m.actor);
+        render(m.content);
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(hideFlag, 3500);
+      } else if (m.type === "write") {
+        // Durable save: bust the 60s edge cache with the new etag.
+        ensureFlag(m.actor);
+        setTimeout(function(){ location.href = location.pathname + "?v=" + encodeURIComponent(m.etag || Date.now()); }, 900);
+      }
+    };
+    ws.onclose = function(){ clearInterval(ping); setTimeout(connect, 5000 + Math.random() * 5000); };
+  }
+  connect();
+})();`;
+}
+
+function publicMarkdownHtml(room: string, path: string, markdown: string, nonce: string, slug?: string): string {
   // Content is inlined as JSON and rendered client-side with the same marked
   // build the logged-in reader uses, so shared pages look identical to the
   // reader. <-escape keeps a literal </script> in the file body from
@@ -3411,7 +3495,8 @@ function publicMarkdownHtml(room: string, path: string, markdown: string, nonce:
   <article id="doc"></article>
   <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/marked@13.0.2/marked.min.js"></script>
   <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
-  <script nonce="${nonce}">document.getElementById("doc").innerHTML = DOMPurify.sanitize(marked.parse(${payload}));</script>`;
+  <script nonce="${nonce}">document.getElementById("doc").innerHTML = DOMPurify.sanitize(marked.parse(${payload}));</script>
+  ${slug ? `<script nonce="${nonce}">${publicLiveScript(slug, path)}</script>` : ""}`;
   return publicShellHtml(`${room}/${path}`, body);
 }
 
@@ -3444,6 +3529,7 @@ function publicShellHtml(title: string, body: string): string {
   main { max-width:820px; margin:0 auto; padding:56px 24px 120px; }
   .file-meta { font-family:var(--mono); font-size:11px; color:var(--ink-faint); margin-bottom:24px; }
   .empty { color:var(--ink-dim); }
+  .live-flag { display:none; position:fixed; top:14px; right:16px; z-index:5; font-family:var(--mono); font-size:10.5px; padding:3px 9px; border:1px solid var(--link); color:var(--link); border-radius:999px; background:var(--bg); }
   ul.index { list-style:none; margin:0; padding:0; }
   ul.index li { padding:6px 0; border-bottom:1px solid var(--rule); font-family:var(--mono); font-size:13px; }
   ul.index a { color:var(--ink); text-decoration:none; }
