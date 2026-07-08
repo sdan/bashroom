@@ -28,6 +28,7 @@ type Env = {
   GITHUB_CLIENT_SECRET?: string;
   BASHROOM_PUBLIC_URL?: string;
   R2_BUCKET_NAME?: string;
+  SANDBOX_TRANSPORT?: string;
   R2_ENDPOINT?: string;
   R2_ACCESS_KEY_ID?: string;
   R2_SECRET_ACCESS_KEY?: string;

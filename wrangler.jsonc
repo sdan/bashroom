@@ -73,7 +73,10 @@
   "vars": {
     "GITHUB_CLIENT_ID": "Ov23ligO8e72A6E9MGRx",
     "BASHROOM_PUBLIC_URL": "https://bashroom.sdan.io",
-    "R2_BUCKET_NAME": "bashroom-rooms"
+    "R2_BUCKET_NAME": "bashroom-rooms",
+    // Sandbox SDK: HTTP/WebSocket transports are removed 2026-07-09; RPC is
+    // the supported transport going forward (read by the Sandbox DO's ctor).
+    "SANDBOX_TRANSPORT": "rpc"
   },
   "observability": {
     "enabled": true

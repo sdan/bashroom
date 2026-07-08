@@ -20,7 +20,7 @@
     "smoke": "node bin/bashroom.js --help"
   },
   "dependencies": {
-    "@cloudflare/sandbox": "0.12.1",
+    "@cloudflare/sandbox": "^0.12.3",
     "@modelcontextprotocol/sdk": "1.26.0",
     "agents": "^0.6.0",
     "zod": "^3.25.76"
