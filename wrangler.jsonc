@@ -17,6 +17,10 @@
       {
         "name": "SANDBOXES",
         "class_name": "Sandbox"
+      },
+      {
+        "name": "ROOM_HUBS",
+        "class_name": "RoomHub"
       }
     ]
   },
@@ -54,6 +58,10 @@
     {
       "tag": "v5",
       "new_sqlite_classes": ["AccountDO"]
+    },
+    {
+      "tag": "v6",
+      "new_sqlite_classes": ["RoomHub"]
     }
   ],
   "rules": [

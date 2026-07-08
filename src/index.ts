@@ -23,6 +23,7 @@ type Env = {
   REGISTRY: DurableObjectNamespace<Registry>;
   ACCOUNTS: DurableObjectNamespace<AccountDO>;
   SANDBOXES: DurableObjectNamespace<Sandbox>;
+  ROOM_HUBS: DurableObjectNamespace<RoomHub>;
   ROOMS_R2: R2Bucket;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
@@ -48,6 +49,115 @@ export class Sandbox extends SandboxBase<Env> {
 (Sandbox as unknown as { outboundHandlers: Record<string, unknown> }).outboundHandlers = {
   bashroomControl: handleSandboxBashroomControl,
 };
+
+// ─── RoomHub — per-room presence + live-activity fanout ───────────────────
+// One DO per (userId, room). Web readers hold hibernating WebSockets; every
+// Worker-side write pokes the hub, which records the event in a small SQLite
+// ring and broadcasts it to connected readers. A fresh page gets the recent
+// ring in its hello frame, so "codex · wrote 2m ago" paints without waiting
+// for a live event. Hibernation-friendly by construction: no timers, no
+// outbound connections, and client keepalive pings are answered by
+// setWebSocketAutoResponse without waking the object. Pokes are fire-and-
+// forget from the caller — presence must never make a write slower or
+// break it.
+type HubEvent = { actor: string; path: string; etag?: string; source?: "web" | "mcp" | "shell" };
+
+export class RoomHub extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(async () => {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS activity (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          actor TEXT NOT NULL,
+          path TEXT NOT NULL,
+          etag TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT ''
+        );
+      `);
+    });
+    // Answered by the runtime while hibernated — the client's 45s "ping"
+    // keeps intermediaries from reaping the socket without ever waking us.
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+  }
+
+  // RPC from the Worker's write paths. Records + broadcasts one write event.
+  async hubPoke(event: HubEvent): Promise<void> {
+    const ts = Date.now();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO activity (ts, actor, path, etag, source) VALUES (?, ?, ?, ?, ?)",
+      ts, event.actor, event.path, event.etag || "", event.source || "",
+    );
+    // Ring semantics: keep the newest 100 rows, prune inline (no alarm).
+    this.ctx.storage.sql.exec(
+      "DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT 100)",
+    );
+    this.broadcast({ type: "write", ts, actor: event.actor, path: event.path, etag: event.etag || "", source: event.source || "" });
+  }
+
+  // WebSocket upgrade, forwarded from the Worker AFTER token + membership
+  // auth — the hub trusts its caller. (The forwarded headers still include
+  // the tok.* subprotocol slot; never log request headers here.)
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("expected websocket", { status: 426 });
+    }
+    const url = new URL(request.url);
+    const viewer = url.searchParams.get("viewer") || "reader";
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({ viewer, since: Date.now() });
+    const recent = this.ctx.storage.sql
+      .exec<{ ts: number; actor: string; path: string; etag: string; source: string }>(
+        "SELECT ts, actor, path, etag, source FROM activity ORDER BY id DESC LIMIT 20",
+      )
+      .toArray();
+    server.send(JSON.stringify({ type: "hello", recent, viewers: this.ctx.getWebSockets().length }));
+    this.broadcastViewers();
+    // The browser requires the response to select one of the offered
+    // subprotocols; echo the app protocol (never the tok.* credential slot).
+    const offered = (request.headers.get("Sec-WebSocket-Protocol") || "")
+      .split(",").map((p) => p.trim()).find((p) => p && !p.startsWith("tok."));
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: offered ? { "Sec-WebSocket-Protocol": offered } : undefined,
+    });
+  }
+
+  async webSocketMessage(): Promise<void> {
+    // Readers don't send application messages; keepalive pings are handled
+    // by the auto-response pair without reaching this handler.
+  }
+
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    try { ws.close(); } catch (_) { /* already closing */ }
+    // getWebSockets() still contains the terminating socket while this
+    // handler runs — exclude it or every disconnect over-counts forever
+    // (the broadcast after close is the LAST frame survivors receive).
+    this.broadcastViewers(ws);
+  }
+
+  async webSocketError(ws: WebSocket): Promise<void> {
+    this.broadcastViewers(ws);
+  }
+
+  private broadcast(message: Record<string, unknown>, exclude?: WebSocket): void {
+    const frame = JSON.stringify(message);
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws === exclude) continue;
+      try { ws.send(frame); } catch (_) { /* socket mid-close; skip */ }
+    }
+  }
+
+  private broadcastViewers(exclude?: WebSocket): void {
+    const viewers = this.ctx.getWebSockets().filter((ws) => ws !== exclude).length;
+    this.broadcast({ type: "viewers", viewers }, exclude);
+  }
+}
 
 export class AccountDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -1687,6 +1797,25 @@ function defer(work: Promise<unknown>): void {
   // else: fire-and-forget; the promise still runs, just untracked.
 }
 
+// Fire-and-forget presence poke. Hub name is the storage identity
+// (userId:room — the same pair that keys R2 prefixes). Deferred + swallowed:
+// presence must never add latency to or fail a write.
+function pokeRoomHub(env: Env, userId: string, room: string, actor: string, path: string, source: "web" | "mcp" | "shell", etag?: string): void {
+  try {
+    const stub = env.ROOM_HUBS.get(env.ROOM_HUBS.idFromName(`${userId}:${room}`));
+    defer(stub.hubPoke({ actor, path, etag, source }));
+  } catch (_) { /* presence is best-effort by contract */ }
+}
+
+// Rooms a shell command plausibly touched — /rooms/<room> mentions in the
+// command text. Heuristic by design (a cd + relative path escapes it);
+// per-file precision arrives with R2 event notifications later.
+function roomsMentioned(command: string): string[] {
+  const rooms = new Set<string>();
+  for (const match of command.matchAll(/\/rooms\/([A-Za-z0-9][A-Za-z0-9_-]*)/g)) rooms.add(match[1]);
+  return [...rooms];
+}
+
 async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   activeCtx = ctx;
   const url = new URL(request.url);
@@ -1834,6 +1963,29 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
     if (url.pathname === "/web" || url.pathname === "/web/") return html(webIndexHtml());
 
+    // Presence WebSocket for the web reader. Auth happens HERE (token rides
+    // the Sec-WebSocket-Protocol header as "tok.<token>" because browser
+    // WebSockets can't set Authorization); the hub only ever sees the
+    // already-authorized upgrade. One hub per (userId, room).
+    if (url.pathname === "/web/api/presence") {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return json({ ok: false, error: "expected_websocket" }, 426);
+      }
+      const room = parseOptionalWiki(url.searchParams.get("room"));
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      const protoHeader = request.headers.get("Sec-WebSocket-Protocol") || "";
+      const token = protoHeader.split(",").map((p) => p.trim()).find((p) => p.startsWith("tok."))?.slice(4) || "";
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.presence", includeRooms: true });
+      if (account.ok === false) return json({ ok: false, error: account.error || "unauthorized" }, 401);
+      const userId = String(account.user_id || "");
+      const membership = (account.rooms || []).find((row) => row.room === room);
+      if (!userId || !membership) return json({ ok: false, error: "forbidden" }, 403);
+      const stub = env.ROOM_HUBS.get(env.ROOM_HUBS.idFromName(`${userId}:${room}`));
+      const hubUrl = new URL("https://hub.local/connect");
+      hubUrl.searchParams.set("viewer", String(account.handle || "you"));
+      return stub.fetch(new Request(hubUrl, request));
+    }
+
     if (url.pathname === "/web/api/rooms" && request.method === "GET") {
       // Pass ?active=ROOM to also fetch that room's metadata tree in the same
       // response — saves a round-trip on initial page load without reading
@@ -1946,6 +2098,9 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
         return json({ ok: false, error: "conflict", file: current }, 412);
       }
       const file = await r2File(env, userId, room, path);
+      // Presence: a web edit is the human writing — attribute to the handle.
+      // The etag lets other tabs skip refetching a version they already hold.
+      pokeRoomHub(env, userId, room, String(account.handle || "you"), path, "web", file?.etag);
       return json({ ok: true, file });
     }
 
@@ -2374,7 +2529,7 @@ function publicBaseUrl(env: Env, request: Request): string {
 // tokens fall back to Registry during migration.
 async function runShell(env: Env, headerToken: string, ip: string, command: string, stdin: string): Promise<ShellResult> {
   const inputBytes = utf8ByteLength(command) + utf8ByteLength(stdin);
-  const account = await authorizeAccount(env, headerToken, ip, { route: "mcp.exec", inputBytes });
+  const account = await authorizeAccount(env, headerToken, ip, { route: "mcp.exec", inputBytes, includeRooms: true });
   if (account.ok === false) {
     return { stdout: "", stderr: `bashroom: ${account.error || "unauthorized"}\n`, exitCode: 1, changed: 0, changed_paths: [] };
   }
@@ -2382,7 +2537,19 @@ async function runShell(env: Env, headerToken: string, ip: string, command: stri
   if (!userId) {
     return { stdout: "", stderr: "bashroom: no account\n", exitCode: 1, changed: 0, changed_paths: [] };
   }
-  return runShellV2(env, userId, headerToken, ip, command, stdin);
+  const result = await runShellV2(env, userId, headerToken, ip, command, stdin);
+  // Presence: room-level touch for every room the command names. path=""
+  // means "activity in this room" (readers refresh the tree, not a file);
+  // heuristic until R2 event notifications provide per-file precision.
+  // Failed commands don't poke — a command that errored is weak evidence
+  // anything changed, and phantom activity is worse than missed activity.
+  if (result.exitCode === 0) {
+    for (const room of roomsMentioned(command)) {
+      const membership = (account.rooms || []).find((row) => row.room === room);
+      if (membership) pokeRoomHub(env, userId, room, String(membership.actor || "agent"), "", "shell");
+    }
+  }
+  return result;
 }
 
 // Result of bashroom_write — separate shape from ShellResult since this
@@ -2402,7 +2569,7 @@ async function runWriteFile(env: Env, headerToken: string, ip: string, path: str
   const bytes = encoding === "base64"
     ? Math.floor((content.length * 3) / 4)
     : utf8ByteLength(content);
-  const account = await authorizeAccount(env, headerToken, ip, { route: "mcp.write", inputBytes: utf8ByteLength(path), writeBytes: bytes });
+  const account = await authorizeAccount(env, headerToken, ip, { route: "mcp.write", inputBytes: utf8ByteLength(path), writeBytes: bytes, includeRooms: true });
   if (account.ok === false) {
     return { ok: false, path, bytes: 0, error: String(account.error || "unauthorized") };
   }
@@ -2427,6 +2594,14 @@ async function runWriteFile(env: Env, headerToken: string, ip: string, path: str
       });
       // SDK accepts encoding: 'utf-8' (default) or 'base64'. We pass through.
       await session.writeFile(path, content, { encoding });
+      // Presence: attribute to the room's registered actor (the agent
+      // identity chosen at create/join — per-connection agent identity
+      // isn't knowable on the stateless MCP transport).
+      const segments = path.split("/"); // "/rooms/<room>/rest..."
+      const room = segments[2] || "";
+      const rel = segments.slice(3).join("/");
+      const membership = (account.rooms || []).find((row) => row.room === room);
+      if (room && membership) pokeRoomHub(env, userId, room, String(membership.actor || "agent"), rel, "mcp");
       // Best-effort byte count for the audit / response. For base64 it's
       // the decoded length; for utf-8 it's the UTF-8 byte length.
       return { ok: true, path, bytes };
