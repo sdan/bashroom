@@ -2865,7 +2865,7 @@ async function webSearchRoom(
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(8, objects.length || 1) }, scanOne));
+    await Promise.all(Array.from({ length: Math.min(20, objects.length || 1) }, scanOne));
     // Pool completion order is nondeterministic — stable-sort for the UI.
     out.sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
     return out;
