@@ -2848,8 +2848,10 @@ const WEB_INDEX_HTML = `<!doctype html>
     const activeFileLoading = state.activeRoom && state.activePath && !activeFile && fileInflight.has(activeKey);
     // Room addressed but its first tree hasn't landed — content is on its
     // way (fetchTree picks a default file), so the pane skeletons instead of
-    // narrating "Loading…" in an empty state that then reflows away.
-    const treeLoading = Boolean(state.activeRoom && !tree && !treeIsErr);
+    // narrating "Loading…" in an empty state that then reflows away. Share
+    // mode never loads a tree (one granted document, no sidebar): there this
+    // must stay false or a failed file fetch would skeleton forever.
+    const treeLoading = Boolean(!share && state.activeRoom && !tree && !treeIsErr);
     // Modeless editing stays primary. Preview is a per-document opt-in used
     // for renderers (Mermaid today, more allowlisted blocks later).
     const inlineMode = Boolean(activeFile && !activeFileIsErr && !activeFile.is_binary && !cmLoadFailed);
