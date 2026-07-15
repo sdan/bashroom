@@ -191,6 +191,12 @@ describe("webCollaborativeShareHtml", () => {
     expect(html).toContain('className = "remote-caret-label"');
   });
 
+  it("anchors comments by server-mapped offsets only — no quote-substring fallback", () => {
+    const html = webCollaborativeShareHtml({ slug: "abc12345", role: "comment", nonce: "nonce" });
+    expect(html).not.toContain("text.indexOf(comment.quote");
+    expect(html).toContain("text.slice(start,end) === comment.quote");
+  });
+
   it("escapes the embedded slug before the inline script boundary", () => {
     const html = webCollaborativeShareHtml({ slug: "</script><script>alert(1)", role: "edit", nonce: "nonce" });
     expect(html).not.toContain('var slug = "</script>');

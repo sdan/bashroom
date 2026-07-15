@@ -273,10 +273,13 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
     return { anchor_start:start+left, anchor_end:start+left+quote.length, quote:quote };
   }
   function resolvedAnchor(comment, text){
+    // Stored offsets are the anchor authority: the server maps them through
+    // every accepted update (assoc -1 start / +1 end) and rewrites them via
+    // DocumentCollab.remapCommentAnchors. The quote-substring fallback was
+    // deleted — a moved or repeated quote must surface as drift ("Text
+    // moved"), never highlight a guessed occurrence at the wrong position.
     var start = Number(comment.anchor_start), end = Number(comment.anchor_end);
-    if (text.slice(start,end) === comment.quote) return { start:start, end:end, drifted:false };
-    var first = text.indexOf(comment.quote);
-    if (first !== -1 && text.indexOf(comment.quote,first+1) === -1) return { start:first, end:first+comment.quote.length, drifted:true };
+    if (end > start && text.slice(start,end) === comment.quote) return { start:start, end:end };
     return null;
   }
   function wrapAnchor(root, anchor, id){
