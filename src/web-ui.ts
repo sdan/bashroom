@@ -707,6 +707,31 @@ const WEB_INDEX_HTML = `<!doctype html>
   .empty { font-size: 14px; color: var(--ink-dim); padding: 10px 14px; }
   .empty code { font-family: var(--mono); font-size: 12px; background: var(--hover); padding: 2px 6px; border-radius: 3px; color: var(--link); }
 
+  /* ── Skeleton loading ──
+     Ghost layout while a room tree / document body is in flight, built from
+     the REAL layout's own boxes (.room-head, .tree .row, article h1/p) so
+     the content landing causes zero layout shift. One shared gradient sweep
+     — linear easing, because this is progress-like motion — kept quiet by
+     staying inside the surface palette; static ghosts under
+     prefers-reduced-motion. Tokens only, so both themes come for free. */
+  .sk {
+    display: inline-block; vertical-align: middle; height: 12px; border-radius: 4px;
+    background: linear-gradient(90deg, var(--hover) 25%, var(--guide) 50%, var(--hover) 75%);
+    background-size: 200% 100%;
+    animation: sk-sweep 1.6s linear infinite;
+  }
+  /* Ghost rows reuse .room-head/.row for their exact metrics but must never
+     act like rows — no hover fill, no cursor, no clicks. */
+  .sk-ghost, .room-head.sk-ghost, .tree .row.sk-ghost { pointer-events: none; cursor: default; }
+  /* Article ghosts sit inside the article's own h1/p line boxes — the line
+     strut owns the height, the bar just marks where ink will land. */
+  .sk-doc h1 .sk { height: 0.62em; width: 52%; border-radius: 6px; }
+  .sk-crumb { height: 9px; width: 90px; }
+  @keyframes sk-sweep { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    .sk { animation: none; background: var(--hover); }
+  }
+
   /* Cross-room search — quiet input pinned under the brand; results replace
      the room sections while a query is active. */
   .search-box { padding: 0 14px 10px; flex-shrink: 0; }
@@ -2382,11 +2407,41 @@ const WEB_INDEX_HTML = `<!doctype html>
     return root.kids;
   }
 
+  // ── Skeleton builders ──
+  // Ghosts are assembled from the same elements the real content uses
+  // (.section/.room-head, .tree .row, article h1/p), so their metrics are
+  // definitionally the content's metrics — landing swaps ink into the same
+  // boxes instead of reflowing the page. Widths vary so the ghosts read as
+  // a layout, not a barcode.
+  function skeletonRoomsHtml() {
+    return [64, 92, 56, 76, 48].map(w =>
+      '<div class="section" aria-hidden="true"><div class="room-head sk-ghost">'
+      + '<span class="chev"></span>'
+      + '<span class="name"><span class="sk" style="width:' + w + 'px"></span></span>'
+      + '</div></div>').join("");
+  }
+  function skeletonTreeHtml() {
+    return [104, 72, 88].map(w =>
+      '<li aria-hidden="true"><div class="row sk-ghost">'
+      + '<span class="chev hidden"></span>'
+      + '<span class="icon"></span>'
+      + '<span class="label"><span class="sk" style="width:' + w + 'px"></span></span>'
+      + '</div></li>').join("");
+  }
+  function skeletonDocHtml() {
+    // article carries the real 65vh floor + 20vh trailing pad, so the page
+    // height (and the scrollbar) don't jump when the document lands.
+    return '<article class="sk-doc" role="status" aria-label="Loading document">'
+      + '<h1><span class="sk"></span></h1>'
+      + ['96%', '88%', '93%', '71%', '42%'].map(w => '<p><span class="sk" style="width:' + w + '"></span></p>').join("")
+      + '</article>';
+  }
+
   function roomTreeInnerHtml(room) {
     const roomTree = trees.get(room);
     if (Array.isArray(roomTree)) return renderTree(room, buildTree(roomTree));
     if (isErrorRecord(roomTree)) return '<li class="empty">Couldn\\'t load. <span class="retry-link">Click room to retry.</span></li>';
-    return '<li class="empty">Loading…</li>';
+    return skeletonTreeHtml();
   }
 
   function sidebarSectionsHtml() {
@@ -2406,7 +2461,7 @@ const WEB_INDEX_HTML = `<!doctype html>
             \${open ? '<ul class="tree">' + treeHtml + '</ul>' : ''}
           </div>\`;
         }).join("")
-      : roomsLoading ? '<div class="empty">Loading rooms…</div>'
+      : roomsLoading ? skeletonRoomsHtml()
       : '<div class="empty">No rooms. Use <code>bashroom room create</code>.</div>';
   }
 
@@ -2600,6 +2655,10 @@ const WEB_INDEX_HTML = `<!doctype html>
     const treeIsErr = isErrorRecord(tree);
     const activeFileIsErr = isErrorRecord(activeFile);
     const activeFileLoading = state.activeRoom && state.activePath && !activeFile && fileInflight.has(activeKey);
+    // Room addressed but its first tree hasn't landed — content is on its
+    // way (fetchTree picks a default file), so the pane skeletons instead of
+    // narrating "Loading…" in an empty state that then reflows away.
+    const treeLoading = Boolean(state.activeRoom && !tree && !treeIsErr);
     // Modeless editing stays primary. Preview is a per-document opt-in used
     // for renderers (Mermaid today, more allowlisted blocks later).
     const inlineMode = Boolean(activeFile && !activeFileIsErr && !activeFile.is_binary && !cmLoadFailed);
@@ -2645,12 +2704,12 @@ const WEB_INDEX_HTML = `<!doctype html>
               </div>
           </div>\`
       : "";
-    const documentHeader = (activeFile && !activeFileIsErr) || activeFileLoading
+    const documentHeader = (activeFile && !activeFileIsErr) || activeFileLoading || treeLoading
       ? \`<header class="doc-header">
-          <div class="doc-location" title="\${escHtml(state.activeRoom + "/" + docPath)}">
+          <div class="doc-location" title="\${escHtml(state.activeRoom + (docPath ? "/" + docPath : ""))}">
             <span class="doc-room">\${escHtml(state.activeRoom)}</span>
             <span class="doc-separator" aria-hidden="true">/</span>
-            <span class="doc-path">\${escHtml(docPath)}</span>
+            <span class="doc-path">\${docPath ? escHtml(docPath) : '<span class="sk sk-crumb" aria-hidden="true"></span>'}</span>
           </div>
           <div class="doc-activity">
             <span class="presence" id="presence-row"></span>
@@ -2659,12 +2718,12 @@ const WEB_INDEX_HTML = `<!doctype html>
           \${docActionsHtml}
         </header>\`
       : "";
+    // In-flight loads (treeLoading / activeFileLoading) never reach this —
+    // they render the skeleton document below instead of a message.
     const emptyMsg = !state.activeRoom ? "Pick a room."
       : treeIsErr ? "Couldn't load <code>" + state.activeRoom + "</code>. Click the room in the sidebar to retry."
-      : !tree ? "Loading <code>" + state.activeRoom + "</code>…"
       : !state.activePath ? "Pick a file."
       : activeFileIsErr ? "Couldn't load <code>" + state.activePath + "</code>."
-      : activeFileLoading ? "Loading <code>" + state.activePath + "</code>…"
       : "File <code>" + state.activePath + "</code> not in <code>" + state.activeRoom + "</code>.";
     // Fallback (cmLoadFailed) explicit-edit flow: textarea + Save/Cancel.
     const editorHtml = '<div id="cm-mount"></div>'
@@ -2694,6 +2753,7 @@ const WEB_INDEX_HTML = `<!doctype html>
           ? '<div class="empty">Binary file. Use the Bashroom shell to inspect it.</div>'
           : inlineMode ? (previewing ? '<article>' + md + '</article>' : inlineHtml)
           : (editing ? editorHtml : '<article>' + md + '</article>'))
+      : (treeLoading || activeFileLoading) ? skeletonDocHtml()
       : '<div class="empty">' + emptyMsg + '</div>';
 
     app.innerHTML = \`
