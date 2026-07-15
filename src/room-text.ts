@@ -176,6 +176,17 @@ export function changeSetToWire(changes: ChangeSet): WireTextChange[] {
 }
 
 /**
+ * The wire identity of one logical update: the exact string the store
+ * persists as update_token and the sync surface tags broadcast entries with.
+ * Client and server MUST derive it identically — it is the rebaseUpdates
+ * clientID, so a mismatch would stop a client from recognizing its own
+ * committed updates (echo-as-ack) and corrupt outbox confirmation.
+ */
+export function roomTextUpdateToken(clientId: string, requestId: string): string {
+  return JSON.stringify([clientId, requestId]);
+}
+
+/**
  * Move a stale client edit over canonical updates accepted since its base.
  * updateToken must uniquely identify this logical update. It deliberately is
  * not the long-lived actor ID: CodeMirror uses clientID to deduplicate updates.

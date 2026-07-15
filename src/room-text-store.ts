@@ -10,11 +10,12 @@ import {
   encodeRoomText,
   mapRoomTextAnchors,
   rebaseRoomTextChange,
+  roomTextUpdateToken,
   type RoomTextAnchor,
   type WireTextChange,
 } from "./room-text";
 
-const ROOM_TEXT_PROTOCOL = 1 as const;
+export const ROOM_TEXT_PROTOCOL = 1 as const;
 const MAX_CACHE_FILES = 32;
 const MAX_SYNC_UPDATES = 256;
 const MAX_SYNC_TAIL_BYTES = 1_000_000;
@@ -154,6 +155,41 @@ export type PullRoomTextResult =
     }
   | RoomTextFailure;
 
+// Reconnect handshake. The client states what it already has; the SERVER
+// chooses the hydration shape — never the client, which cannot know whether
+// its last revision still sits inside the retained sync window.
+export type ConnectRoomTextInput = {
+  connectRequestId: string;
+  protocolVersion: number;
+  fileId: string;
+  epoch: number;
+  lastRevision: number;
+};
+
+export type ConnectRoomTextResult =
+  | {
+      ok: true;
+      protocol: typeof ROOM_TEXT_PROTOCOL;
+      connectRequestId: string;
+      fileId: string;
+      hydration: "delta";
+      epoch: number;
+      headRevision: number;
+      updates: CanonicalRoomTextUpdate[];
+    }
+  | {
+      ok: true;
+      protocol: typeof ROOM_TEXT_PROTOCOL;
+      connectRequestId: string;
+      fileId: string;
+      hydration: "snapshot";
+      epoch: number;
+      headRevision: number;
+      byteLength: number;
+      doc: string;
+    }
+  | RoomTextFailure;
+
 export type CompactHistoryResult =
   | {
       ok: true;
@@ -215,12 +251,22 @@ export type RoomTextFailure = {
     | "FUTURE_REVISION"
     | "RESET_REQUIRED"
     | "IDEMPOTENCY_MISMATCH"
+    | "PROTOCOL_MISMATCH"
     | RoomTextError["code"];
   message?: string;
   epoch?: number;
   revision?: number;
   content?: string;
 };
+
+/**
+ * Retryable failures are stale SYNC STATE: the client's picture of the file
+ * is out of date and a re-hydration fixes it. Everything else is bad-args or
+ * a server invariant — resubmitting the same update can never succeed.
+ */
+export function isRetryableRoomTextFailure(code: RoomTextFailure["error"]): boolean {
+  return code === "EPOCH_MISMATCH" || code === "RESET_REQUIRED" || code === "FUTURE_REVISION";
+}
 
 /**
  * SQLite authority for collaborative text inside one room Durable Object.
@@ -318,7 +364,7 @@ export class RoomTextStore {
       }
       const overRows = this.updateRows(normalized.fileId, row.epoch, normalized.baseRevision, row.head_revision);
       validateUpdateChain(overRows, normalized.baseRevision, baseLength, row.head_revision);
-      const updateToken = JSON.stringify([normalized.clientId, normalized.requestId]);
+      const updateToken = roomTextUpdateToken(normalized.clientId, normalized.requestId);
       const canonical = rebaseRoomTextChange(
         submitted,
         updateToken,
@@ -495,6 +541,68 @@ export class RoomTextStore {
         epoch: row.epoch,
         revision: row.head_revision,
         updates: updates.map(toCanonicalUpdate),
+      };
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  /**
+   * Reconnect handshake: the SERVER chooses the hydration shape. Delta — a
+   * range read over the existing canonical update rows — only when the
+   * client's epoch matches and its last revision still sits inside the
+   * bounded sync window at or above history_floor. Anything else (stale
+   * epoch, below the floor, ahead of head, oversized tail) falls back to a
+   * full snapshot; a reconnect must never fail for being too far behind.
+   * An unknown protocol version is refused outright so the host can send an
+   * explicit incompatibility frame instead of updates the client cannot
+   * decode.
+   */
+  connectText(input: ConnectRoomTextInput): ConnectRoomTextResult {
+    try {
+      if (!input || !Number.isSafeInteger(input.protocolVersion) || !Number.isSafeInteger(input.epoch)
+        || !Number.isSafeInteger(input.lastRevision) || input.lastRevision < 0) {
+        return { ok: false, error: "INVALID_REQUEST" };
+      }
+      const connectRequestId = validateKey(input.connectRequestId, "connectRequestId");
+      const fileId = validateKey(input.fileId, "fileId");
+      if (input.protocolVersion !== ROOM_TEXT_PROTOCOL) {
+        return {
+          ok: false,
+          error: "PROTOCOL_MISMATCH",
+          message: `server speaks room-text protocol ${ROOM_TEXT_PROTOCOL}, client sent ${input.protocolVersion}`,
+        };
+      }
+      const row = this.fileRow(fileId);
+      if (!row) return { ok: false, error: "NOT_FOUND" };
+      if (input.epoch === row.epoch && input.lastRevision >= row.history_floor
+        && input.lastRevision <= row.head_revision
+        && row.head_revision - input.lastRevision <= MAX_SYNC_UPDATES
+        && this.tailBytesAfter(row, input.lastRevision) <= MAX_SYNC_TAIL_BYTES) {
+        const updates = this.updateRows(fileId, row.epoch, input.lastRevision, row.head_revision);
+        validateUpdateChain(updates, input.lastRevision, this.lengthAtRevision(row, input.lastRevision), row.head_revision);
+        return {
+          ok: true,
+          protocol: ROOM_TEXT_PROTOCOL,
+          connectRequestId,
+          fileId,
+          hydration: "delta",
+          epoch: row.epoch,
+          headRevision: row.head_revision,
+          updates: updates.map(toCanonicalUpdate),
+        };
+      }
+      const current = this.loadCurrent(row);
+      return {
+        ok: true,
+        protocol: ROOM_TEXT_PROTOCOL,
+        connectRequestId,
+        fileId,
+        hydration: "snapshot",
+        epoch: row.epoch,
+        headRevision: current.revision,
+        byteLength: current.byteLength,
+        doc: current.doc.toString(),
       };
     } catch (error) {
       return failureFrom(error);
