@@ -8,7 +8,9 @@ import {
   changeSetToWire,
   decodeRoomText,
   encodeRoomText,
+  mapRoomTextAnchors,
   rebaseRoomTextChange,
+  type RoomTextAnchor,
   type WireTextChange,
 } from "./room-text";
 
@@ -96,6 +98,11 @@ export type PushRoomTextInput = {
   clientId: string;
   requestId: string;
   changes: readonly WireTextChange[];
+  // Head-revision observer positions (open comment anchors) the host wants
+  // mapped through the accepted update. Deliberately excluded from the
+  // idempotency envelope: anchors are host-side state, not part of the
+  // logical update, and a retry carries whatever snapshot the host has now.
+  anchors?: readonly RoomTextAnchor[];
 };
 
 export type CanonicalRoomTextUpdate = {
@@ -116,6 +123,14 @@ export type PushRoomTextSuccess = {
   roomCommit: number;
   byteLength: number;
   update: CanonicalRoomTextUpdate;
+  // Present only when this call committed a NEW revision and the host sent
+  // anchors: positions mapped through the canonical (rebased) ChangeSet with
+  // assoc -1 for start / +1 for end. Idempotent replays omit it — the first
+  // accept already reported the mapping, and re-mapping an already rewritten
+  // anchor through the same update would double-shift it. The mapping itself
+  // is pure and synchronous (mapRoomTextAnchors); the host wires the result
+  // into DocumentCollab.remapCommentAnchors — this store never imports it.
+  anchors?: RoomTextAnchor[];
 };
 
 export type PushRoomTextResult = PushRoomTextSuccess | RoomTextFailure;
@@ -305,6 +320,11 @@ export class RoomTextStore {
             requestId: normalized.requestId,
             changes: changeSetToWire(canonical),
           },
+          // Fresh accept only: map host anchors through the exact ChangeSet
+          // that just moved the text. Pure and synchronous by construction.
+          ...(Array.isArray(input.anchors)
+            ? { anchors: mapRoomTextAnchors(canonical, input.anchors) }
+            : {}),
         };
         this.storage.sql.exec(
           `INSERT INTO room_text_updates (

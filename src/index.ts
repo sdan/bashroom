@@ -1825,13 +1825,13 @@ function createServer(env: Env, ctx: ExecutionContext, headerToken: string, ip: 
 
   server.tool(
     "bashroom_shared_comment",
-    "Add an inline comment through a Bashroom Comment or Edit link. quote must be an exact, preferably unique visible text selection from the rendered document; Bashroom re-anchors by quote if the document moved. Use bashroom_shared_read first so the comment carries the current document etag.",
+    "Add an inline comment through a Bashroom Comment or Edit link. quote must be an exact visible text selection from the rendered document. Stored offsets are the anchor authority: there is no quote re-anchoring, so without a correct anchor_start the comment still posts but shows as drifted (Text moved) instead of highlighting. Use bashroom_shared_read first so the comment carries the current document etag.",
     {
       link: z.string().min(1).max(2048).describe("A /s/<slug> Comment or Edit URL copied from Bashroom."),
       quote: z.string().min(1).max(2000).describe("Exact visible text to anchor the inline comment to; unique text is best."),
       body: z.string().min(1).max(8000).describe("Comment text."),
       document_etag: z.string().max(128).optional().describe("Etag returned by bashroom_shared_read, used to detect anchor drift."),
-      anchor_start: z.number().int().min(0).max(10_000_000).optional().describe("Optional rendered-text character offset. Omit to let the browser re-anchor by unique quote."),
+      anchor_start: z.number().int().min(0).max(10_000_000).optional().describe("Rendered-text character offset of the quote. Offsets are authoritative; if omitted or wrong the comment shows as drifted instead of highlighted."),
     },
     async ({ link, quote, body, document_etag, anchor_start }) => {
       const result = await mcpSharedComment(env, ctx, headerToken, ip, { link, quote, body, documentEtag: document_etag || "", anchorStart: anchor_start });

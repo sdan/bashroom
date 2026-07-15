@@ -34,6 +34,12 @@ export type ResolveDocumentCommentInput = {
   canResolveAny: boolean;
 };
 
+export type RemapCommentAnchorInput = {
+  id: string;
+  anchor_start: number;
+  anchor_end: number;
+};
+
 const MAX_COMMENT_CHARS = 8_000;
 const MAX_QUOTE_CHARS = 2_000;
 const MAX_DOCUMENT_OFFSET = 10_000_000;
@@ -128,6 +134,46 @@ export class DocumentCollab extends DurableObject<DocumentCollabEnv> {
       comment.created_at,
     );
     return { ok: true, comment };
+  }
+
+  /**
+   * Rewrite stored anchor offsets after the room text authority accepted an
+   * update. The caller maps positions through the accepted ChangeSet
+   * (RoomTextStore push result carries them pre-mapped); this DO only
+   * persists offsets — it never sees the document. Open comments only:
+   * resolved comments keep the offsets they were resolved at. Unknown ids
+   * are skipped so a host racing a concurrent resolve cannot fail the batch,
+   * and anchor_start === anchor_end is legal here (the anchored text was
+   * deleted; the client renders that as drift instead of guessing).
+   */
+  async remapCommentAnchors(
+    anchors: readonly RemapCommentAnchorInput[],
+  ): Promise<{ ok: true; updated: number } | { ok: false; error: string }> {
+    if (!Array.isArray(anchors) || anchors.length > MAX_COMMENTS_PER_DOCUMENT) {
+      return { ok: false, error: "invalid_anchors" };
+    }
+    const valid: RemapCommentAnchorInput[] = [];
+    for (const anchor of anchors) {
+      const start = Number(anchor?.anchor_start);
+      const end = Number(anchor?.anchor_end);
+      if (!anchor || typeof anchor.id !== "string" || !anchor.id
+        || !Number.isSafeInteger(start) || !Number.isSafeInteger(end)
+        || start < 0 || end < start || end > MAX_DOCUMENT_OFFSET) {
+        return { ok: false, error: "invalid_anchor" };
+      }
+      valid.push({ id: anchor.id, anchor_start: start, anchor_end: end });
+    }
+    let updated = 0;
+    this.ctx.storage.transactionSync(() => {
+      for (const anchor of valid) {
+        updated += this.ctx.storage.sql.exec(
+          `UPDATE comments SET anchor_start = ?, anchor_end = ?
+            WHERE id = ? AND resolved_at IS NULL`,
+          anchor.anchor_start, anchor.anchor_end, anchor.id,
+        ).rowsWritten;
+      }
+    });
+    return { ok: true, updated };
   }
 
   async resolveComment(input: ResolveDocumentCommentInput): Promise<{ ok: true; comment: DocumentComment } | { ok: false; error: string }> {

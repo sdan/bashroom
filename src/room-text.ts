@@ -1,4 +1,4 @@
-import { ChangeSet, Text } from "@codemirror/state";
+import { ChangeSet, Text, type ChangeDesc } from "@codemirror/state";
 import { rebaseUpdates } from "@codemirror/collab";
 
 // Keep the first version comfortably below Durable Object SQLite's 2 MB
@@ -193,6 +193,42 @@ export function rebaseRoomTextChange(
     throw new RoomTextError("STORAGE_CORRUPT", "logical update was unexpectedly deduplicated");
   }
   return rebased[0].changes;
+}
+
+/**
+ * Host-observed positions (comment anchors) in head-document UTF-16 offsets.
+ * The store maps these through each accepted update so anchor authority lives
+ * with the same ChangeSet that moved the text — no substring guessing.
+ */
+export type RoomTextAnchor = {
+  id: string;
+  start: number;
+  end: number;
+};
+
+/**
+ * Map anchors through an accepted canonical ChangeSet. assoc -1 keeps the
+ * start before text inserted exactly at it; assoc +1 pushes the end past text
+ * inserted exactly at it — typing at either edge stays inside the anchor.
+ * A deletion covering the whole span collapses it (start === end); the host
+ * treats a collapsed anchor as drifted rather than re-anchoring by substring.
+ * Out-of-range inputs are clamped: anchors are advisory observer state and
+ * must never fail an already committed update.
+ */
+export function mapRoomTextAnchors(
+  changes: ChangeSet | ChangeDesc,
+  anchors: readonly RoomTextAnchor[],
+): RoomTextAnchor[] {
+  const clamp = (position: number) =>
+    Math.max(0, Math.min(Number.isSafeInteger(position) ? position : 0, changes.length));
+  return anchors.map((anchor) => {
+    const start = changes.mapPos(clamp(anchor.start), -1);
+    return {
+      id: anchor.id,
+      start,
+      end: Math.max(start, changes.mapPos(clamp(anchor.end), 1)),
+    };
+  });
 }
 
 /**

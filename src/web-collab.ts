@@ -1,4 +1,106 @@
+import { ChangeSet, type ChangeDesc, type Text } from "@codemirror/state";
 import type { ShareRole } from "./document-collab";
+
+// ─── Selective undo ────────────────────────────────────────────────────────
+// Local history for the collaborative editor. Invariants (Figma rule:
+// undo-copy-redo must not change the document):
+//   - the stacks hold inverses of this client's OWN changesets only;
+//   - remote updates (receiveUpdates) NEVER enter history — they only remap
+//     stored inverses, so an undo target survives concurrent edits;
+//   - undo()/redo() return a brand-new forward changeset the caller submits
+//     through the normal push pipeline — never a revision rollback.
+
+export type CollabHistoryTransaction = {
+  changes: ChangeSet;
+  /** Document the changes apply to (state before this transaction). */
+  docBefore: Text;
+  /** True when the changes arrived from the authority (receiveUpdates). */
+  remote?: boolean;
+  /**
+   * Wrapper-supplied CodeMirror-style flag. Origin wins over flags: a remote
+   * transaction is never recorded even when a dispatch wrapper forces this
+   * to true, and an own transaction with false remaps without recording.
+   */
+  addToHistory?: boolean;
+  /**
+   * Set on transactions this history itself emitted via undo()/redo(). The
+   * stacks were already rotated for that op; recording or remapping it again
+   * would corrupt them.
+   */
+  fromHistory?: boolean;
+};
+
+const MAX_HISTORY_DEPTH = 200;
+
+export class SelectiveUndoHistory {
+  private undone: ChangeSet[] = []; // inverses of own edits, oldest first
+  private redone: ChangeSet[] = []; // inverses of undos, oldest first
+
+  get undoDepth(): number {
+    return this.undone.length;
+  }
+
+  get redoDepth(): number {
+    return this.redone.length;
+  }
+
+  /** Single dispatch funnel: every applied transaction must pass through. */
+  applyTransaction(tr: CollabHistoryTransaction): void {
+    if (tr.fromHistory || tr.changes.empty) return;
+    if (tr.remote || tr.addToHistory === false) {
+      this.undone = mapBranch(this.undone, tr.changes.desc);
+      this.redone = mapBranch(this.redone, tr.changes.desc);
+      return;
+    }
+    this.undone.push(tr.changes.invert(tr.docBefore));
+    if (this.undone.length > MAX_HISTORY_DEPTH) this.undone.shift();
+    this.redone = []; // a fresh own edit invalidates redo; remote edits do not
+  }
+
+  /**
+   * Pop the newest own inverse as a forward op against `doc` (the current
+   * document). The caller dispatches it with { fromHistory: true } and pushes
+   * it to the authority exactly like typing — a new revision, not a rollback.
+   */
+  undo(doc: Text): ChangeSet | null {
+    return rotate(this.undone, this.redone, doc);
+  }
+
+  redo(doc: Text): ChangeSet | null {
+    return rotate(this.redone, this.undone, doc);
+  }
+}
+
+function rotate(from: ChangeSet[], to: ChangeSet[], doc: Text): ChangeSet | null {
+  const changes = from.pop();
+  if (!changes) return null;
+  if (changes.length !== doc.length) {
+    // A remote update reached the document without passing applyTransaction.
+    throw new Error("selective undo history is out of sync with the document");
+  }
+  to.push(changes.invert(doc));
+  return changes;
+}
+
+/**
+ * Remap a stack of own inverses over one remote changeset. The newest entry
+ * applies to the current document; each older entry applies to the document
+ * its successors produce. Cascade the remote change down the stack, mapping
+ * consistently in both directions (remote ordered before the inverse), and
+ * drop inverses the remote edit fully absorbed — an empty mapped inverse is
+ * an identity op, so deeper entries still line up.
+ */
+function mapBranch(branch: readonly ChangeSet[], remote: ChangeDesc): ChangeSet[] {
+  const result: ChangeSet[] = [];
+  let mapping = remote;
+  for (let index = branch.length - 1; index >= 0; index--) {
+    const inverse = branch[index];
+    const mapped = inverse.map(mapping);
+    mapping = mapping.mapDesc(inverse, true);
+    if (!mapped.empty) result.push(mapped);
+  }
+  return result.reverse();
+}
 
 type CollaborativeShareHtmlOptions = {
   slug: string;
@@ -171,10 +273,13 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
     return { anchor_start:start+left, anchor_end:start+left+quote.length, quote:quote };
   }
   function resolvedAnchor(comment, text){
+    // Stored offsets are the anchor authority: the server maps them through
+    // every accepted update (assoc -1 start / +1 end) and rewrites them via
+    // DocumentCollab.remapCommentAnchors. The quote-substring fallback was
+    // deleted — a moved or repeated quote must surface as drift ("Text
+    // moved"), never highlight a guessed occurrence at the wrong position.
     var start = Number(comment.anchor_start), end = Number(comment.anchor_end);
-    if (text.slice(start,end) === comment.quote) return { start:start, end:end, drifted:false };
-    var first = text.indexOf(comment.quote);
-    if (first !== -1 && text.indexOf(comment.quote,first+1) === -1) return { start:first, end:first+comment.quote.length, drifted:true };
+    if (end > start && text.slice(start,end) === comment.quote) return { start:start, end:end };
     return null;
   }
   function wrapAnchor(root, anchor, id){

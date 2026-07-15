@@ -6,6 +6,7 @@ import {
   changeSetToWire,
   decodeRoomText,
   encodeRoomText,
+  mapRoomTextAnchors,
   rebaseRoomTextChange,
   replayRoomText,
   roomTextByteLength,
@@ -94,6 +95,49 @@ describe("RoomText changes", () => {
 
     expect(final.doc.toString()).toBe("aXYb");
     expect(rebased.length).toBe(current.doc.length);
+  });
+
+  it("maps comment anchors across insert-before, insert-inside, and insert-after", () => {
+    // "hello world notes" with an anchor on "world" [6, 11).
+    const anchor = { id: "c1", start: 6, end: 11 };
+    const docLength = "hello world notes".length;
+
+    const before = changeSetFromWire([{ from: 0, to: 0, insert: ">> " }], docLength);
+    expect(mapRoomTextAnchors(before, [anchor])).toEqual([{ id: "c1", start: 9, end: 14 }]);
+
+    const inside = changeSetFromWire([{ from: 8, to: 8, insert: "XX" }], docLength);
+    expect(mapRoomTextAnchors(inside, [anchor])).toEqual([{ id: "c1", start: 6, end: 13 }]);
+
+    const after = changeSetFromWire([{ from: 12, to: 12, insert: "more " }], docLength);
+    expect(mapRoomTextAnchors(after, [anchor])).toEqual([{ id: "c1", start: 6, end: 11 }]);
+  });
+
+  it("absorbs typing at anchor edges: assoc -1 start, assoc +1 end", () => {
+    const anchor = { id: "c1", start: 6, end: 11 };
+    const docLength = "hello world notes".length;
+
+    // Insert exactly at the start: the start stays put (assoc -1), so the
+    // typed text lands inside the anchored range.
+    const atStart = changeSetFromWire([{ from: 6, to: 6, insert: "aa" }], docLength);
+    expect(mapRoomTextAnchors(atStart, [anchor])).toEqual([{ id: "c1", start: 6, end: 13 }]);
+
+    // Insert exactly at the end: the end moves past it (assoc +1).
+    const atEnd = changeSetFromWire([{ from: 11, to: 11, insert: "bb" }], docLength);
+    expect(mapRoomTextAnchors(atEnd, [anchor])).toEqual([{ id: "c1", start: 6, end: 13 }]);
+  });
+
+  it("collapses an anchor whose text a deletion removed, and clamps stale offsets", () => {
+    const anchor = { id: "c1", start: 6, end: 11 };
+    const docLength = "hello world notes".length;
+
+    const deletion = changeSetFromWire([{ from: 5, to: 12, insert: "" }], docLength);
+    const collapsed = mapRoomTextAnchors(deletion, [anchor]);
+    expect(collapsed).toEqual([{ id: "c1", start: 5, end: 5 }]);
+
+    // Anchors are advisory observer state: out-of-range offsets clamp to the
+    // document instead of failing an already committed update.
+    const stale = mapRoomTextAnchors(deletion, [{ id: "c2", start: 500, end: 900 }]);
+    expect(stale).toEqual([{ id: "c2", start: 10, end: 10 }]);
   });
 
   it("replays a contiguous tail and rejects a missing revision", () => {

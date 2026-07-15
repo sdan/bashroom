@@ -173,9 +173,17 @@ requests.
   links may expose a file or room prefix anonymously. Comment/Edit links are
   exact-file capabilities and require a separate Bashroom account identity.
 - `DocumentCollab` is keyed by the canonical R2 document identity, so all role
-  links for that file share one inline comment thread. Anchors keep rendered
-  text offsets plus the selected quote; the client re-anchors a unique quote
-  after nearby edits and marks ambiguous/missing anchors as moved.
+  links for that file share one inline comment thread. Stored offsets are the
+  anchor authority: a RoomText push may carry open-comment anchors and the
+  accept result returns them mapped through the accepted canonical ChangeSet
+  (`mapPos` assoc -1 for start / +1 for end — typing at an edge stays inside
+  the anchor); the host persists them via `remapCommentAnchors`, which skips
+  resolved comments. Until the RoomText cutover wires that push path into the
+  live share flow, nothing rewrites offsets after an edit, so a stale anchor
+  simply surfaces as drift. The client renders an anchor only when the stored range
+  still matches the quote and otherwise shows drift — the quote-substring
+  re-anchoring fallback was deleted so a repeated or moved quote can never
+  highlight the wrong occurrence.
 - Active content types from shares are downgraded to text and rendered
   Markdown is sanitized under a restrictive CSP. Mermaid fences render in
   strict mode; ASCII/text diagram fences remain source-faithful.
@@ -287,6 +295,16 @@ The workerd and cross-library results are in
 until the production cutover can make it the sole authority. Dual-writing R2
 and SQLite cannot be atomic and would create split-brain. Until that cutover,
 all current R2/etag behavior documented above remains the product truth.
+
+**Selective undo is local inverses remapped over remote updates.**
+`SelectiveUndoHistory` in `src/web-collab.ts` stores inverses of this
+client's OWN changesets only; transactions marked remote (the
+`receiveUpdates` path) never enter history — origin wins even when a
+dispatch wrapper forces `addToHistory` — they only remap the stored
+inverses through the OT cascade, so each undo target survives concurrent
+edits. `undo()`/`redo()` return a brand-new forward changeset the caller
+submits through the normal push pipeline: a new revision, never a revision
+rollback (Figma rule: undo-copy-redo must not change the document).
 
 **Durable Objects are small synchronous arbiters, never large
 orchestrators.** Measured (NOTES.md): request delivery is strictly

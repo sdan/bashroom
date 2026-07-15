@@ -4,10 +4,12 @@
   "compatibility_date": "2026-06-24",
   "durable_objects": {
     "bindings": [
-      { "name": "ROOM_TEXT_PROBE", "class_name": "RoomTextProbe" }
+      { "name": "ROOM_TEXT_PROBE", "class_name": "RoomTextProbe" },
+      { "name": "DOCUMENT_COLLAB_PROBE", "class_name": "DocumentCollab" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["RoomTextProbe"] }
+    { "tag": "v1", "new_sqlite_classes": ["RoomTextProbe"] },
+    { "tag": "v2", "new_sqlite_classes": ["DocumentCollab"] }
   ]
 }
