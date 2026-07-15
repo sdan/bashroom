@@ -5,6 +5,30 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-15 — Chunk-aligned hashing: adopt with a size gate (Experiment 2)
+
+Hypothesis: caching per-node content hashes keyed by rope-node identity
+(WeakMap = the pointer-equality trick) makes per-revision document hashing
+O(dirty spine). Mergeable hash: polynomial with length-aware combine
+(h1·B^len2 + h2 mod p) so subtree hashes merge in O(1) and the root equals
+a straight hash of the content — structure-independent, which the gate
+verified on all seven traces (byte-exact finals, roots equal from-scratch).
+Rig: benchmarks/room-text/hash-benchmark.ts.
+
+Pre-registered rule (adopt if ≤15% of full-rehash at median): PASSED at
+7.5% median — 2.0–9.4% on six traces (rustcode: 143.0s full vs 2.9s incr;
+automerge-paper: 17.3min vs 98s). EXCEPTION: the 21KB trace ran at 125% —
+below ~32KB, walking the tree costs more than hashing the document.
+
+Design for the digest index, settled by data: size-gated. Small docs
+(< ~32KB) hash whole content — they materialize snapshot bytes per
+revision anyway under the snapshot-cadence policy, so hash those bytes
+inline. Larger docs use dirty-spine incremental with the WeakMap cache.
+Constraint discovered at design time: crypto.subtle.digest is async — a
+non-storage await the discipline test forbids — so the production hash
+must be synchronous (two-modulus polynomial or sync WASM xxhash/blake3).
+Leaves-hashed ≈ revisions confirms ~1 dirty chunk per edit.
+
 ## 2026-07-15 — utf8Length: 1.8–2.7× on every editing trace (allocation, not algorithm)
 
 Hypothesis (vmg-style): the RoomText hot path paid TextEncoder.encode() —
