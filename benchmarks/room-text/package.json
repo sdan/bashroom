@@ -16,10 +16,12 @@
     "@liveblocks/client": "3.22.0",
     "@liveblocks/yjs": "3.22.0",
     "editing-traces": "https://github.com/streamich/editing-traces/archive/71c6d732956dbe08a490f8cd9764214bd3d4c9b7.tar.gz",
-    "json-joy": "18.28.0",
     "liveblocks": "1.6.2",
     "tsx": "4.20.6",
     "ws": "8.21.0",
     "yjs": "13.6.31"
+  },
+  "devDependencies": {
+    "json-joy": "^18.28.0"
   }
 }

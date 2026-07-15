@@ -5,6 +5,28 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-16 — The tie test: json-joy behind the identical surface (prediction hit)
+
+Prediction pre-registered before the first run: json-joy mounted behind the
+IDENTICAL WebSocket surface, same DO, same durability parity (every patch
+persisted via sql.exec behind the output gate), same 25ms one-way simulated
+network, same scenario, would land within ±10ms of RoomText's 54ms p50.
+
+Result: 54ms p50 — a dead tie to the millisecond (p95 56ms vs 67ms, run
+variance). Zero keystrokes lost by both engines; both merged the concurrent
+agent write byte-perfectly. Driver: benchmarks/room-text/ab-tie.mjs; engine:
+the jj-* frames in scripts/room-text-probe/worker.ts (benchmark-only,
+json-joy + tslib are root devDependencies for the probe bundle).
+
+What this settles: at system scale the text engine is invisible — network
+and durability own the latency budget entirely (engine transform time is
+2–12µs inside a 54ms round trip). Engine choice is therefore decided by the
+OTHER dimensions: bounded state vs history-growing metadata, stale-work
+rebase scaling, exact-bytes-as-canonical-state, and dumb-client writers.
+"Faster than json-joy" is not a claim we make; "the engine difference
+cannot be observed behind a real network, and ours stays small and speaks
+filesystem" now has a predicted-then-measured null result behind it.
+
 ## 2026-07-16 — Cutover A/B: the deciding experiment (rule PASSED)
 
 The scenario that breaks production (agent whole-file write while a human

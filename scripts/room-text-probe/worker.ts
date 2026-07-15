@@ -19,8 +19,23 @@ import {
   type RoomTextServerFrame,
 } from "../../src/room-text-client";
 import { DocumentCollab, type RemapCommentAnchorInput } from "../../src/document-collab";
+// Tie-test only (benchmarks/room-text/ab-tie.mjs): the CRDT contender behind
+// the identical socket + durability pattern. Not a production dependency.
+import { Model } from "json-joy/lib/json-crdt/index.js";
+import { Patch } from "json-joy/lib/json-crdt-patch/index.js";
 
 export { DocumentCollab };
+
+function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, "0");
+  return out;
+}
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
 
 type Env = {
   ROOM_TEXT_PROBE: DurableObjectNamespace<RoomTextProbe>;
@@ -119,6 +134,8 @@ export class RoomTextProbe extends DurableObject<Env> {
       }
     } else if (frame.type === "ping") {
       this.sendFrame(ws, { type: "pong", at: frame.at });
+    } else if (typeof (frame as { type?: string }).type === "string" && (frame as { type: string }).type.startsWith("jj-")) {
+      this.handleJJ(ws, frame as never);
     }
   }
 
@@ -259,6 +276,70 @@ export class RoomTextProbe extends DurableObject<Env> {
 
   private sendFrame(ws: WebSocket, frame: RoomTextServerFrame): void {
     ws.send(JSON.stringify(frame));
+  }
+
+  // ── json-joy tie-test engine (benchmark-only, same socket, same DO) ──
+  // Parity with the RoomText path: every accepted patch is persisted via a
+  // synchronous sql.exec (the output gate holds the ack until durable) and
+  // acceptance broadcasts to every attached socket, echo-as-ack included.
+  // The canonical Model lives in memory and rebuilds from the patch log.
+  private jjModels = new Map<string, InstanceType<typeof Model>>();
+
+  private jjLoad(fileId: string) {
+    let model = this.jjModels.get(fileId);
+    if (model) return model;
+    model = Model.create();
+    const rows = this.ctx.storage.sql
+      .exec<{ patch_hex: string }>("SELECT patch_hex FROM jj_patches WHERE file_id = ? ORDER BY seq", fileId)
+      .toArray();
+    for (const row of rows) model.applyPatch(Patch.fromBinary(hexToBytes(row.patch_hex)));
+    this.jjModels.set(fileId, model);
+    return model;
+  }
+
+  private handleJJ(ws: WebSocket, frame: { type: string; fileId: string; token?: string; patchHex?: string }): void {
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS jj_patches (file_id TEXT NOT NULL, seq INTEGER NOT NULL, patch_hex TEXT NOT NULL, PRIMARY KEY (file_id, seq))",
+    );
+    if (frame.type === "jj-create") {
+      const model = Model.create();
+      model.api.set("");
+      const patch = model.api.flush();
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO jj_patches (file_id, seq, patch_hex) VALUES (?, 0, ?)",
+        frame.fileId, bytesToHex(patch.toBinary()),
+      );
+      this.jjModels.set(frame.fileId, model);
+      this.sendFrame(ws, { type: "jj-created", fileId: frame.fileId } as never);
+      return;
+    }
+    const model = this.jjLoad(frame.fileId);
+    if (frame.type === "jj-connect") {
+      ws.serializeAttachment({ jjFile: frame.fileId });
+      this.sendFrame(ws, { type: "jj-hydration", modelHex: bytesToHex(model.toBinary()) } as never);
+      return;
+    }
+    if (frame.type === "jj-open") {
+      this.sendFrame(ws, { type: "jj-content", content: model.view() } as never);
+      return;
+    }
+    if (frame.type === "jj-push" && frame.patchHex) {
+      model.applyPatch(Patch.fromBinary(hexToBytes(frame.patchHex)));
+      const seq = Number(this.ctx.storage.sql
+        .exec<{ n: number }>("SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM jj_patches WHERE file_id = ?", frame.fileId)
+        .one().n);
+      this.ctx.storage.sql.exec(
+        "INSERT INTO jj_patches (file_id, seq, patch_hex) VALUES (?, ?, ?)",
+        frame.fileId, seq, frame.patchHex,
+      );
+      const out = JSON.stringify({ type: "jj-updates", updates: [{ token: frame.token, patchHex: frame.patchHex }] });
+      for (const socket of this.ctx.getWebSockets()) {
+        const attachment = (socket.deserializeAttachment() || {}) as { jjFile?: string };
+        if (attachment.jjFile === frame.fileId) {
+          try { socket.send(out); } catch { /* mid-close */ }
+        }
+      }
+    }
   }
 
   /** Real alarm wiring for the janitor; only the target read awaits storage. */
