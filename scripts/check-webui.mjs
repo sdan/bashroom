@@ -26,5 +26,19 @@ try {
 const m = html.match(/<script>\s*\(\(\) => \{[\s\S]*?\}\)\(\);\s*<\/script>/);
 if (!m) { console.error("main script block not found in evaluated HTML"); process.exit(1); }
 const js = m[0].replace(/^<script>/, "").replace(/<\/script>$/, "");
+for (const required of [
+  "view.state.selection.main.head",
+  "placeRemoteCaret(article, content, caret, actor, actorColor(actor))",
+  "mountEl.onpointerup = streamDraft",
+]) {
+  if (!js.includes(required)) {
+    console.error("cursor collaboration wiring missing: " + required);
+    process.exit(1);
+  }
+}
+if (js.includes('if (msg.actor === String(state.handle || "")) return;')) {
+  console.error("same-account collaboration frames are still discarded");
+  process.exit(1);
+}
 writeFileSync(process.argv[3], js);
 console.log("extracted", js.length, "chars (faithful template evaluation)");

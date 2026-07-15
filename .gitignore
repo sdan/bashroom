@@ -11,12 +11,6 @@ npm-debug.log*
 # Kept locally as the rollback artifact; not for git history.
 backup/
 
-# Web HTML kept private — landing, device pages, and reader.
-# These exist on the deployed worker but are not source-public.
-src/web-landing.ts
-src/web-device.ts
-src/web-ui.ts
-
 # Skills installed via `npx skills add` — vendor cache, not project source.
 .agents/
 skills-lock.json
@@ -37,3 +31,4 @@ docs/harness-vs-claude-code.md
 # ~/.bashroom-metrics-patch, not in the public repo.
 scripts/usage.ts
 usage-report.*
+benchmarks/room-text/node_modules/

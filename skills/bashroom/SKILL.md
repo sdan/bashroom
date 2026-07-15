@@ -11,7 +11,7 @@ FUSE-mounted from Cloudflare R2. Use it like any Linux shell — there
 is no hidden command parser. Room admin is exposed through the visible
 `bashroom` executable inside the sandbox.
 
-A second tool, `bashroom_write({ path, content, encoding? })`, writes a
+A second tool, `bashroom_write({ path, content, encoding?, base_etag? })`, writes a
 file directly without going through bash — use it when content has
 quotes, backticks, `$variables`, or arbitrary bytes that would fight
 shell quoting (see [bashroom_write](#bashroom_write) below).
@@ -20,6 +20,11 @@ Read-only context tools (`bashroom_tree`, `bashroom_read`,
 `bashroom_search`, `bashroom_stat`) read directly from R2 without
 starting bash. Prefer them over `tree`, `cat`, or broad `rg` when you
 want bounded, predictable model context.
+
+Role-link tools (`bashroom_shared_read`, `bashroom_shared_write`,
+`bashroom_shared_comment`) open one document another Bashroom user shared
+without mounting that user's room. The link grants scope; your own Bashroom
+token supplies the audited actor identity.
 
 ## Start
 
@@ -41,9 +46,7 @@ bashroom rooms                    # list rooms you can access
 bashroom create-room my-room      # create and seed a room
 bashroom mounts                   # list mounted rooms with actor + scopes
 bashroom who my-room              # list actors in a room
-bashroom history my-room          # per-room audit log
-bashroom pair my-room             # mint a short-lived invite
-bashroom join <invite>            # redeem an invite
+bashroom history my-room          # per-room activity log (not file versions)
 ```
 
 `bashroom login`, `bashroom token`, `bashroom mcp`, and
@@ -83,23 +86,24 @@ from the next call.
 
 When file content contains quotes, backticks, `$variables`, or arbitrary
 bytes, heredocs and `echo >` get mangled by shell quoting. Use the
-`bashroom_write` tool instead — it calls the sandbox's `writeFile`
-directly, bypassing bash entirely:
+`bashroom_write` tool instead — it writes the authorized object directly
+to R2, bypassing bash and sandbox startup entirely:
 
 ```jsonc
 bashroom_write({
   "path": "/rooms/my-room/notes/snippet.md",  // must be under /rooms/<room>/
   "content": "anything: `backticks`, $vars, \"quotes\", newlines — all literal",
-  "encoding": "utf-8"   // "utf-8" (default) | "base64" for binary
+  "encoding": "utf-8",  // "utf-8" (default) | "base64" for binary
+  "base_etag": "etag from bashroom_read or bashroom_stat" // optional CAS guard
 })
 ```
 
-- **Path must be under `/rooms/`** — writes elsewhere don't persist
-  (the sandbox is ephemeral; only `/rooms` is R2-backed) and are rejected.
-- **No parent-dir creation.** If the target's folder doesn't exist yet,
-  the write fails — `mkdir -p` it first via the `bashroom` tool, or write
-  into an existing folder.
-- **5 MB cap** per write.
+- **Path must name a file under `/rooms/<room>/`**, and the caller must have
+  that room's `write` scope.
+- **5 MB decoded-byte cap** per write. Base64 is validated before decoding.
+- **Prefer `base_etag` for replacements.** A stale etag returns `conflict`
+  instead of silently overwriting another writer. Omit it only when an
+  unconditional replacement is intentional.
 
 Prefer plain `>>`/`cat` for ordinary appends; reach for `bashroom_write`
 specifically when quoting would otherwise corrupt the content.
@@ -115,6 +119,35 @@ specifically when quoting would otherwise corrupt the content.
   over text files. Use `bashroom` + `rg` for regex or advanced search.
 - `bashroom_stat({ path })` returns R2 metadata for one file without
   reading its body.
+
+## Shared document links
+
+When the user gives you a Bashroom Comment or Edit link, do not look for its
+document under `/rooms`; role links deliberately do not create room membership.
+
+```jsonc
+bashroom_shared_read({ "link": "https://bashroom.sdan.io/s/<slug>" })
+bashroom_shared_write({
+  "link": "https://bashroom.sdan.io/s/<slug>",
+  "content": "complete replacement body",
+  "base_etag": "etag from bashroom_shared_read"
+})
+bashroom_shared_comment({
+  "link": "https://bashroom.sdan.io/s/<slug>",
+  "quote": "exact unique visible text",
+  "body": "the inline comment",
+  "document_etag": "etag from bashroom_shared_read"
+})
+```
+
+- View links are anonymous browser links and are not accepted by shared MCP
+  mutation tools.
+- Comment links permit read + inline comment. Edit links also permit CAS
+  replacement.
+- Always read first and pass `base_etag` when editing. A stale save returns
+  `conflict`, never a silent overwrite.
+- Prefer a unique visible `quote`; the browser uses it to re-anchor the comment
+  if nearby edits changed its stored rendered-text offset.
 
 ## Tools
 
@@ -155,7 +188,8 @@ why, the dead ends, the next move.
 
 - **Coordinates over content.** Prefer commit hashes + file paths over pasted
   code. Cheaper in tokens, and never goes stale.
-- **No secrets.** No keys, tokens, or PII — rooms are shared and versioned.
+- **No secrets.** No keys, tokens, or PII. Activity history is not file
+  version recovery.
 
 **Where.** Append to the project room's `log/YYYY-MM-DD.md` under a
 `## HH:MM <topic> — handoff` heading. Append (`>>`), never overwrite. Update
@@ -212,9 +246,10 @@ that room's `index.md` only if its file tree changed.
 
 ## Gotchas
 
-- **Each MCP call is a fresh shell session.** `cwd`, environment
-  variables, shell variables, and shell functions do NOT persist. Only
-  `/rooms` (R2-backed) persists. Always use absolute paths.
+- **Each MCP call is a fresh process session.** `cwd`, environment
+  variables, shell variables, and shell functions do NOT persist. The warm
+  sandbox filesystem can persist; `/rooms` is durable R2. Always use absolute
+  paths.
 - **`/tmp` is shared across this user's concurrent sessions**, unlike
   `cwd`/env. Don't rely on it for per-call scratch; use `/rooms` or
   unique temp names if you write to `/tmp`.
@@ -225,9 +260,8 @@ that room's `index.md` only if its file tree changed.
   arbitrary outbound HTTP remains unavailable.
 - **The 30-second command timeout** applies per call. Long-running work
   must be split, or it gets killed.
-- **R2 is strongly consistent per key**, so a `cat` after `>>` in the
-  next session sees the appended content. But `ls` listings may briefly
-  lag a write — re-run if a freshly-written file isn't visible.
+- **R2 is strongly consistent**, so the next read or listing sees a completed
+  write.
 - **No hidden command interception.** `bashroom create-room ...` works
   because `/usr/local/bin/bashroom` is on `PATH`; ordinary commands still
   run as real bash.

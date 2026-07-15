@@ -7,8 +7,8 @@ Agents get real `bash` plus structured R2-backed file/context tools. The
 shell runs inside a Cloudflare Sandbox, with `/rooms` FUSE-mounted from
 Cloudflare R2. The structured tools (`tree`, `read`, `search`, `stat`) read
 directly from R2 without booting a sandbox. Bashroom handles access control,
-durable room files, and audit. Room admin (create, join, pair, mounts, who,
-history) is also available inside the sandbox through the visible `bashroom`
+durable room files, and audit. Room admin (create, mounts, who, history) is
+also available inside the sandbox through the visible `bashroom`
 helper. Destructive room deletion stays on the laptop CLI.
 
 ## Connect
@@ -29,15 +29,18 @@ The local MCP proxy reads `~/.bashroom/config.json` and sends auth to the hosted
 
 ## Model
 
-The MCP exposes six tools:
+The MCP exposes nine tools:
 
 ```text
 bashroom({ command, stdin? })
-bashroom_write({ path, content, encoding? })
+bashroom_write({ path, content, encoding?, base_etag? })
 bashroom_tree({ path, max_entries? })
 bashroom_read({ path, offset?, max_bytes? })
 bashroom_search({ path, query, case_sensitive?, max_matches?, max_files?, max_bytes_per_file? })
 bashroom_stat({ path })
+bashroom_shared_read({ link, max_bytes? })
+bashroom_shared_write({ link, content, base_etag })
+bashroom_shared_comment({ link, quote, body, document_etag?, anchor_start? })
 ```
 
 Use `bashroom` when you need real command execution. Use the structured tools
@@ -65,9 +68,10 @@ bashroom_search({ "path": "/rooms/my-room", "query": "decision" })
 bashroom_stat({ "path": "/rooms/my-room/index.md" })
 ```
 
-Each MCP call gets a fresh session — cwd, env, and `/tmp` do not leak
-between calls. Only `/rooms` (R2-backed) persists. The sandbox stays warm
-between calls for ~15 minutes, so subsequent calls skip the cold-start tax.
+Each MCP call gets a fresh process session, so cwd and environment variables
+do not carry over. The warm sandbox filesystem is shared: `/rooms` is durable
+R2 storage and `/tmp` may survive or be visible to concurrent calls. Never use
+`/tmp` for secrets or coordination. The sandbox stays warm for ~15 minutes.
 
 ## Shell tools
 
@@ -85,11 +89,9 @@ From the laptop CLI:
 ```bash
 bashroom mounts                       # list your rooms
 bashroom create-room <name>           # create a new room
-bashroom join <invite>                # redeem a pair-code invite
-bashroom pair <room>                  # mint an invite to share
 bashroom destroy <room> --yes         # remove a room
 bashroom who <room>                   # list actors in a room
-bashroom history <room> [--limit N]   # per-room audit log
+bashroom history <room> [--limit N]   # per-room activity log (not versions)
 ```
 
 Inside the sandbox, `/usr/local/bin/bashroom` supports the non-destructive
@@ -101,8 +103,6 @@ bashroom create-room <name>
 bashroom mounts
 bashroom who <room>
 bashroom history <room> [--limit N]
-bashroom pair <room>
-bashroom join <invite>
 ```
 
 The sandbox helper sends no account token. Calls to `bashroom.internal`
@@ -118,21 +118,20 @@ The recommended MCP setup is local stdio: `bashroom mcp` reads the local token a
 
 Remote HTTP MCP is also available at `https://bashroom.sdan.io/mcp`.
 
-Pair codes are one-time invites. They expire after 10 minutes and mint a token when redeemed. Pair codes are case-insensitive, and `join` accepts invite URIs such as `bashroom://join/syncing-reviewing-shipping?code=M2Q4-K7P9`.
+Cross-account shared rooms are not a supported contract yet. Pair/join was
+removed because the current per-user R2 ownership model cannot provide a
+correct shared storage identity. Role links are narrower and supported: a
+View link is anonymous, while Comment and Edit links require the recipient's
+own Bashroom account and grant access to exactly one owner-scoped document.
+Agents use the `bashroom_shared_*` tools with the same links; they are not
+mounted into the owner's room.
 
 The public service does not expose global room lists, global actor lists, public search, or unauthenticated reads.
 
 ## Network
 
-Network is disabled in the public shell by default, except for the
-private `bashroom.internal` control channel used by the sandbox helper.
-A self-hosted deployment can opt into full `curl` support with:
-
-```text
-BASHROOM_ENABLE_FULL_NETWORK=1
-```
-
-This flag is intentionally explicit because full outbound network makes a public service behave like a proxy.
+Network is disabled in the public shell except for the private
+`bashroom.internal` control channel used by the sandbox helper.
 
 ## CLI
 
@@ -149,13 +148,25 @@ bashroom 'ls /rooms'
 bashroom 'cat /rooms/my-room/index.md'
 ```
 
-The CLI stores account tokens and local MCP-style session ids at `~/.bashroom/config.json` with file mode `0600`.
+The CLI stores account tokens at `~/.bashroom/config.json` with file mode `0600`.
 
 ## Web
 
-A read-only browser view of your rooms is served at `/web`. Paste your account token (from `~/.bashroom/config.json`) once; the sidebar lists every room as a collapsible section, each expanding into a file tree. Clicking a file renders the Markdown in the content pane. No editor — agents write through MCP, humans read through the web.
+A browser reader/editor is served at `/web`. Paste your account token once;
+the sidebar lists your rooms and file trees. Members with `write` scope can
+edit files with etag-based conflict detection; read-only members can only view.
+
+The Share menu creates separate View, Comment, and Edit links. Inline comments
+are quote-anchored and keep actor identity. Shared pages show viewer count,
+ephemeral live drafts, and an actor-labeled live cursor. Durable saves still
+use etag conflict checks rather than CRDT merging. Mermaid fences render in
+strict mode; `ascii`, `text`, `diagram`, and `art` fences preserve diagram
+spacing. Use Preview in the private editor to render these richer blocks.
 
 Two panes, Notion-shape: sidebar plus content. Single inline HTML served from the worker — no build, no framework.
+
+`bashroom history` is an activity log for shell commands and direct web/MCP
+writes. It is not file version history and cannot restore deleted content.
 
 ## Agent-readable
 
@@ -177,7 +188,7 @@ build time so there's one source of truth.
 Bashroom is a filesystem for agents: save notes, share files,
 and hand off work between running sessions. The v3 architecture is documented
 in `ARCHITECTURAL.md`; the product sequence is in `docs/product-roadmap.md`;
-how the six-tool harness compares to Claude Code's is in
+how the nine-tool harness compares to Claude Code's is in
 `docs/harness-vs-claude-code.md`.
 
 ## Self-host

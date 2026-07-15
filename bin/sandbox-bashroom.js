@@ -18,8 +18,6 @@ Room admin:
   bashroom mounts
   bashroom who <room>
   bashroom history <room> [--limit N]
-  bashroom pair <room>
-  bashroom join <invite> [--actor <actor>]
 
 Local bash fallback:
   bashroom <bash command>
@@ -120,24 +118,6 @@ async function roomHistory(args) {
   }
 }
 
-async function pairRoom(args) {
-  const room = args[0] || "";
-  if (!room) throw new Error("usage: bashroom pair <room>");
-  const result = await api("/account/room-pair", { wiki: room });
-  console.log(result.invite);
-  console.log(`code ${result.code}`);
-  console.log(`expires ${result.expires_at}`);
-}
-
-async function joinRoom(args) {
-  const mutableArgs = [...args];
-  const actor = parseFlag(mutableArgs, "--actor") || defaultActor();
-  const invite = mutableArgs[0] || "";
-  if (!invite) throw new Error("usage: bashroom join <invite> [--actor X]");
-  const result = await api("/account/room-join", { invite, actor });
-  console.log(`joined ${result.wiki}`);
-}
-
 function laptopOnly(command) {
   console.error(`bashroom ${command} is laptop-only. Run it from your terminal where the Bashroom CLI is installed.`);
   process.exit(1);
@@ -175,9 +155,6 @@ async function main() {
   if (args[0] === "mounts") return listMounts();
   if (args[0] === "who") return whoInRoom(args.slice(1));
   if (args[0] === "history") return roomHistory(args.slice(1));
-  if (args[0] === "pair") return pairRoom(args.slice(1));
-  if (args[0] === "join") return joinRoom(args.slice(1));
-
   runLocalBash(args);
 }
 

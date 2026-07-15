@@ -16,7 +16,10 @@ const end = src.lastIndexOf("`;");
 // serves. (The old regex-unescape silently fixed escape bugs that then
 // broke prod: \n inside the literal becomes a real newline in production.)
 let HTML = new Function("return `" + src.slice(start, end) + "`;")();
-HTML = HTML.replace("<body>", '<body><script>try{localStorage.setItem("bashroom.token","br_user_mockpreview")}catch(_){}</script>');
+// Anchor on the unique #app div, NOT on "<body>" — that string also appears
+// inside a CSS comment in the <style> block, where injected scripts land as
+// inert stylesheet text and never execute.
+HTML = HTML.replace('<div id="app">', '<script>try{localStorage.setItem("bashroom.token","br_user_mockpreview")}catch(_){}</script><div id="app">');
 
 const ROOMS = ["ant-takehome","milkdown-test","personal","sealist","quack","bashroom",
   "llmh-current","design","llmh-labs-mail","llmh-accel","vmux","geospot","jokegen",
@@ -59,6 +62,10 @@ const server = createServer(async (req, res) => {
     putCount += 1;
     return json(res, { ok: true, file: { path: p.path, content: p.content, etag: "e" + putCount, version: putCount + 3, size_bytes: (p.content || "").length, updated_at: new Date().toISOString(), is_binary: false } });
   }
+  if (url.pathname === "/web/api/share" && req.method === "POST") {
+    const p = JSON.parse(await readBody(req) || "{}");
+    return json(res, { ok: true, slug: "mock-" + (p.role || "view"), role: p.role || "view", url: "http://localhost:" + (Number(process.env.PORT) || 8123) + "/s/mock-" + (p.role || "view") });
+  }
   if (url.pathname === "/web/api/put-count") return json(res, { putCount });
   if (url.pathname === "/web/api/rooms") {
     const active = url.searchParams.get("active") || "";
@@ -83,7 +90,14 @@ const server = createServer(async (req, res) => {
     const room = url.searchParams.get("room");
     const path = url.searchParams.get("path");
     const rev = fileRev.get(room + "/" + path) || 0;
-    return json(res, { ok: true, file: { path, content: "# " + path + "\n\nMock body rev " + rev + " for **" + path + "**.\n\n- one\n- two\n", etag: "e1-r" + rev, version: 3 + rev, size_bytes: 123, updated_at: "2026-07-01T00:00:00Z", is_binary: false } });
+    return json(res, { ok: true, file: { path, content: "# " + path + "\n\nMock body rev " + rev + " for **" + path + "**.\n\n- one\n- two\n\n```mermaid\nflowchart LR\n  Agent --> Bashroom\n  Bashroom --> Document\n```\n\n```ascii\nagent ---> shared document\n```\n", etag: "e1-r" + rev, version: 3 + rev, size_bytes: 123, updated_at: "2026-07-01T00:00:00Z", is_binary: false } });
+  }
+  // Mirrors prod: /s/<slug> edit links serve the same SPA with an injected
+  // capability grant (single-document share mode, no sidebar).
+  if (url.pathname.startsWith("/s/")) {
+    const boot = '<script>window.BASHROOM_SHARE={slug:"mockslug",room:"ant-takehome",path:"index.md",role:"edit",'
+      + 'file:{path:"index.md",content:"# index.md\\n\\nInlined by the grant — painted with zero fetches.\\n",etag:"e-inline",updated_at:"2026-07-01T00:00:00Z",size_bytes:64,is_binary:false}};</script>';
+    return res.writeHead(200, { "content-type": "text/html" }).end(HTML.replace('<div id="app">', boot + '<div id="app">'));
   }
   res.writeHead(200, { "content-type": "text/html" }).end(HTML);
 });
@@ -122,7 +136,11 @@ server.on("upgrade", (req, socket, head) => {
     ws.send(JSON.stringify({
       type: "hello",
       recent: [{ ts: Date.now() - 120_000, actor: "codex", path: "notes/geozero.md", etag: "e-old" }],
-      viewers: roomSockets.get(room).size,
+      viewers: roomSockets.get(room).size + 2,
+      // Mirrors the RoomHub roster: signed-in handles plus animals dealt to
+      // anonymous share-link viewers.
+      roster: [{ name: "sdan" }, { name: "otter", anon: true }, { name: "capybara", anon: true }],
+      you: "sdan",
     }));
   });
 });

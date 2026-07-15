@@ -1,19 +1,11 @@
 #!/usr/bin/env node
 
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_URL = "https://bashroom.sdan.io";
 const CONFIG_PATH = path.join(os.homedir(), ".bashroom", "config.json");
-const MAX_WRITE_BYTES = 5_000_000;
-const MAX_MCP_READ_BYTES = 512_000;
-const MAX_MCP_TREE_ENTRIES = 1_000;
-const MAX_MCP_SEARCH_MATCHES = 200;
-const MAX_MCP_SEARCH_FILES = 1_000;
-const MAX_MCP_SEARCH_FILE_BYTES = 1_000_000;
-
 function usage() {
   return `bashroom
 
@@ -31,13 +23,10 @@ Account:
 Room admin:
   bashroom create-room [room] [--actor <actor>]
                                        Create a new room (room name optional; auto-slug if omitted).
-  bashroom join <invite> [--actor <actor>]
-                                       Redeem a pair-code invite.
-  bashroom pair <room>                 Mint an invite for an existing room.
   bashroom destroy <room> --yes        Destroy a room and purge its R2 storage.
   bashroom mounts                      List your mounted rooms with actor + scopes.
   bashroom who <room>                  List the actors present in a room.
-  bashroom history <room> [--limit N]  Per-room audit log (default 20 most recent).
+  bashroom history <room> [--limit N]  Per-room activity log (not file versions).
 
 Data:
   bashroom export [dir] [--room R]     Download rooms to a local directory tree
@@ -51,7 +40,6 @@ Examples:
   bashroom login
   bashroom rooms
   bashroom create-room suryad
-  bashroom pair suryad
   bashroom 'tree /rooms'
   bashroom 'cat /rooms/my-room/index.md'
   echo '# Notes' | bashroom 'cat > /rooms/my-room/notes.md'
@@ -65,7 +53,7 @@ Environment:
   BASHROOM_TOKEN  Optional bearer token mount.
 
 State:
-  The CLI stores account tokens and local MCP-style session ids at ${CONFIG_PATH}.
+  The CLI stores account tokens at ${CONFIG_PATH}.
 `;
 }
 
@@ -97,14 +85,6 @@ function writeConfig(config) {
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   fs.chmodSync(CONFIG_PATH, 0o600);
-}
-
-function sessionId(baseUrl) {
-  const config = readConfig();
-  config.sessions ||= {};
-  config.sessions[baseUrl] ||= crypto.randomUUID();
-  writeConfig(config);
-  return config.sessions[baseUrl];
 }
 
 function account(baseUrl) {
@@ -223,33 +203,6 @@ async function createRoom(baseUrl, args) {
   const room = mutableArgs[0] || "";
   const result = await api(baseUrl, "/account/room-create", { room, actor }, current.token);
   console.log(`created ${result.wiki}`);
-}
-
-// Redeem a pair-code invite — `bashroom join <invite> [--actor X]`.
-async function joinRoom(baseUrl, args) {
-  const current = account(baseUrl);
-  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
-
-  const mutableArgs = [...args];
-  const actor = parseFlag(mutableArgs, "--actor") || `cli-${os.hostname().replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 32)}`;
-  const invite = mutableArgs[0] || "";
-  if (!invite) throw new Error("usage: bashroom join <invite> [--actor X]");
-  const result = await api(baseUrl, "/account/room-join", { invite, actor }, current.token);
-  console.log(`joined ${result.wiki}`);
-}
-
-// Mint a pair-code invite for an existing room — `bashroom pair <room>`.
-// Output matches v1's `room pair` format exactly: 3 lines (URI, code, expiry).
-async function pairRoom(baseUrl, args) {
-  const current = account(baseUrl);
-  if (!current?.token) throw new Error("not logged in. Run: bashroom login");
-
-  const room = args[0] || "";
-  if (!room) throw new Error("usage: bashroom pair <room>");
-  const result = await api(baseUrl, "/account/room-pair", { wiki: room }, current.token);
-  console.log(result.invite);
-  console.log(`code ${result.code}`);
-  console.log(`expires ${result.expires_at}`);
 }
 
 // Destroy a room (drop Registry rows + purge R2 prefix). Hard-requires --yes.
@@ -399,7 +352,6 @@ function formatBytes(n) {
 async function runBash(baseUrl, command, stdin) {
   const headers = {
     "content-type": "application/json",
-    "mcp-session-id": sessionId(baseUrl),
   };
   const token = process.env.BASHROOM_TOKEN || process.env.INTRACODE_TOKEN;
   const current = account(baseUrl);
@@ -421,195 +373,51 @@ function accountToken(baseUrl) {
   return process.env.BASHROOM_TOKEN || process.env.INTRACODE_TOKEN || account(baseUrl)?.token || "";
 }
 
-function parseMcpSse(text) {
-  const dataLines = text
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data: "))
-    .map((line) => line.slice(6));
-  if (!dataLines.length) {
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`invalid MCP response: ${text.slice(0, 200)}`);
-    }
-  }
-  return JSON.parse(dataLines.join("\n"));
-}
-
-async function createRemoteMcpClient(baseUrl) {
+async function runStdioMcp(baseUrl) {
   const token = accountToken(baseUrl);
   if (!token) throw new Error("not logged in. Run: bashroom login");
-  let remoteSessionId = "";
-  let nextId = 1;
 
-  async function post(body) {
-    const headers = {
-      "content-type": "application/json",
-      accept: "application/json, text/event-stream",
-      authorization: `Bearer ${token}`,
-    };
-    if (remoteSessionId) headers["mcp-session-id"] = remoteSessionId;
-    const response = await fetch(`${baseUrl}/mcp`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
-    const text = await response.text();
-    if (!response.ok) throw new Error(text || response.statusText || "MCP request failed");
-    remoteSessionId = response.headers.get("mcp-session-id") || remoteSessionId;
-    const message = parseMcpSse(text);
-    if (message.error) throw new Error(message.error.message || "MCP error");
-    return message.result;
-  }
-
-  await post({
-    jsonrpc: "2.0",
-    id: nextId++,
-    method: "initialize",
-    params: {
-      protocolVersion: "2025-03-26",
-      capabilities: {},
-      clientInfo: { name: "bashroom-cli", version: "2.0.0" },
-    },
-  });
-
-  return {
-    async callTool(name, args) {
-      return post({
-        jsonrpc: "2.0",
-        id: nextId++,
-        method: "tools/call",
-        params: { name, arguments: args },
-      });
-    },
-  };
-}
-
-async function runStdioMcp(baseUrl) {
-  const [{ McpServer }, { StdioServerTransport }, { z }] = await Promise.all([
-    import("@modelcontextprotocol/sdk/server/mcp.js"),
+  const [
+    { Client },
+    { StreamableHTTPClientTransport },
+    { Server },
+    { StdioServerTransport },
+    { ListToolsRequestSchema, CallToolRequestSchema },
+  ] = await Promise.all([
+    import("@modelcontextprotocol/sdk/client/index.js"),
+    import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
+    import("@modelcontextprotocol/sdk/server/index.js"),
     import("@modelcontextprotocol/sdk/server/stdio.js"),
-    import("zod"),
+    import("@modelcontextprotocol/sdk/types.js"),
   ]);
 
-  const server = new McpServer({ name: "bashroom", version: "0.2.0" });
-  let remotePromise;
-  function remoteClient() {
-    remotePromise ||= createRemoteMcpClient(baseUrl);
-    return remotePromise;
-  }
+  const remoteTransport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+    requestInit: { headers: { authorization: `Bearer ${token}` } },
+  });
+  const remote = new Client({ name: "bashroom-cli", version: "2.0.1" }, { capabilities: {} });
+  await remote.connect(remoteTransport);
 
-  async function forwardTool(name, args) {
+  // The hosted Worker owns tool names, descriptions, schemas, and behavior.
+  // Stdio is deliberately a transparent transport adapter so those contracts
+  // cannot drift in two independently maintained implementations. It proxies
+  // only tool RPCs today; prompts, resources, and server notifications are not
+  // advertised or forwarded until the hosted Worker actually exposes them.
+  const server = new Server(
+    { name: "bashroom", version: "2.0.1" },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, (request) => remote.listTools(request.params));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
-      const remote = await remoteClient();
-      const result = await remote.callTool(name, args);
-      return {
-        content: result.content || [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        isError: Boolean(result.isError),
-      };
+      return await remote.callTool(request.params);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
       return {
-        content: [{ type: "text", text: `bashroom: ${message}` }],
+        content: [{ type: "text", text: `bashroom: ${error instanceof Error ? error.message : String(error)}` }],
         isError: true,
       };
     }
-  }
-
-  server.tool(
-    "bashroom",
-    "Run bash against durable Bashroom files. Use `bashroom create-room`, `bashroom rooms`, `bashroom mounts`, `bashroom who`, or `bashroom history` inside bash for room control.",
-    {
-      command: z.string().min(1).describe("Bash command to run, for example: bashroom mounts; cat /rooms/my-room/index.md"),
-      stdin: z.string().optional().describe("Optional standard input for the command."),
-    },
-    async ({ command, stdin }) => {
-      try {
-        const result = await runBash(baseUrl, command, stdin || "");
-        return {
-          content: [{ type: "text", text: formatMcpResult(result) }],
-          isError: (result.exitCode ?? 0) !== 0,
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const hint = message.toLowerCase().includes("token") || message.toLowerCase().includes("auth")
-          ? "\n\nHint: run `bashroom login` then `bashroom create-room` to set up auth."
-          : "";
-        return {
-          content: [{ type: "text", text: `bashroom: ${message}${hint}` }],
-          isError: true,
-        };
-      }
-    },
-  );
-
-  server.tool(
-    "bashroom_write",
-    "Write a file to /rooms directly, bypassing bash quoting. Use this instead of `echo ... > file` or heredoc when content contains quotes, backticks, $variables, or arbitrary bytes. The path must be inside /rooms/<room>/.",
-    {
-      path: z.string().min(1).max(1024).describe("Absolute path under /rooms, e.g. /rooms/my-room/notes/today.md"),
-      content: z.string().max(MAX_WRITE_BYTES).describe("File content. UTF-8 by default; pass base64-encoded bytes with encoding='base64' for binary."),
-      encoding: z.enum(["utf-8", "base64"]).optional().describe("'utf-8' (default) treats content as text; 'base64' decodes content as binary before writing."),
-    },
-    async (args) => forwardTool("bashroom_write", { ...args, encoding: args.encoding ?? "utf-8" }),
-  );
-
-  server.tool(
-    "bashroom_tree",
-    "List rooms or files directly from R2 without starting bash. Use path='/rooms' to list rooms, or path='/rooms/<room>/<prefix>' to list bounded file metadata.",
-    {
-      path: z.string().default("/rooms").describe("Absolute path: /rooms to list rooms, or /rooms/<room>/<optional-prefix> to list files."),
-      max_entries: z.number().int().min(1).max(MAX_MCP_TREE_ENTRIES).optional().describe(`Maximum files to return, up to ${MAX_MCP_TREE_ENTRIES}.`),
-    },
-    async (args) => forwardTool("bashroom_tree", { ...args, path: args.path || "/rooms" }),
-  );
-
-  server.tool(
-    "bashroom_read",
-    "Read a bounded text range directly from R2 without starting bash. Use this instead of `cat` when you want predictable context size.",
-    {
-      path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/ARCHITECTURAL.md."),
-      offset: z.number().int().min(0).optional().describe("Byte offset to start reading from. Defaults to 0."),
-      max_bytes: z.number().int().min(1).max(MAX_MCP_READ_BYTES).optional().describe(`Maximum bytes to return, up to ${MAX_MCP_READ_BYTES}.`),
-    },
-    async (args) => forwardTool("bashroom_read", args),
-  );
-
-  server.tool(
-    "bashroom_search",
-    "Bounded literal text search over R2-backed room files without starting bash. Use bashroom for advanced rg/regex workflows.",
-    {
-      path: z.string().min(1).describe("Absolute room or prefix path under /rooms/<room>/, e.g. /rooms/bashroom/notes."),
-      query: z.string().min(1).max(256).describe("Literal text to search for."),
-      case_sensitive: z.boolean().optional().describe("Defaults to false."),
-      max_matches: z.number().int().min(1).max(MAX_MCP_SEARCH_MATCHES).optional().describe(`Maximum matches to return, up to ${MAX_MCP_SEARCH_MATCHES}.`),
-      max_files: z.number().int().min(1).max(MAX_MCP_SEARCH_FILES).optional().describe(`Maximum files to scan, up to ${MAX_MCP_SEARCH_FILES}.`),
-      max_bytes_per_file: z.number().int().min(1).max(MAX_MCP_SEARCH_FILE_BYTES).optional().describe(`Maximum bytes to scan per file, up to ${MAX_MCP_SEARCH_FILE_BYTES}.`),
-    },
-    async (args) => forwardTool("bashroom_search", args),
-  );
-
-  server.tool(
-    "bashroom_stat",
-    "Return R2 metadata for one file without reading its body: size, modified time, etag, version, content type, and custom metadata.",
-    {
-      path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/index.md."),
-    },
-    async (args) => forwardTool("bashroom_stat", args),
-  );
-
+  });
   await server.connect(new StdioServerTransport());
-}
-
-function formatMcpResult(result) {
-  const stdout = result.stdout || "";
-  const stderr = result.stderr || "";
-  const body = `${stdout}${stderr}`;
-  const paths = Array.isArray(result.changed_paths) && result.changed_paths.length
-    ? ` ${result.changed_paths.join(" ")}`
-    : "";
-  const tail = `[bashroom] exit=${result.exitCode ?? 0} changed=${result.changed ?? 0}${paths}`;
-  return body && !body.endsWith("\n") ? `${body}\n${tail}\n` : `${body}${tail}\n`;
 }
 
 async function main() {
@@ -646,16 +454,6 @@ async function main() {
 
   if (args[0] === "create-room") {
     await createRoom(baseUrl, args.slice(1));
-    return;
-  }
-
-  if (args[0] === "join") {
-    await joinRoom(baseUrl, args.slice(1));
-    return;
-  }
-
-  if (args[0] === "pair") {
-    await pairRoom(baseUrl, args.slice(1));
     return;
   }
 
