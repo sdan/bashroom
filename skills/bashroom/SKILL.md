@@ -146,8 +146,9 @@ bashroom_shared_comment({
   replacement.
 - Always read first and pass `base_etag` when editing. A stale save returns
   `conflict`, never a silent overwrite.
-- Prefer a unique visible `quote`; the browser uses it to re-anchor the comment
-  if nearby edits changed its stored rendered-text offset.
+- Stored rendered-text offsets are the anchor authority; there is no quote
+  re-anchoring. A comment whose offsets no longer match its `quote` shows as
+  drifted ("Text moved") in the share page rather than highlighting a guess.
 
 ## Tools
 

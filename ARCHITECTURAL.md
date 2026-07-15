@@ -178,7 +178,9 @@ requests.
   accept result returns them mapped through the accepted canonical ChangeSet
   (`mapPos` assoc -1 for start / +1 for end — typing at an edge stays inside
   the anchor); the host persists them via `remapCommentAnchors`, which skips
-  resolved comments. The client renders an anchor only when the stored range
+  resolved comments. Until the RoomText cutover wires that push path into the
+  live share flow, nothing rewrites offsets after an edit, so a stale anchor
+  simply surfaces as drift. The client renders an anchor only when the stored range
   still matches the quote and otherwise shows drift — the quote-substring
   re-anchoring fallback was deleted so a repeated or moved quote can never
   highlight the wrong occurrence.
