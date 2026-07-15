@@ -22,9 +22,17 @@ const MAX_PERSISTED_JSON_BYTES = 1_700_000;
 const CHECKPOINT_EVERY_UPDATES = 128;
 const CHECKPOINT_TAIL_BYTES = 256_000;
 // With checkpoints at most 128 updates apart, retaining 384 at each checkpoint
-// keeps the physical log below 512 rows between pruning passes.
+// keeps the live sync window below 512 rows between floor advances.
 const RETAIN_HISTORY_UPDATES = 384;
 const RETAIN_HISTORY_BYTES = 8_000_000;
+// History compaction below the floor. SOFT: documents under this size keep
+// per-revision granularity — a full snapshot per revision costs R2 less than
+// composition loses in attribution. HARD: larger documents compose
+// consecutive same-client runs once this many ops or delta bytes accumulate
+// strictly below the floor.
+const SOFT_SNAPSHOT_DOC_BYTES = 8_000;
+const HARD_COMPACT_MIN_UPDATES = 256;
+const HARD_COMPACT_MIN_DELTA_BYTES = 64_000;
 const persistedJsonEncoder = new TextEncoder();
 
 type FileRow = {
@@ -143,6 +151,57 @@ export type PullRoomTextResult =
       epoch: number;
       revision: number;
       updates: CanonicalRoomTextUpdate[];
+    }
+  | RoomTextFailure;
+
+export type CompactHistoryResult =
+  | {
+      ok: true;
+      protocol: typeof ROOM_TEXT_PROTOCOL;
+      fileId: string;
+      epoch: number;
+      historyFloor: number;
+      mode: "soft" | "idle" | "compacted";
+      composedRows: number;
+      belowFloorUpdates: number;
+    }
+  | RoomTextFailure;
+
+// Host-facing artifact parts. snake_case fields mirror the R2 object layout:
+// the host PUTs them (create-only) under
+// rooms/<room>/.history/<file>/<epoch>@<revision>.
+export type RoomTextVersionArtifact =
+  | {
+      ok: true;
+      protocol: typeof ROOM_TEXT_PROTOCOL;
+      fileId: string;
+      path: string;
+      epoch: number;
+      revision: number;
+      snapshot_bytes: ArrayBuffer;
+      composed_changes_json: string;
+    }
+  | RoomTextFailure;
+
+export type RoomTextHeadManifest =
+  | {
+      ok: true;
+      protocol: typeof ROOM_TEXT_PROTOCOL;
+      fileId: string;
+      epoch: number;
+      revision: number;
+      manifestJson: string;
+    }
+  | RoomTextFailure;
+
+export type AdvanceFloorResult =
+  | {
+      ok: true;
+      protocol: typeof ROOM_TEXT_PROTOCOL;
+      fileId: string;
+      epoch: number;
+      historyFloor: number;
+      prunedUpdates: number;
     }
   | RoomTextFailure;
 
@@ -366,26 +425,15 @@ export class RoomTextStore {
             row.history_floor,
           );
           if (retainedFloor > row.history_floor) {
+            // The floor closes the sync window: a client based below it gets
+            // RESET_REQUIRED. Rows below the floor stay as cold history for
+            // the flush janitor — compactHistory bounds their accumulation
+            // and advanceFloorAfterFlush prunes them once R2 holds the
+            // version artifact. Request pointers survive with their rows, so
+            // a below-floor retry still dedupes until the flush.
             this.storage.sql.exec(
               "UPDATE room_text_files SET history_floor = ? WHERE file_id = ? AND epoch = ?",
               retainedFloor, normalized.fileId, row.epoch,
-            );
-            // Request pointers and canonical updates share one retention
-            // boundary. A retry older than the floor receives RESET_REQUIRED
-            // instead of being accidentally applied as a new mutation.
-            this.storage.sql.exec(
-              `DELETE FROM room_text_requests
-                WHERE file_id = ? AND epoch = ? AND revision < ?`,
-              normalized.fileId, row.epoch, retainedFloor,
-            );
-            this.storage.sql.exec(
-              `DELETE FROM room_text_updates
-                WHERE file_id = ? AND epoch = ? AND revision < ?`,
-              normalized.fileId, row.epoch, retainedFloor,
-            );
-            this.storage.sql.exec(
-              `DELETE FROM room_text_commits
-                WHERE sequence NOT IN (SELECT room_commit FROM room_text_updates)`,
             );
           }
         }
@@ -485,6 +533,231 @@ export class RoomTextStore {
     }
   }
 
+  /**
+   * Compose consecutive same-client canonical updates STRICTLY below the
+   * history floor. Rows at or above the floor are never rewritten: rebase
+   * confirms in-window updates by update_token (rebaseUpdates clientID), so
+   * composing the live window would corrupt client reconciliation (the
+   * NOTES.md invariant). Idempotent: a pass leaves only maximal runs, so a
+   * re-fired janitor composes nothing and re-exports byte-identical history.
+   */
+  compactHistory(fileIdInput: string): CompactHistoryResult {
+    try {
+      const fileId = validateKey(fileIdInput, "fileId");
+      const row = this.fileRow(fileId);
+      if (!row) return { ok: false, error: "NOT_FOUND" };
+      const below = this.storage.sql.exec<UpdateRow & { created_at: number }>(
+        `SELECT revision, base_revision, update_token, client_id, request_id,
+                changes_json, before_utf16_length, after_utf16_length,
+                byte_delta, after_byte_length, room_commit, created_at
+           FROM room_text_updates
+          WHERE file_id = ? AND epoch = ? AND revision < ?
+          ORDER BY revision`,
+        fileId, row.epoch, row.history_floor,
+      ).toArray();
+      const done = (mode: "soft" | "idle" | "compacted", composedRows: number, belowFloorUpdates: number): CompactHistoryResult => ({
+        ok: true,
+        protocol: ROOM_TEXT_PROTOCOL,
+        fileId,
+        epoch: row.epoch,
+        historyFloor: row.history_floor,
+        mode,
+        composedRows,
+        belowFloorUpdates,
+      });
+      if (row.byte_length < SOFT_SNAPSHOT_DOC_BYTES) return done("soft", 0, below.length);
+      const belowBytes = below.reduce(
+        (total, update) => total + persistedJsonEncoder.encode(update.changes_json).byteLength,
+        0,
+      );
+      if (below.length <= HARD_COMPACT_MIN_UPDATES && belowBytes <= HARD_COMPACT_MIN_DELTA_BYTES) {
+        return done("idle", 0, below.length);
+      }
+
+      // Group chain-adjacent rows by client. List order is chain order:
+      // pruning removes prefixes and composition preserves adjacency, so a
+      // UTF-16 length discontinuity below the floor is storage corruption.
+      const runs: Array<Array<UpdateRow & { created_at: number }>> = [];
+      for (const update of below) {
+        const run = runs[runs.length - 1];
+        const last = run?.[run.length - 1];
+        if (last && update.before_utf16_length !== last.after_utf16_length) {
+          throw new RoomTextError("STORAGE_CORRUPT", `history chain breaks at revision ${update.revision}`);
+        }
+        if (last && last.client_id === update.client_id) run.push(update);
+        else runs.push([update]);
+      }
+
+      let removed = 0;
+      let composedRows = 0;
+      this.storage.transactionSync(() => {
+        for (const run of runs) {
+          if (run.length < 2) continue;
+          const first = run[0];
+          const last = run[run.length - 1];
+          let changes = parseStoredChangeSet(first);
+          for (let index = 1; index < run.length; index++) {
+            changes = changes.compose(parseStoredChangeSet(run[index]));
+          }
+          if (changes.length !== first.before_utf16_length || changes.newLength !== last.after_utf16_length) {
+            throw new RoomTextError("STORAGE_CORRUPT", `composed run at revision ${last.revision} changed its endpoints`);
+          }
+          this.storage.sql.exec(
+            `DELETE FROM room_text_updates
+              WHERE file_id = ? AND epoch = ? AND revision >= ? AND revision <= ?`,
+            fileId, row.epoch, first.revision, last.revision,
+          );
+          // base_revision below the floor is attribution metadata only; the
+          // replay chain is defined by row order and length continuity.
+          this.storage.sql.exec(
+            `INSERT INTO room_text_updates (
+               file_id, epoch, revision, base_revision, update_token,
+               client_id, request_id, changes_json, before_utf16_length,
+               after_utf16_length, byte_delta, after_byte_length,
+               room_commit, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            fileId, row.epoch, last.revision, first.base_revision,
+            last.update_token, last.client_id, last.request_id,
+            JSON.stringify(changes.toJSON()), first.before_utf16_length,
+            last.after_utf16_length,
+            run.reduce((total, update) => total + update.byte_delta, 0),
+            last.after_byte_length, last.room_commit, last.created_at,
+          );
+          removed += run.length;
+          composedRows++;
+        }
+        // Dedup pointers into rewritten history go with their rows: a retry
+        // below the floor now takes the RESET_REQUIRED path instead of
+        // resolving against a revision that no longer exists verbatim.
+        this.storage.sql.exec(
+          `DELETE FROM room_text_requests
+            WHERE file_id = ? AND epoch = ? AND revision < ?`,
+          fileId, row.epoch, row.history_floor,
+        );
+        this.storage.sql.exec(
+          `DELETE FROM room_text_commits
+            WHERE sequence NOT IN (SELECT room_commit FROM room_text_updates)`,
+        );
+      });
+      return done("compacted", composedRows, below.length - removed + composedRows);
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  /**
+   * Everything the host needs to persist one version to R2 under
+   * rooms/<room>/.history/<file>/<epoch>@<revision>. Deterministic — no
+   * clocks, no randomness — so identical store state yields byte-identical
+   * artifacts and a re-fired alarm can safely re-PUT (or create-only skip).
+   * composed_changes_json carries every retained update at or below the
+   * artifact revision; readers replay entries with revision greater than
+   * their base snapshot's, so consecutive artifacts chain byte-exactly.
+   */
+  exportVersionArtifact(fileIdInput: string): RoomTextVersionArtifact {
+    try {
+      const fileId = validateKey(fileIdInput, "fileId");
+      const row = this.fileRow(fileId);
+      if (!row) return { ok: false, error: "NOT_FOUND" };
+      const rows = this.updateRows(fileId, row.epoch, -1, row.snapshot_revision);
+      const entries = rows.map((update) => ({
+        revision: update.revision,
+        clientId: update.client_id,
+        requestId: update.request_id,
+        afterByteLength: update.after_byte_length,
+        changes: parseStoredChangeSet(update).toJSON() as unknown,
+      }));
+      return {
+        ok: true,
+        protocol: ROOM_TEXT_PROTOCOL,
+        fileId,
+        path: row.path,
+        epoch: row.epoch,
+        revision: row.snapshot_revision,
+        snapshot_bytes: row.snapshot_bytes,
+        composed_changes_json: JSON.stringify(entries),
+      };
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  /**
+   * The tiny JSON whose R2 etag-CAS flip is the atomic visibility switch for
+   * the artifact above. Deterministic for the same revision, so a re-fired
+   * alarm compares equal against the already-flipped HEAD and skips the CAS.
+   */
+  buildHeadManifest(fileIdInput: string): RoomTextHeadManifest {
+    try {
+      const fileId = validateKey(fileIdInput, "fileId");
+      const row = this.fileRow(fileId);
+      if (!row) return { ok: false, error: "NOT_FOUND" };
+      const manifestJson = JSON.stringify({
+        protocol: ROOM_TEXT_PROTOCOL,
+        fileId,
+        path: row.path,
+        epoch: row.epoch,
+        revision: row.snapshot_revision,
+        byteLength: row.snapshot_bytes.byteLength,
+        artifact: `${row.epoch}@${row.snapshot_revision}`,
+      });
+      return {
+        ok: true,
+        protocol: ROOM_TEXT_PROTOCOL,
+        fileId,
+        epoch: row.epoch,
+        revision: row.snapshot_revision,
+        manifestJson,
+      };
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  /**
+   * After the host has durably PUT the artifact for `revision` and flipped
+   * HEAD, drop the local history it covers. The floor may not pass the
+   * recovery snapshot (cold replay needs the snapshot-to-head tail), and a
+   * revision at or below the current floor is a completed flush — no-op, so
+   * alarm re-fires are safe.
+   */
+  advanceFloorAfterFlush(fileIdInput: string, revision: number): AdvanceFloorResult {
+    try {
+      const fileId = validateKey(fileIdInput, "fileId");
+      if (!Number.isSafeInteger(revision) || revision < 0) {
+        return { ok: false, error: "INVALID_REQUEST" };
+      }
+      const row = this.fileRow(fileId);
+      if (!row) return { ok: false, error: "NOT_FOUND" };
+      if (revision > row.snapshot_revision) {
+        return { ok: false, error: "INVALID_REQUEST", message: "floor cannot pass the recovery snapshot" };
+      }
+      const done = (historyFloor: number, prunedUpdates: number): AdvanceFloorResult => ({
+        ok: true,
+        protocol: ROOM_TEXT_PROTOCOL,
+        fileId,
+        epoch: row.epoch,
+        historyFloor,
+        prunedUpdates,
+      });
+      if (revision <= row.history_floor) return done(row.history_floor, 0);
+      let pruned = 0;
+      this.storage.transactionSync(() => {
+        const updated = this.storage.sql.exec(
+          "UPDATE room_text_files SET history_floor = ?, updated_at = ? WHERE file_id = ? AND epoch = ? AND history_floor = ?",
+          revision, Date.now(), fileId, row.epoch, row.history_floor,
+        );
+        if (updated.rowsWritten !== 1) {
+          throw new RoomTextError("STORAGE_CORRUPT", "history floor changed during synchronous flush advance");
+        }
+        pruned = this.pruneBelowFloor(fileId, row.epoch, revision);
+      });
+      return done(revision, pruned);
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
   /** Probe/test hook: simulates hibernation without changing durable state. */
   clearCache(): void {
     this.cache.clear();
@@ -499,6 +772,10 @@ export class RoomTextStore {
         "SELECT COUNT(*) AS count FROM room_text_updates WHERE file_id = ? AND epoch = ?",
         fileId, row.epoch,
       ).one().count;
+      const belowFloorUpdates = this.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM room_text_updates WHERE file_id = ? AND epoch = ? AND revision < ?",
+        fileId, row.epoch, row.history_floor,
+      ).one().count;
       return {
         epoch: row.epoch,
         revision: row.head_revision,
@@ -507,6 +784,7 @@ export class RoomTextStore {
         byteLength: row.byte_length,
         recoveryTailBytes: row.recovery_tail_bytes,
         updateCount,
+        belowFloorUpdates,
         cacheEntries: this.cache.size,
       };
     } catch (error) {
@@ -702,6 +980,33 @@ export class RoomTextStore {
       byteLength: update.after_byte_length,
       update: toCanonicalUpdate(update),
     };
+  }
+
+  /**
+   * One atomic retention boundary for everything keyed below the floor:
+   * request pointers (a retry older than the floor receives RESET_REQUIRED
+   * instead of being accidentally applied as a new mutation), canonical
+   * updates, and the room commits their deletion orphans. The row AT the
+   * floor survives because lengthAtRevision(floor) reads its
+   * after_utf16_length. Callers must run this inside a transaction that has
+   * already advanced history_floor to `floor`.
+   */
+  private pruneBelowFloor(fileId: string, epoch: number, floor: number): number {
+    this.storage.sql.exec(
+      `DELETE FROM room_text_requests
+        WHERE file_id = ? AND epoch = ? AND revision < ?`,
+      fileId, epoch, floor,
+    );
+    const pruned = this.storage.sql.exec(
+      `DELETE FROM room_text_updates
+        WHERE file_id = ? AND epoch = ? AND revision < ?`,
+      fileId, epoch, floor,
+    ).rowsWritten;
+    this.storage.sql.exec(
+      `DELETE FROM room_text_commits
+        WHERE sequence NOT IN (SELECT room_commit FROM room_text_updates)`,
+    );
+    return pruned;
   }
 
   /**

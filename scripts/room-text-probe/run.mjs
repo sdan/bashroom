@@ -1,24 +1,11 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
 const root = path.resolve(import.meta.dirname, "../..");
 const wrangler = path.join(root, "node_modules", ".bin", "wrangler");
-
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      const port = typeof address === "object" && address ? address.port : 0;
-      server.close((error) => error ? reject(error) : resolve(port));
-    });
-  });
-}
 
 function waitForReady(child, url, timeoutMs = 20_000) {
   return new Promise((resolve, reject) => {
@@ -64,7 +51,8 @@ function run(command, args) {
   });
 }
 
-const port = await freePort();
+// Fixed probe port so concurrent harnesses on one machine stay apart.
+const port = Number(process.env.ROOM_TEXT_PROBE_PORT ?? 8796);
 const persistence = await mkdtemp(path.join(os.tmpdir(), "bashroom-room-text-probe-"));
 const server = spawn(wrangler, [
   "dev",

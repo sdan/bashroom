@@ -286,9 +286,14 @@ open/export/checkpoint boundaries. Idempotent requests, revision advance,
 canonical update, and room commit persist in one synchronous transaction.
 Recovery checkpoints every 128 updates or 256 KB of tail; clients more than
 256 updates or 1 MB of update payload behind reset to the current snapshot.
-Checkpoint pruning retains 384 canonical updates or 8 MB, which keeps the
-physical live-sync log below 512 rows between pruning passes. This retention
-is not a substitute for future user-visible file-version snapshots.
+Checkpoints advance a history floor that retains 384 canonical updates or
+8 MB as the live sync window; rows below the floor persist as cold history
+for a flush janitor (probed in `scripts/room-text-probe/`, not yet mounted):
+compact same-client runs strictly below the floor, export a deterministic
+version artifact plus HEAD manifest for R2 (create-only PUT, etag-CAS
+flip), then prune updates, retry pointers, and orphaned commits at one
+atomic boundary. Re-fires and crashes between PUT and flip recover by
+firing again.
 
 The workerd and cross-library results are in
 `benchmarks/room-text/RESULTS.md`. Do not wire RoomText into web/MCP writes

@@ -29,6 +29,38 @@ non-storage await the discipline test forbids — so the production hash
 must be synchronous (two-modulus polynomial or sync WASM xxhash/blake3).
 Leaves-hashed ≈ revisions confirms ~1 dirty chunk per edit.
 
+## 2026-07-15 — RoomText history janitor: compose below the floor, CAS-flip the HEAD
+
+Mechanics for user-visible version history, built and probed ahead of the
+sync-v1 mount (store methods + `scripts/room-text-probe/` alarm, port 8796).
+The history floor still advances at each checkpoint and still means "based
+below this → RESET_REQUIRED", but checkpoint-time pruning is gone: rows
+below the floor are now retained as cold history until a flush janitor
+ships them to R2, then `advanceFloorAfterFlush` prunes updates, retry
+pointers, and orphaned room commits at one atomic boundary.
+
+Invariant, restated because it shapes everything: compose updates ONLY
+strictly below history_floor. Rebase confirms in-window updates by
+update_token (the rebaseUpdates clientID), so composing a live-window row
+would corrupt client reconciliation. The probe proves live rows survive
+compaction byte-identically. Two named thresholds bound cold accumulation:
+SOFT — docs under 8 KB keep per-revision granularity (a snapshot per
+revision costs R2 less than composition loses in attribution); HARD —
+larger docs compose consecutive same-client runs once >256 ops or >64 KB
+of delta sit below the floor (48 runs of 8 collapsed to 48 rows in probe).
+
+Crash-safety is ordering plus idempotence, no coordination: compact →
+export artifact (deterministic bytes, no clocks) → create-only PUT under
+`rooms/<room>/.history/<file>/<epoch>@<revision>` → etag-CAS flip of the
+tiny HEAD manifest (the atomic visibility switch) → advance the floor.
+Measured on workerd: an alarm re-fire is a full no-op (identical artifact
+bytes, HEAD etag untouched); an injected crash between PUT and flip leaves
+an orphaned artifact and an unmoved HEAD, and the next fire completes;
+cold replay after the floor advance is byte-exact, and consecutive
+artifacts chain byte-exactly (1@768 snapshot + 1@772 deltas = 1@772
+snapshot). This is the Liveblocks hot(DO)/cold(R2) split from the
+2026-07-14 entry, with deltas kept for attribution.
+
 ## 2026-07-15 — utf8Length: 1.8–2.7× on every editing trace (allocation, not algorithm)
 
 Hypothesis (vmg-style): the RoomText hot path paid TextEncoder.encode() —
