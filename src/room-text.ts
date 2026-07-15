@@ -287,6 +287,126 @@ export function replayRoomText(
   return { doc, revision, byteLength };
 }
 
+/**
+ * Size-gated mergeable content digest (Experiment 2, NOTES.md 2026-07-15).
+ *
+ * Two-modulus polynomial hash with a length-aware combine:
+ * combine(left, right) = left.h * B^right.len + right.h (mod p). The combine
+ * is associative over content, so subtree hashes merge in O(1) and the root
+ * equals a straight hash of the concatenated content — independent of the
+ * rope's tree shape (the benchmark gate verified byte-exact equality on all
+ * seven editing traces). Each modulus sits below 2^26 so every product stays
+ * under 2^52 and is exact in doubles; two moduli keep collision odds
+ * negligible for change detection. crypto.subtle.digest is async — a
+ * forbidden yield point in this file — so the hash is synchronous end to end.
+ *
+ * The gate: documents under ROOM_TEXT_DIGEST_GATE_BYTES hash their whole
+ * content (below ~32KB walking the tree costs more than hashing the string,
+ * and small docs materialize snapshot bytes per revision anyway); larger
+ * documents hash the dirty spine only, reusing per-node digests cached by
+ * the rope's immutable node identity. Both paths yield the same digest.
+ */
+export const ROOM_TEXT_DIGEST_GATE_BYTES = 32_768;
+
+const HASH_MODULI = [67_108_859, 67_108_837] as const; // two largest primes < 2^26
+const HASH_BASE = 131;
+
+/** Mergeable digest of a content span: one hash per modulus plus its length. */
+type RoomTextSpanDigest = { h1: number; h2: number; len: number };
+
+// Cached digests keyed by rope-node identity: CodeMirror Text nodes are
+// immutable and structurally shared across revisions, so an unchanged
+// subtree's digest is valid forever and entries vanish with their nodes.
+const nodeDigestCache = new WeakMap<Text, RoomTextSpanDigest>();
+
+// Monotonic count of leaf nodes hashed by the incremental path. Probes take
+// deltas around single operations to prove an edit rehashes the dirty spine,
+// not the document.
+let hashedLeaves = 0;
+
+export function roomTextHashedLeaves(): number {
+  return hashedLeaves;
+}
+
+function polyDigest(value: string): RoomTextSpanDigest {
+  let h1 = 0;
+  let h2 = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    h1 = (h1 * HASH_BASE + code) % HASH_MODULI[0];
+    h2 = (h2 * HASH_BASE + code) % HASH_MODULI[1];
+  }
+  return { h1, h2, len: value.length };
+}
+
+// B^exponent per modulus, memoized: exponents repeat because they are node
+// lengths, and the pow itself is O(log n) so a cold entry stays cheap.
+const powCaches: [Map<number, number>, Map<number, number>] = [new Map(), new Map()];
+
+function powBase(exponent: number, modulus: number, cache: Map<number, number>): number {
+  const cached = cache.get(exponent);
+  if (cached !== undefined) return cached;
+  let result = 1;
+  let base = HASH_BASE % modulus;
+  let remaining = exponent;
+  while (remaining > 0) {
+    if (remaining & 1) result = (result * base) % modulus;
+    base = (base * base) % modulus;
+    remaining >>>= 1;
+  }
+  cache.set(exponent, result);
+  return result;
+}
+
+function combineDigests(left: RoomTextSpanDigest, right: RoomTextSpanDigest): RoomTextSpanDigest {
+  return {
+    h1: (left.h1 * powBase(right.len, HASH_MODULI[0], powCaches[0]) + right.h1) % HASH_MODULI[0],
+    h2: (left.h2 * powBase(right.len, HASH_MODULI[1], powCaches[1]) + right.h2) % HASH_MODULI[1],
+    len: left.len + right.len,
+  };
+}
+
+// Children of a branch node are joined by "\n" in content order; hashing the
+// separator explicitly keeps the combined digest equal to the string hash.
+const SEPARATOR_DIGEST = polyDigest("\n");
+
+function digestOfNode(node: Text): RoomTextSpanDigest {
+  const cached = nodeDigestCache.get(node);
+  if (cached) return cached;
+  const children = (node as unknown as { children: readonly Text[] | null }).children;
+  let digest: RoomTextSpanDigest = { h1: 0, h2: 0, len: 0 };
+  if (children) {
+    for (let index = 0; index < children.length; index++) {
+      if (index > 0) digest = combineDigests(digest, SEPARATOR_DIGEST);
+      digest = combineDigests(digest, digestOfNode(children[index]));
+    }
+  } else {
+    hashedLeaves++;
+    digest = polyDigest(node.sliceString(0, node.length));
+  }
+  nodeDigestCache.set(node, digest);
+  return digest;
+}
+
+// The length rides in the digest string because a bare polynomial cannot
+// separate NUL-prefixed strings ("\0a" and "a" both hash to 97): the
+// length-aware combine needs the length anyway, and including it closes
+// that class of collision outright.
+function digestToString(digest: RoomTextSpanDigest): string {
+  return `${digest.h1.toString(16).padStart(7, "0")}${digest.h2.toString(16).padStart(7, "0")}-${digest.len.toString(16)}`;
+}
+
+/** From-scratch reference digest of raw content; also the small-doc path. */
+export function roomTextDigestOfString(content: string): string {
+  return digestToString(polyDigest(content));
+}
+
+/** Size-gated document digest; equal to roomTextDigestOfString(doc.toString()). */
+export function roomTextContentDigest(doc: Text, byteLength: number): string {
+  if (byteLength < ROOM_TEXT_DIGEST_GATE_BYTES) return roomTextDigestOfString(doc.toString());
+  return digestToString(digestOfNode(doc));
+}
+
 function assertScalarBoundary(doc: Text, position: number): void {
   if (!Number.isSafeInteger(position) || position < 0 || position > doc.length) {
     throw new RoomTextError("INVALID_CHANGE", "change position is outside the document");
