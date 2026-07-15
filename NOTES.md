@@ -5,6 +5,39 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-16 — CS-fundamentals review; live lost-update hole found & fixed
+
+Six-lens theory audit (distributed / algorithms / queueing / information /
+formal / systems) over the committed system. Every lens accepted the core:
+strict DO serialization + zero non-storage awaits as the atomicity basis,
+pushText's single synchronous transaction making torn states
+unrepresentable, the client FSM as correct stop-and-wait ARQ, retention
+384 = 256+128 as near-sqrt-optimal, per-key R2 linearizability. Confirmed
+kills stay dead: CBOR wire ($0 under CF metering), TLA+ (nothing to
+model-check under DO serialization), trigram search index (R2 RTT
+dominates at wiki n).
+
+RANK 1 found a LIVE bug and it is FIXED + DEPLOYED (version d15ea856):
+r2Put discarded the PUT's R2Object and every CAS-success path re-GET the
+object to build its response. A concurrent writer landing in that put->get
+window returned THEIR content+etag to the saver; the saver's next 700ms
+autosave CAS'd against that foreign etag, succeeded, and silently
+destroyed the other write — the exact lost-update the etag design exists
+to surface, with NO 412 ever firing, on the path agents + the SPA hit.
+Fix: r2Put returns R2Object|null; new r2FileFromPut builds the response
+from the put's own etag + held content; re-read kept only on the 412
+branch. Also removes one R2 round trip per save.
+
+Remaining ranked proposals (queued, not yet built): #2 revocation
+convergence (Registry tombstone + alarm retry — stale AccountDO mirror can
+authorize writes to a deleted room forever, security-relevant); #3 honest
+reads (single-GET mcpRead to kill torn HEAD+GET, pooled mcpSearch ~20s->~1s,
+FUSE read-your-writes probe); #4 overload posture (jitter + admission
+control before cutover — undamped metastable failure risk); #5 janitor
+lineage (monotonic HEAD-flip guard); #6 O(doc) mailbox waste; #7
+exactly-once seams (requestId fallback wrong-answer bug). Full report:
+tasks/wy8zlxang.output.
+
 ## 2026-07-16 — The tie test: json-joy behind the identical surface (prediction hit)
 
 Prediction pre-registered before the first run: json-joy mounted behind the
