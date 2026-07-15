@@ -157,6 +157,74 @@ await post(`/evict?file=${checkpointFile}`);
 const recoveredCheckpoint = await json(`/open?file=${checkpointFile}`);
 assert.equal(recoveredCheckpoint.content, "x".repeat(640));
 
+// Server-mapped comment anchors: a push may carry open-anchor offsets; the
+// accept result returns them mapped through the exact canonical ChangeSet,
+// and DocumentCollab.remapCommentAnchors persists them for open comments.
+const anchorFile = `${fileId}-anchors`;
+assert.equal(
+  (await post("/create", { fileId: anchorFile, path: "notes/anchors.md", content: "hello world notes" })).ok,
+  true,
+);
+const added = await post("/comments/add", {
+  authorUserId: "user-a",
+  author: "usera",
+  anchorStart: 6,
+  anchorEnd: 11,
+  quote: "world",
+  body: "anchor probe",
+  documentEtag: "etag-1",
+});
+assert.equal(added.ok, true);
+const commentId = added.comment.id;
+
+const anchoredRequest = {
+  protocol: 1,
+  fileId: anchorFile,
+  epoch: 1,
+  baseRevision: 0,
+  clientId: "anchor-client",
+  requestId: "insert-before-anchor",
+  changes: [{ from: 0, to: 0, insert: ">> " }],
+  anchors: [{ id: commentId, start: 6, end: 11 }],
+};
+const anchoredPush = await post("/push", anchoredRequest);
+assert.equal(anchoredPush.ok, true);
+assert.deepEqual(anchoredPush.anchors, [{ id: commentId, start: 9, end: 14 }]);
+
+// An idempotent replay returns the same revision but never re-reports
+// anchors: the first accept already carried the mapping, and mapping an
+// already rewritten anchor through the same update would double-shift it.
+const anchoredReplay = await post("/push", anchoredRequest);
+assert.equal(anchoredReplay.ok, true);
+assert.equal(anchoredReplay.revision, anchoredPush.revision);
+assert.equal(anchoredReplay.anchors, undefined);
+
+const remapped = await post("/comments/remap", { anchors: anchoredPush.anchors.map((anchor) => ({
+  id: anchor.id,
+  anchor_start: anchor.start,
+  anchor_end: anchor.end,
+})) });
+assert.deepEqual(remapped, { ok: true, updated: 1 });
+const openComments = await json("/comments/list");
+assert.equal(openComments[0].anchor_start, 9);
+assert.equal(openComments[0].anchor_end, 14);
+
+// Resolved comments freeze their offsets: the remap RPC skips them.
+const resolvedComment = await post("/comments/resolve", {
+  id: commentId,
+  actorUserId: "user-a",
+  actor: "usera",
+  canResolveAny: true,
+});
+assert.equal(resolvedComment.ok, true);
+const remapAfterResolve = await post("/comments/remap", {
+  anchors: [{ id: commentId, anchor_start: 0, anchor_end: 1 }],
+});
+assert.deepEqual(remapAfterResolve, { ok: true, updated: 0 });
+const frozenComments = await json("/comments/list");
+assert.equal(frozenComments[0].anchor_start, 9);
+assert.equal(frozenComments[0].anchor_end, 14);
+
 console.log(JSON.stringify({
   concurrent: {
     requests: concurrency,
@@ -185,5 +253,11 @@ console.log(JSON.stringify({
     retainedUpdates: retainedStats.updateCount,
     historyFloor: retainedStats.historyFloor,
     verdict: "cold replay, stale transform work, and log retention are bounded",
+  },
+  anchors: {
+    mappedOnAccept: `[6,11) -> [9,14)`,
+    replayReportsAnchors: false,
+    resolvedFrozen: true,
+    verdict: "comment anchors follow the canonical ChangeSet, not substrings",
   },
 }, null, 2));

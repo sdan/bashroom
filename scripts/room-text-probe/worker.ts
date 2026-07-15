@@ -1,9 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import { RoomTextStore, type PushRoomTextInput } from "../../src/room-text-store";
 import { encodeRoomText, roomTextFromString } from "../../src/room-text";
+import { DocumentCollab, type RemapCommentAnchorInput } from "../../src/document-collab";
+
+export { DocumentCollab };
 
 type Env = {
   ROOM_TEXT_PROBE: DurableObjectNamespace<RoomTextProbe>;
+  DOCUMENT_COLLAB_PROBE: DurableObjectNamespace<DocumentCollab>;
 };
 
 /** Isolated workerd wrapper around the real RoomText SQLite adapter. */
@@ -68,6 +72,25 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const room = url.searchParams.get("room") || "probe-room";
+    // The real DocumentCollab class over RPC, so the anchor-remap contract
+    // is exercised on workerd rather than mocked.
+    if (url.pathname.startsWith("/comments/")) {
+      const collab = env.DOCUMENT_COLLAB_PROBE.getByName(room);
+      if (request.method === "POST" && url.pathname === "/comments/add") {
+        return Response.json(await collab.addComment(await request.json()));
+      }
+      if (request.method === "POST" && url.pathname === "/comments/remap") {
+        const body = await request.json<{ anchors: RemapCommentAnchorInput[] }>();
+        return Response.json(await collab.remapCommentAnchors(body.anchors));
+      }
+      if (request.method === "POST" && url.pathname === "/comments/resolve") {
+        return Response.json(await collab.resolveComment(await request.json()));
+      }
+      if (request.method === "GET" && url.pathname === "/comments/list") {
+        return Response.json(await collab.listComments());
+      }
+      return new Response("unknown probe route", { status: 404 });
+    }
     return env.ROOM_TEXT_PROBE.getByName(room).fetch(request);
   },
 };
