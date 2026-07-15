@@ -2226,8 +2226,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
           const current = await r2File(env, grant.userId, grant.room, path);
           return json({ ok: false, error: "conflict", file: current }, 412);
         }
-        const sharedFile = await r2File(env, grant.userId, grant.room, path);
-        pokeRoomHub(ctx, env, grant.userId, grant.room, actor, path, "web", sharedFile?.etag);
+        const sharedFile = r2FileFromPut(sharedWrote, grant.userId, grant.room, content);
+        pokeRoomHub(ctx, env, grant.userId, grant.room, actor, path, "web", sharedFile.etag);
         defer(ctx, registry(env, "/audit-append", {
           user_id: grant.userId,
           room: grant.room,
@@ -2256,10 +2256,10 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
         const current = await r2File(env, userId, room, path);
         return json({ ok: false, error: "conflict", file: current }, 412);
       }
-      const file = await r2File(env, userId, room, path);
+      const file = r2FileFromPut(wrote, userId, room, content);
       // Presence: a web edit is the human writing — attribute to the handle.
       // The etag lets other tabs skip refetching a version they already hold.
-      pokeRoomHub(ctx, env, userId, room, String(account.handle || "you"), path, "web", file?.etag);
+      pokeRoomHub(ctx, env, userId, room, String(account.handle || "you"), path, "web", file.etag);
       defer(ctx, registry(env, "/audit-append", {
         user_id: userId,
         room,
@@ -2344,8 +2344,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
         const current = await r2File(env, access.ownerUserId, access.room, access.path);
         return json({ ok: false, error: "conflict", file: current }, 412);
       }
-      const file = await r2File(env, access.ownerUserId, access.room, access.path);
-      pokeRoomHub(ctx, env, access.ownerUserId, access.room, access.actor, access.path, "web", file?.etag);
+      const file = r2FileFromPut(wrote, access.ownerUserId, access.room, content);
+      pokeRoomHub(ctx, env, access.ownerUserId, access.room, access.actor, access.path, "web", file.etag);
       defer(ctx, registry(env, "/audit-append", {
         user_id: access.ownerUserId,
         room: access.room,
@@ -3158,8 +3158,8 @@ async function mcpSharedWrite(
     const current = await env.ROOMS_R2.head(r2KeyForFile(access.ownerUserId, access.room, access.path));
     return { ok: false, error: "conflict", current_etag: current?.etag || null };
   }
-  const file = await r2File(env, access.ownerUserId, access.room, access.path);
-  pokeRoomHub(ctx, env, access.ownerUserId, access.room, access.actor, access.path, "mcp", file?.etag);
+  const file = r2FileFromPut(wrote, access.ownerUserId, access.room, content);
+  pokeRoomHub(ctx, env, access.ownerUserId, access.room, access.actor, access.path, "mcp", file.etag);
   defer(ctx, registry(env, "/audit-append", {
     user_id: access.ownerUserId,
     room: access.room,
@@ -3725,16 +3725,28 @@ async function r2ListPrefix(
   return { objects: out, truncated: Boolean(cursor) };
 }
 
-// Returns false when baseEtag is supplied and the object changed since that
+// Returns null when baseEtag is supplied and the object changed since that
 // read — R2's conditional put (onlyIf.etagMatches) makes this a true
 // compare-and-swap at the source of truth, so it guards against ALL other
 // write paths (web editor, bashroom_write, FUSE writes from shells).
-async function r2Put(env: Env, userId: string, room: string, path: string, content: string, baseEtag?: string): Promise<boolean> {
-  const result = await env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content, {
+// Returns the PUT's OWN R2Object on success: callers must build their
+// response from this etag + the content they already hold, never from a
+// post-save re-read — a racing writer landing in a put→get window would
+// hand back THEIR content under OUR success, poisoning the caller's next
+// CAS base into a silent lost update that no 412 ever surfaces.
+async function r2Put(env: Env, userId: string, room: string, path: string, content: string, baseEtag?: string): Promise<R2Object | null> {
+  return env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content, {
     httpMetadata: { contentType: contentTypeForPath(path) },
     ...(baseEtag ? { onlyIf: { etagMatches: baseEtag } } : {}),
   });
-  return result !== null;
+}
+
+// Build the file record for a just-committed write from the PUT's own object
+// plus the content the caller already holds — never a re-read. Text writes go
+// through this path (is_binary false); the content round-trips verbatim.
+function r2FileFromPut(object: R2Object, userId: string, room: string, content: string): R2File {
+  const metadata = r2MetadataForObject(object, r2KeyForRoom(userId, room));
+  return { ...metadata, content, is_binary: false };
 }
 
 // ─── Public share serving ───────────────────────────────────────────────
