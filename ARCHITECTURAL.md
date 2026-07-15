@@ -295,6 +295,16 @@ flip), then prune updates, retry pointers, and orphaned commits at one
 atomic boundary. Re-fires and crashes between PUT and flip recover by
 firing again.
 
+A size-gated digest index rides the same transactions (Experiment 2,
+NOTES.md 2026-07-15): every accepted update upserts a per-file digest row
+— a synchronous two-modulus polynomial hash with a length-aware combine,
+whole-content below 32 KB, dirty-spine incremental above it via a WeakMap
+node cache — plus a room root hash over the path-ordered listing, logged
+in a bounded window so `diffDigest(clientRootHash)` answers agent catch-up
+in O(changed files); roots outside the window get the full listing,
+explicitly flagged. Line/search indexing and share-prefix proofs attach to
+this layer later.
+
 The workerd and cross-library results are in
 `benchmarks/room-text/RESULTS.md`. Do not wire RoomText into web/MCP writes
 until the production cutover can make it the sole authority. Dual-writing R2
