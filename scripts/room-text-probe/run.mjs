@@ -51,28 +51,35 @@ function run(command, args) {
   });
 }
 
-// Fixed probe port so concurrent harnesses on one machine stay apart.
-const port = Number(process.env.ROOM_TEXT_PROBE_PORT ?? 8796);
-const persistence = await mkdtemp(path.join(os.tmpdir(), "bashroom-room-text-probe-"));
-const server = spawn(wrangler, [
-  "dev",
-  "-c", "scripts/room-text-probe/wrangler.jsonc",
-  "--port", String(port),
-  "--persist-to", persistence,
-  "--log-level", "error",
-], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+async function withServer(port, task) {
+  const persistence = await mkdtemp(path.join(os.tmpdir(), "bashroom-room-text-probe-"));
+  const server = spawn(wrangler, [
+    "dev",
+    "-c", "scripts/room-text-probe/wrangler.jsonc",
+    "--port", String(port),
+    "--persist-to", persistence,
+    "--log-level", "error",
+  ], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
 
-try {
-  await waitForReady(server, `http://127.0.0.1:${port}`);
-  await run(process.execPath, ["scripts/room-text-probe/blast.mjs", `http://127.0.0.1:${port}`]);
-} finally {
-  if (server.exitCode === null) {
-    server.kill("SIGTERM");
-    await Promise.race([
-      new Promise((resolve) => server.once("exit", resolve)),
-      new Promise((resolve) => setTimeout(resolve, 5_000)),
-    ]);
-    if (server.exitCode === null) server.kill("SIGKILL");
+  try {
+    await waitForReady(server, `http://127.0.0.1:${port}`);
+    await task(`http://127.0.0.1:${port}`);
+  } finally {
+    if (server.exitCode === null) {
+      server.kill("SIGTERM");
+      await Promise.race([
+        new Promise((resolve) => server.once("exit", resolve)),
+        new Promise((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      if (server.exitCode === null) server.kill("SIGKILL");
+    }
+    await rm(persistence, { recursive: true, force: true });
   }
-  await rm(persistence, { recursive: true, force: true });
 }
+
+// Fixed probe ports so concurrent harnesses on one machine stay apart:
+// 8796 exercises the HTTP surface, 8797 the WebSocket sync surface.
+const port = Number(process.env.ROOM_TEXT_PROBE_PORT ?? 8796);
+const wsPort = Number(process.env.ROOM_TEXT_PROBE_WS_PORT ?? 8797);
+await withServer(port, (base) => run(process.execPath, ["scripts/room-text-probe/blast.mjs", base]));
+await withServer(wsPort, (base) => run(process.execPath, ["scripts/room-text-probe/blast-ws.mjs", base]));

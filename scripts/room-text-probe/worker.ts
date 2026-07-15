@@ -1,10 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   RoomTextStore,
+  isRetryableRoomTextFailure,
   type PushRoomTextInput,
   type RoomTextVersionArtifact,
 } from "../../src/room-text-store";
-import { encodeRoomText, roomTextFromString } from "../../src/room-text";
+import { encodeRoomText, roomTextFromString, roomTextUpdateToken } from "../../src/room-text";
+import {
+  ROOM_TEXT_CLOSE_INCOMPATIBLE,
+  type RoomTextBroadcastUpdate,
+  type RoomTextClientFrame,
+  type RoomTextServerFrame,
+} from "../../src/room-text-client";
 import { DocumentCollab, type RemapCommentAnchorInput } from "../../src/document-collab";
 
 export { DocumentCollab };
@@ -76,10 +83,176 @@ class InjectedCrash extends Error {}
 export class RoomTextProbe extends DurableObject<Env> {
   private readonly texts: RoomTextStore;
   private readonly r2 = new MockR2();
+  // Broadcast batching: updates accepted during one event-loop turn (one
+  // socket message may carry a whole outbox) leave as ONE frame per file.
+  // In-memory is safe — the queue always drains in the same turn it fills.
+  private readonly pendingBroadcast: Array<{ fileId: string; epoch: number; update: RoomTextBroadcastUpdate }> = [];
+  private broadcastScheduled = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.texts = new RoomTextStore(ctx.storage);
+  }
+
+  /** Hibernation-API message handler for the sync socket (/ws upgrade). */
+  webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): void {
+    if (typeof message !== "string") return;
+    let frame: RoomTextClientFrame;
+    try {
+      frame = JSON.parse(message) as RoomTextClientFrame;
+    } catch {
+      ws.close(1008, "malformed frame");
+      return;
+    }
+    if (frame.type === "connect") {
+      this.handleConnect(ws, frame);
+    } else if (frame.type === "push") {
+      // One message, N pushes, ONE broadcast flush — the batching contract.
+      for (const push of Array.isArray(frame.pushes) ? frame.pushes : []) {
+        this.handlePush(ws, push);
+      }
+    } else if (frame.type === "ping") {
+      this.sendFrame(ws, { type: "pong", at: frame.at });
+    }
+  }
+
+  private handleConnect(ws: WebSocket, frame: Extract<RoomTextClientFrame, { type: "connect" }>): void {
+    const result = this.texts.connectText({
+      connectRequestId: frame.connectRequestId,
+      protocolVersion: frame.protocolVersion,
+      fileId: frame.fileId,
+      epoch: frame.epoch,
+      lastRevision: frame.lastRevision,
+    });
+    if (!result.ok) {
+      if (result.error === "PROTOCOL_MISMATCH") {
+        // Explicit incompatibility frame, then a server-declared close code
+        // so the client's aggressive backoff ladder paces its re-checks.
+        this.sendFrame(ws, {
+          type: "incompatible",
+          connectRequestId: frame.connectRequestId,
+          serverProtocol: 1,
+          ...(result.message ? { message: result.message } : {}),
+        });
+        ws.close(ROOM_TEXT_CLOSE_INCOMPATIBLE, "room-text protocol mismatch");
+        return;
+      }
+      this.sendFrame(ws, {
+        type: "connect-error",
+        connectRequestId: frame.connectRequestId,
+        code: result.error,
+        ...(result.message ? { message: result.message } : {}),
+      });
+      return;
+    }
+    // The attachment scopes broadcasts and survives hibernation with the socket.
+    ws.serializeAttachment({ fileId: result.fileId });
+    this.sendFrame(ws, result.hydration === "delta"
+      ? {
+          type: "hydration",
+          connectRequestId: result.connectRequestId,
+          fileId: result.fileId,
+          hydration: "delta",
+          epoch: result.epoch,
+          headRevision: result.headRevision,
+          updates: result.updates,
+        }
+      : {
+          type: "hydration",
+          connectRequestId: result.connectRequestId,
+          fileId: result.fileId,
+          hydration: "snapshot",
+          epoch: result.epoch,
+          headRevision: result.headRevision,
+          byteLength: result.byteLength,
+          doc: result.doc,
+        });
+  }
+
+  private handlePush(ws: WebSocket, push: PushRoomTextInput): void {
+    const token = push && typeof push.clientId === "string" && typeof push.requestId === "string"
+      ? roomTextUpdateToken(push.clientId, push.requestId)
+      : "";
+    const before = this.texts.openText(push ? push.fileId : "");
+    const headBefore = before.ok ? before.revision : -1;
+    const result = this.texts.pushText(push);
+    if (!result.ok) {
+      // Discard, keyed by the client's own token. retryable separates stale
+      // sync state (re-hydrate, then decide) from terminal bad-args.
+      this.sendFrame(ws, {
+        type: "discard",
+        updateToken: token,
+        code: result.error,
+        retryable: isRetryableRoomTextFailure(result.error),
+        ...(result.message ? { message: result.message } : {}),
+      });
+      return;
+    }
+    if (result.revision > headBefore) {
+      // Fresh commit: the batched broadcast is the ack. The sender finds its
+      // own updateToken-tagged entry in the frame (echo-as-ack).
+      this.queueBroadcast(result.fileId, result.epoch, {
+        ...result.update,
+        updateToken: roomTextUpdateToken(result.update.clientId, result.update.requestId),
+      });
+      return;
+    }
+    // Idempotent replay: the store surfaced the ORIGINAL commit verbatim.
+    // Only the retrying socket hears it — everyone else saw the broadcast
+    // when the update first committed. A racing first-transmission commit
+    // cannot mis-order this: its broadcast flushes in the microtask before
+    // the replay message's turn begins.
+    const rebased = result.update.parentRevision > result.submittedBaseRevision;
+    this.sendFrame(ws, {
+      type: "ack",
+      updateToken: token,
+      status: "commit",
+      revision: result.revision,
+      ...(rebased ? { rebasedChanges: result.update.changes } : {}),
+    });
+  }
+
+  private queueBroadcast(fileId: string, epoch: number, update: RoomTextBroadcastUpdate): void {
+    this.pendingBroadcast.push({ fileId, epoch, update });
+    if (this.broadcastScheduled) return;
+    this.broadcastScheduled = true;
+    // End-of-turn flush: every update accepted in this event-loop turn
+    // leaves in one frame per file.
+    queueMicrotask(() => this.flushBroadcast());
+  }
+
+  private flushBroadcast(): void {
+    this.broadcastScheduled = false;
+    const queued = this.pendingBroadcast.splice(0);
+    const byFile = new Map<string, { epoch: number; updates: RoomTextBroadcastUpdate[] }>();
+    for (const item of queued) {
+      const group = byFile.get(item.fileId) ?? { epoch: item.epoch, updates: [] };
+      group.epoch = item.epoch;
+      group.updates.push(item.update);
+      byFile.set(item.fileId, group);
+    }
+    for (const [fileId, group] of byFile) {
+      const frame = JSON.stringify({
+        type: "updates",
+        fileId,
+        epoch: group.epoch,
+        headRevision: group.updates[group.updates.length - 1].revision,
+        updates: group.updates,
+      } satisfies RoomTextServerFrame);
+      for (const socket of this.ctx.getWebSockets()) {
+        const attachment = socket.deserializeAttachment() as { fileId?: string } | null;
+        if (attachment?.fileId !== fileId) continue;
+        try {
+          socket.send(frame);
+        } catch {
+          // Peer already gone; its reconnect handshake will hydrate it.
+        }
+      }
+    }
+  }
+
+  private sendFrame(ws: WebSocket, frame: RoomTextServerFrame): void {
+    ws.send(JSON.stringify(frame));
   }
 
   /** Real alarm wiring for the janitor; only the target read awaits storage. */
@@ -138,6 +311,13 @@ export class RoomTextProbe extends DurableObject<Env> {
     try {
       const url = new URL(request.url);
       const room = url.searchParams.get("room") || "probe-room";
+      if (url.pathname === "/ws" && request.headers.get("Upgrade") === "websocket") {
+        const pair = new WebSocketPair();
+        // Hibernation API so the sync surface exercises the same socket
+        // lifecycle a production mount would use.
+        this.ctx.acceptWebSocket(pair[1]);
+        return new Response(null, { status: 101, webSocket: pair[0] });
+      }
       if (request.method === "POST" && url.pathname === "/create") {
         const body = await request.json<{ fileId: string; path: string; content: string }>();
         return Response.json(this.texts.createText({

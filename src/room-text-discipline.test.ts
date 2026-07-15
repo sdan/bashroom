@@ -11,8 +11,11 @@ import { describe, expect, it } from "vitest";
 // sql.exec calls into one implicit transaction per turn and output gates
 // carry durability — the "memory-speed mutation, honest ack" design. This
 // test makes that discipline a build property instead of a code-review hope.
+// The client module is held to the same wire: it performs no I/O and holds
+// no real timers — hosts inject schedule() and the transport — so the sync
+// machinery stays deterministic and unit-testable without a browser.
 describe("room-text hot-path discipline", () => {
-  const files = ["src/room-text.ts", "src/room-text-store.ts"];
+  const files = ["src/room-text.ts", "src/room-text-store.ts", "src/room-text-client.ts"];
 
   for (const file of files) {
     it(`${file} stays synchronous (no await/async/timers/fetch)`, () => {
