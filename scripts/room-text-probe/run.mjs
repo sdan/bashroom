@@ -52,7 +52,7 @@ function run(command, args) {
 }
 
 // Fixed probe port so concurrent harnesses on one machine stay apart.
-const port = Number(process.env.ROOM_TEXT_PROBE_PORT ?? 8796);
+const port = Number(process.env.ROOM_TEXT_PROBE_PORT ?? 8798);
 const persistence = await mkdtemp(path.join(os.tmpdir(), "bashroom-room-text-probe-"));
 const server = spawn(wrangler, [
   "dev",

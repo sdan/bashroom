@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { ChangeSet, Text } from "@codemirror/state";
 
-const base = process.argv[2] || "http://localhost:8796";
+const base = process.argv[2] || "http://localhost:8798";
 const fileId = `probe-${Date.now()}`;
 const room = `room-${Date.now()}`;
 const concurrency = 50;
@@ -439,6 +439,114 @@ assert.deepEqual(
   { ok: true, historyFloor: 772, prunedUpdates: 0 },
 );
 
+// Size-gated digest index. A >32KB document takes the dirty-spine
+// incremental path: creating it hashes every leaf once, and a one-character
+// edit must NOT rehash the whole document (the WeakMap node cache).
+const bigFile = `${fileId}-digest-big`;
+const bigContent = Array.from({ length: 2_000 }, (_, line) => `line ${line} ${"x".repeat(40)}`).join("\n");
+const leavesBeforeCreate = (await json("/digest/stats")).hashedLeaves;
+assert.equal((await post("/create", { fileId: bigFile, path: "notes/digest-big.md", content: bigContent })).ok, true);
+const leavesOnCreate = (await json("/digest/stats")).hashedLeaves - leavesBeforeCreate;
+assert.ok(leavesOnCreate > 16, `creating a ~100KB doc should hash every leaf, saw ${leavesOnCreate}`);
+const leavesBeforeEdit = (await json("/digest/stats")).hashedLeaves;
+const bigEdit = {
+  protocol: 1,
+  fileId: bigFile,
+  epoch: 1,
+  baseRevision: 0,
+  clientId: "digest-client",
+  requestId: "big-edit-1",
+  changes: [{ from: 10, to: 10, insert: "!" }],
+};
+assert.equal((await post("/push", bigEdit)).ok, true);
+const leavesOnEdit = (await json("/digest/stats")).hashedLeaves - leavesBeforeEdit;
+assert.ok(leavesOnEdit > 0, "an edit must rehash its dirty leaf");
+assert.ok(
+  leavesOnEdit * 8 < leavesOnCreate,
+  `edit rehashed ${leavesOnEdit} of ${leavesOnCreate} leaves; dirty spine should be a small fraction`,
+);
+
+// Gate: the incrementally maintained digest equals a from-scratch hash of
+// the current content after edits.
+const bigVerify = await json(`/digest/verify?file=${bigFile}`);
+assert.equal(bigVerify.match, true, `digest ${bigVerify.contentHash} != from-scratch ${bigVerify.fromScratch}`);
+assert.equal(bigVerify.revision, 1);
+
+// The room root changes iff any file's content changed: an idempotent
+// replay and a checkpoint leave it alone; a fresh accept moves it.
+const rootBefore = (await json("/digest/room")).rootHash;
+assert.equal((await post("/push", bigEdit)).ok, true);
+await post(`/checkpoint?file=${bigFile}`);
+assert.equal((await json("/digest/room")).rootHash, rootBefore);
+assert.equal((await post("/push", { ...bigEdit, requestId: "big-edit-2", baseRevision: 1 })).ok, true);
+const rootAfterEdit = (await json("/digest/room")).rootHash;
+assert.notEqual(rootAfterEdit, rootBefore);
+
+// diffDigest returns exactly the changed files: one edited, one created,
+// every other file in the room untouched.
+const smallFile = `${fileId}-digest-small`;
+assert.equal((await post("/create", { fileId: smallFile, path: "notes/digest-small.md", content: "small\n" })).ok, true);
+const diff = await json(`/digest/diff?root=${rootBefore}`);
+assert.equal(diff.baseKnown, true);
+assert.deepEqual(diff.changed.map((file) => file.path), ["notes/digest-big.md"]);
+assert.deepEqual(diff.added.map((file) => file.path), ["notes/digest-small.md"]);
+assert.deepEqual(diff.removed, []);
+const diffCurrent = await json(`/digest/diff?root=${diff.rootHash}`);
+assert.deepEqual(
+  { baseKnown: diffCurrent.baseKnown, changed: diffCurrent.changed, added: diffCurrent.added },
+  { baseKnown: true, changed: [], added: [] },
+);
+
+// An unknown root diffs against the empty room: full listing, flagged.
+const roomNow = await json("/digest/room");
+const diffUnknown = await json("/digest/diff?root=ffffffffffffff-0");
+assert.equal(diffUnknown.baseKnown, false);
+assert.equal(diffUnknown.changed.length, 0);
+assert.equal(diffUnknown.added.length, roomNow.fileCount);
+
+// Gate on the small path too: a <32KB doc hashes whole content, and its
+// maintained row still matches from-scratch after an edit.
+assert.equal((await post("/push", {
+  protocol: 1,
+  fileId: smallFile,
+  epoch: 1,
+  baseRevision: 0,
+  clientId: "digest-client",
+  requestId: "small-edit-1",
+  changes: [{ from: 0, to: 0, insert: "# heading\n" }],
+})).ok, true);
+const smallVerify = await json(`/digest/verify?file=${smallFile}`);
+assert.equal(smallVerify.match, true);
+assert.equal(smallVerify.byteLength, "# heading\nsmall\n".length);
+
+// Structure independence: the same >32KB content built as one tree versus
+// grown by chunked appends must produce identical digests.
+const shapeA = `${fileId}-digest-shape-a`;
+const shapeB = `${fileId}-digest-shape-b`;
+assert.equal((await post("/create", { fileId: shapeA, path: "notes/digest-shape-a.md", content: bigContent })).ok, true);
+assert.equal((await post("/create", { fileId: shapeB, path: "notes/digest-shape-b.md", content: "" })).ok, true);
+let grownLength = 0;
+let grownRevision = 0;
+for (let offset = 0; offset < bigContent.length; offset += 16_000) {
+  const chunk = bigContent.slice(offset, offset + 16_000);
+  const appended = await post("/push", {
+    protocol: 1,
+    fileId: shapeB,
+    epoch: 1,
+    baseRevision: grownRevision,
+    clientId: "digest-grower",
+    requestId: `grow-${offset}`,
+    changes: [{ from: grownLength, to: grownLength, insert: chunk }],
+  });
+  assert.equal(appended.ok, true);
+  grownLength += chunk.length;
+  grownRevision = appended.revision;
+}
+const digestShapeA = await json(`/digest?file=${shapeA}`);
+const digestShapeB = await json(`/digest?file=${shapeB}`);
+assert.equal(digestShapeA.contentHash, digestShapeB.contentHash);
+assert.equal(digestShapeA.byteLength, digestShapeB.byteLength);
+
 console.log(JSON.stringify({
   concurrent: {
     requests: concurrency,
@@ -483,5 +591,14 @@ console.log(JSON.stringify({
     replayReportsAnchors: false,
     resolvedFrozen: true,
     verdict: "comment anchors follow the canonical ChangeSet, not substrings",
+  },
+  digest: {
+    leavesOnCreate,
+    leavesOnEdit,
+    fromScratchMatch: { big: bigVerify.match, small: smallVerify.match },
+    rootMovedOnlyOnContentChange: true,
+    diffAgainstOldRoot: { changed: 1, added: 1, removed: 0 },
+    structureIndependent: digestShapeA.contentHash === digestShapeB.contentHash,
+    verdict: "size-gated digest index: O(dirty spine) hashing, O(changed) catch-up",
   },
 }, null, 2));
