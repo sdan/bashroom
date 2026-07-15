@@ -1,0 +1,9 @@
+{
+  "name": "do-order-probe",
+  "main": "worker.ts",
+  "compatibility_date": "2026-06-01",
+  "durable_objects": {
+    "bindings": [{ "name": "PROBE", "class_name": "OrderProbe" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["OrderProbe"] }]
+}
