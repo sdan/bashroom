@@ -1,0 +1,199 @@
+# Engineering notes
+
+Dated, append-only findings about how bashroom is built: measurements,
+design decisions with their context, and experiments. ARCHITECTURAL.md is
+the current-state truth; this file is the why-we-believe-it log. Add new
+entries at the top with `## YYYY-MM-DD — topic`.
+
+## 2026-07-15 — utf8Length: 1.8–2.7× on every editing trace (allocation, not algorithm)
+
+Hypothesis (vmg-style): the RoomText hot path paid TextEncoder.encode() —
+a Uint8Array allocation — per changed span just to read .byteLength, plus a
+separate scalar-validation scan over each insert. Fix: utf8Length() in
+src/room-text.ts — one charCode-arithmetic pass, zero allocation, validates
+scalar well-formedness in the same loop; roomTextByteLength now iterates
+rope chunks instead of materializing + encoding the whole document.
+
+Decision rule stated before running: keep if ≥10% median gain on ≥4/7
+traces, no trace regressing >2%. Result: 1.83×–2.67× on 7/7 (same-session
+A/B, e.g. automerge-paper 196,955 → 498,539 txns/s; seph-blog1 172,776 →
+419,087), byte-exact finals unchanged, 23/23 tests green.
+
+Moral: the gap to JSON Joy was never rope-vs-CRDT — roughly half of it was
+accounting allocations. RESULTS.md tables predate this change; regenerate
+before quoting. Queued follow-up experiments, same protocol (hypothesis +
+decision rule before running): chunk-aligned dirty-spine hashing (feeds
+task #8), snapshot-cadence sweep by doc size, group-commit burst on real
+workerd, tiny-doc rope-vs-string crossover (expected null result).
+
+## 2026-07-15 — Memory-first audit: the three levers, and what already holds
+
+Question examined: can we keep documents in memory and mutate at memory
+speed ("beat json-joy with RAM")? Platform facts: DO memory dies at
+hibernation (10s idle), eviction (70–140s idle, non-hibernatable), and
+code deploys (1–2×/day, non-deterministic) — memory is never a durability
+tier, and acking from RAM loses acked writes daily. But DO SQLite already
+IS the memory-first design: sql.exec is synchronous and in-process,
+write coalescing batches a turn's writes into one implicit transaction,
+and output gates hold the ack (not the mutation) until replication
+confirms. Mutation at memory speed, honest acks.
+
+Audit of the three levers against the code:
+1. No-await hot path — ALREADY HOLDS: room-text.ts + room-text-store.ts
+   contain zero async/await. Locked as a CI property in
+   src/room-text-discipline.test.ts (also bans timers/fetch).
+2. Group commit — storage side is platform-provided (coalescing + async
+   flush). The remaining win is BROADCAST batching: one WS frame carrying
+   N accepted updates per flush, specced into the sync-v1 task alongside
+   Liveblocks-style keyframe/delta drafts (targetActor-field pattern).
+3. Ephemeral/canonical split — ALREADY HOLDS: drafts bypass storage in
+   RoomHub; canonical revisions sit behind the gate in RoomText.
+
+Implication for benchmarks: the 840 edits/s workerd number is pessimistic
+(local dev, serial acks); production throughput scales with coalescing and
+concurrent gate-waits. The fair test vs json-joy must measure burst
+throughput on real DOs, plus cold-start-to-first-edit after hibernation.
+
+## 2026-07-14 — Liveblocks runs on Durable Objects; convergence findings
+
+Dug into Liveblocks internals (Cloudflare case study, their docs, protocol
+source). Headline: a Liveblocks room IS one Durable Object — hibernating
+WebSockets, placement near first joiner, R2 for version history, KV cache,
+Queues. They migrated from EC2+MongoDB to this; ~0.5B messages/day with
+~10 engineers. Bashroom's room-actor architecture is the same shape as the
+category leader's, independently derived.
+
+Their choices, and ours against them:
+- Storage sync is server-authoritative op-based with LWW arbitration
+  ("CRDT-like", NOT a CRDT) — same bet as RoomText rebase and Figma.
+- Reconnect: full storage refetch (chunked) + client replays unacked ops
+  by opId with echo-acks. A revision log lets us do BETTER: incremental
+  since-seq catchup. Their model = acceptable fallback.
+- Version history: FULL SNAPSHOTS TO R2 (not deltas, not DO storage),
+  time-window retention, restore applied as a new op — validates the
+  hot(DO)/cold(R2) split and snapshot-cadence policy for history.
+- Presence: ephemeral, strictly separate from storage (= RoomHub). They
+  added server-side TTL presence "for AI agents in rooms" — the incumbent
+  is moving toward bashroom's agent territory.
+- Comments: system of record OFF the room actor; room socket is only the
+  delivery bus. Cross-room features (inbox/search) always need a separate
+  index — never stuff them into the room actor.
+- Published per-room socket caps: 10–100 by plan — the honest single-actor
+  ceiling. Their metered pricing ($1/M storage updates, $0.15/GB stored,
+  collab minutes) maps ~1:1 onto DO billing primitives.
+
+## 2026-07-14 — Actor-model review against OTP/Akka/Orleans + DO-native frameworks
+
+Graded all six DO classes against the primitives mature actor systems
+consider essential (survey: OTP, Akka, Orleans, Restate, Temporal;
+DO-native: cloudflare/actors, partyserver, RivetKit, actor-kit, Agents SDK).
+
+Holds system-wide: durable state, virtual-actor addressing (idFromName),
+passivation with verified byte-exact rehydration, reentrancy (ZERO
+non-storage awaits in any DO class — swept), at-least-once + idempotency
+dedup (RoomText request records ≈ Akka ConsumerController), event sourcing
+with snapshots (RoomText ≈ Akka EventSourcedBehavior). Rows 5–7 are
+hand-built because NO DO-native framework ships them — building was
+correct; do not adopt a framework to get sugar we can write in 50 lines.
+
+Gaps, ranked:
+1. Alarms used by 1 of 6 classes. Missing janitors: .lock TTL expiry
+   (crashed agent's lock lives forever), RoomText idle flush/demote,
+   tombstone sweeps. cloudflare/actors + Agents SDK ship multi-alarm/cron
+   multiplexing over the one-alarm limit — steal the pattern (~50 lines).
+2. No saga/compensation on cross-actor flows: room destroy spans
+   Registry + AccountDO + R2 + RoomHub + DocumentCollab best-effort;
+   orphaned hub rings / comment threads persist in billed DO storage.
+   Fix shape: Registry tombstone + alarm-driven idempotent sweeps.
+3. No backpressure (universal — no framework on DOs provides it either);
+   draft-frame throttle (150ms/socket) is the only edge control. Watch
+   the ~1k req/s per-DO soft limit under agent swarms; metric before fix.
+4. Registry singleton stands as documented bottleneck; DO facets
+   (2026 beta, parent-supervised child objects) is the future shard path.
+
+## 2026-07-14 — RoomText DO authority, exact bytes, and benchmarks
+
+Built an isolated vertical slice under `src/room-text.ts`,
+`src/room-text-store.ts`, and `scripts/room-text-probe/`. It is deliberately
+not wired into production R2/web writes yet: dual-writing two authorities
+would be less correct than either one.
+
+The durable representation is an exact UTF-8 snapshot BLOB plus contiguous
+canonical ChangeSets in DO SQLite. Active documents use a bounded cache of
+immutable CodeMirror `Text` trees. Strings are materialized only at
+open/export/checkpoint boundaries; hibernation may discard every cache entry.
+
+Measured on workerd:
+
+- 50 simultaneous stale edits produced revisions 1–50 with no loss;
+- 50 retries of one logical request produced one durable revision;
+- cache eviction and checkpoint recovery were byte-exact;
+- a 262,144-byte escaped paste exposed and then verified the fix for a SQLite
+  row-overflow bug in the first idempotency schema; and
+- checkpoints and stale work are bounded at 128 updates / 256 KB recovery tail
+  and 256 updates / 1 MB synchronization tail respectively; and
+- checkpoint pruning keeps the collaboration log below 512 rows or around
+  8 MB per file, deleting canonical updates, retry pointers, and orphaned room
+  commits at one atomic history floor.
+
+On an M1 Max, the pure implementation handled roughly 363k–612k validated hot
+edits/second for 10 KB–999 KB documents. Local workerd sustained a median 840
+durably accepted edits/second in three 50-writer bursts. Full tables, pinned
+versions, commands, and the important Bashroom-vs-Liveblocks semantic caveat
+live in `benchmarks/room-text/RESULTS.md`.
+
+Decision: keep JSON on the wire and keep the DO-native central authority.
+JSON Joy's CBOR/MessagePack codecs save only 35–41 bytes on our 229-byte
+envelope, and codec time is negligible next to persistence/network latency.
+Do not rebuild Yjs unless offline or partitioned writers become a measured
+requirement.
+
+## 2026-07-08 — Durable Object serialization, measured
+
+We claim DOs order concurrent writers for us. Checked empirically instead
+of trusting docs — probe rig preserved at `scripts/do-probe/` (run
+`npx wrangler dev -c scripts/do-probe/wrangler.jsonc --port 8791`, then
+`node scripts/do-probe/blast.mjs`). 50 genuinely concurrent requests per
+experiment, on workerd (the production runtime):
+
+| Handler | Design | Result |
+|---|---|---|
+| `/order` — fully synchronous | in-memory `++seq` per request | seqs 1..50, unique, gap-free |
+| `/gated` — RMW through DO storage (awaits storage) | `get` → `put` counter | exactly 50 |
+| `/hazard` — RMW across a NON-storage await | read, `scheduler.wait`, write | **12 of 50** — 76% lost |
+
+Conclusions, in force for all DO code here (RoomHub, DocumentCollab, and
+any future patch-sequencer):
+
+1. Request delivery to a DO is strictly one-at-a-time — arrival order IS
+   the order. No locks/timestamps needed for per-object sequencing.
+2. Input/output gates extend that atomicity across *storage* awaits —
+   storage read-modify-write is safe as written.
+3. Any OTHER await (timer, fetch to R2/another service) is a yield point:
+   the next request runs in the gap. Never carry in-memory state across a
+   non-storage await. Load → apply → store, synchronously with respect to
+   everything that isn't `ctx.storage`.
+4. Harness lesson: our first `/gated` run measured 73/50 — the blast
+   client retried requests whose responses died, double-firing increments.
+   At-least-once clients need idempotency keys before a DO can be trusted
+   as a counter/sequencer of THEIR requests. (Applies to any future
+   patch-mode write: patches must carry an idempotency id so redelivery
+   dedupes.)
+
+Context: this de-risks the "patches through the actor" design (task #5) —
+a per-room DO can sequence `{base_etag, diff, patch_id}` writes from
+concurrent agents+humans with no consensus machinery, provided rules 3–4
+are followed.
+
+## 2026-07-08 — Write-integrity ladder and prior art (pointer)
+
+Same-day survey results that shaped the concurrency design, preserved in
+session artifacts: gcsfuse is the only FUSE mount doing conditional
+write-back (ESTALE to the loser); s3fs/rclone/mountpoint punt; JuiceFS/
+SeaweedFS use metadata sequencers; wal3/SlateDB/delta-rs prove CAS +
+put-if-absent suffice for multi-writer logs (delta-rs documents R2 as
+supported). bashroom's ladder: etag CAS + create_only (shipped) →
+versions/ journal via R2 event notifications (planned) → DO patch
+sequencer (task #5) → CRDT (only if live co-typing becomes the product).
+Shell writes through FUSE remain unconditional — see ARCHITECTURAL.md
+Known limits.

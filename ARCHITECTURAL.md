@@ -1,377 +1,328 @@
 # Bashroom Architecture
 
-## Current architecture (v5)
+This file is the current-state truth. Dated measurements and the reasoning
+behind load-bearing decisions live in [NOTES.md](NOTES.md); start there for
+"why is it built this way".
 
-Bashroom is a cloud shell for coding agents: save notes, share files,
-and hand off work between running sessions. It is backed by R2 and one
-Cloudflare Sandbox per signed-in user. The MCP contract has two layers:
+## Mission
 
-```text
-bashroom({ command, stdin? })
-  -> { stdout, stderr, exitCode, changed, changed_paths }
+Bashroom gives an authenticated agent durable files plus a real Linux shell.
+The product contract is deliberately narrow:
 
-bashroom_write({ path, content, encoding? })
-  -> direct file write through the sandbox writeFile path
+- R2 is the source of truth for files under `/rooms`.
+- The Worker owns authentication, authorization, quotas, and tool contracts.
+- Cloudflare Sandbox supplies disposable compute; it does not own durable data.
+- MCP is the primary agent interface. The CLI and web app are adapters around
+  the same Worker-owned behavior.
 
-bashroom_tree/read/search/stat(...)
-  -> direct bounded R2 metadata/read/search tools
-```
+Bashroom is not a general sandbox product, a git host, or a file-versioning
+system. `history` is an activity log and cannot restore old file contents.
 
-What the worker does on `bashroom({ command })`:
-
-```text
-Agent
-  -> MCP bashroom({ command, stdin? })
-  -> Worker (src/index.ts)
-       1. authorizeAccount(token)
-            -> AccountDO("acct:<user_id>") for routeable tokens
-            -> Registry fallback for legacy tokens during migration
-       2. ensureSandboxReady(env, user_id)
-            -> getSandbox(env.SANDBOXES, user_id)
-            -> setOutboundByHost("bashroom.internal",
-                                 "bashroomControl",
-                                 { userId })
-            -> mountBucket("bashroom-rooms", "/rooms",
-                           { prefix: "/users/<user_id>/" })   // idempotent
-       3. sandbox.createSession({ id: "cmd-<uuid>", cwd: "/", env: { HOME }})
-          session.exec(command, { stdin, timeout: 30_000 })
-          sandbox.deleteSession(id) in finally
-       4. registry.audit-append (best-effort)
-```
-
-The `bashroom` MCP tool runs **only real bash inside the sandbox**. There is no
-worker-side intercept of room-control verbs and no `mkdir` magic. Room admin is
-available through a visible `/usr/local/bin/bashroom` helper inside the sandbox.
-That helper calls `http://bashroom.internal/account/*`; Cloudflare Sandbox
-outbound interception routes that host back into the Worker with the
-authenticated `user_id` supplied as per-sandbox outbound params. No account
-token enters the sandbox.
-
-The structured MCP storage tools do not start bash and do not touch the
-sandbox:
+## End-to-end shape
 
 ```text
-Agent
-  -> MCP bashroom_tree/read/search/stat(...)
-  -> Worker
-       1. authorizeAccount(token, includeRooms=true)
-       2. check room membership + read scope
-       3. use ROOMS_R2 binding directly
-       4. return bounded JSON/text payload
+MCP client
+  -> local stdio adapter (optional, bin/bashroom.js)
+  -> POST /mcp with bearer token
+  -> Worker-owned tool contract
+       -> tree/read/search/stat: authenticated R2 access
+       -> write: authenticated, scope-checked R2 PUT with optional etag CAS
+       -> bash: fresh process session in the user's warm Sandbox
+            -> /rooms: credentialless R2-binding mount, user prefix only
+
+Browser
+  -> /web/api/*
+  -> AccountDO authorization
+  -> direct R2 reads/writes + RoomHub live activity
+
+Role link (/s/<slug>)
+  -> Registry capability lookup (one owner/room/document + role)
+  -> View: anonymous rendered Markdown
+  -> Comment/Edit: Bashroom identity required
+       -> R2 file body + DocumentCollab inline comments
 ```
 
-This keeps execution (`bashroom`) separate from storage/context retrieval
-(`tree`, `read`, `search`, `stat`).
+The stdio server does not declare its own tools. It uses the official MCP
+client transport to forward `tools/list` and `tools/call` to the hosted
+Worker. That makes `src/index.ts` the only MCP contract to maintain.
 
-This is a deliberate product shift from v1. Bashroom v3 is a cloud shell
-for agents, not only a small Markdown memory service. Real `bash`, real
-`rg`, real `git`, real `find`, real `jq` — everything `cloudflare/sandbox`
-ships in its base image, plus tools layered in via the custom Dockerfile.
+## Ownership map
 
-## Component boundaries
+| Component | Owns | Must not own |
+| --- | --- | --- |
+| Worker (`src/index.ts`) | Routes, MCP schemas, authorization, orchestration | Durable file bodies |
+| AccountDO | Hot token verification, per-user quotas, room mirror | File bodies, event history |
+| Registry DO | Users, OAuth/device state, canonical memberships, audit rows | File bodies |
+| R2 (`ROOMS_R2`) | Durable room objects and object metadata | Auth policy |
+| Sandbox DO/container | Warm Linux compute and `/rooms` FUSE mount | Credentials, canonical auth, durable state |
+| RoomHub DO | Presence, recent write activity, ephemeral draft relay | File contents at rest |
+| DocumentCollab DO | Inline comment anchors, bodies, and resolution state for one R2 document | File bodies, share capabilities |
+| CLI (`bin/bashroom.js`) | Login/admin UX and transparent stdio transport | MCP tool definitions |
 
-### Worker (src/index.ts)
+## MCP contract
 
-Owns request routing and trust boundaries.
+The Worker exposes nine tools:
 
-- Verifies routeable account tokens through the per-user AccountDO; legacy
-  tokens fall back to Registry while old clients roll forward.
-- Resolves `user_id` and routes the MCP `bashroom({command})` call to
-  that user's Sandbox. The MCP path runs nothing but real bash.
-- Serves structured MCP storage tools (`tree`, `read`, `search`, `stat`)
-  directly from R2 after the same account gate and room-scope check.
-- Exposes `/account/room-*` HTTP endpoints (create, join, pair, delete,
-  mounts, who, history) for the laptop CLI.
-- Exposes the same non-destructive room-control semantics to the sandbox
-  helper through an internal outbound handler. `destroy` remains
-  laptop-only.
-- Seeds room files directly into R2 during `room-create`.
-- Writes per-exec audit rows back to the Registry DO.
-- Never exposes R2 credentials or internal tokens to the sandbox.
+- `bashroom({ command, stdin? })`: real bash for pipelines, git, regex search,
+  and multi-file operations.
+- `bashroom_write({ path, content, encoding?, base_etag? })`: direct R2 write.
+  The decoded payload is capped at 5 MB. The caller needs room `write` scope.
+  `base_etag` turns replacement into compare-and-swap.
+- `bashroom_tree({ path, max_entries? })`: bounded R2 prefix metadata.
+- `bashroom_read({ path, offset?, max_bytes? })`: bounded text byte range.
+- `bashroom_search(...)`: bounded literal search over eligible R2 text objects.
+- `bashroom_stat({ path })`: R2 object metadata without the body.
+- `bashroom_shared_read({ link, max_bytes? })`: bounded access to the exact
+  document named by a Comment or Edit link, including etag and comments.
+- `bashroom_shared_write({ link, content, base_etag })`: CAS-protected
+  replacement through an Edit link.
+- `bashroom_shared_comment({ link, quote, body, ... })`: add a quote-anchored
+  inline comment through a Comment or Edit link.
 
-### Registry Durable Object (AuthDO / cold path)
+The direct tools exist because starting Linux for one list, read, stat, or PUT
+adds latency and expands authority for no customer benefit. Shell remains the
+escape hatch for operations that genuinely need Unix semantics.
 
-Cold source of truth for OAuth/device login, global room coordination, pair
-codes, legacy tokens, and audit. The hot MCP auth path should not require this
-global object for newly issued routeable tokens.
+Every tool authorizes independently. The `/mcp` transport is stateless and
+does not use an `Mcp-Session-Id`.
 
-- `users`, `user_tokens` — account + bearer tokens.
-- `user_rooms` — room ownership and per-room actor names.
-- `wiki_pair_codes` — short-lived join invites (retained for v2.1 sharing).
-- `device_codes` — OAuth device-flow state.
-- `credit_buckets` — legacy/global cold-path limiter.
-- `audit` — every shell exec and every room-control HTTP call (replaces
-  the per-room audit tables that used to live in Room DOs).
-- Internal user-id based room operations used only by the Worker after
-  Sandbox outbound interception has supplied the trusted `user_id`.
+## Storage and room identity
 
-The Registry never stores file content.
-
-### AccountDO Durable Object
-
-Hot per-user auth, quota, and compact usage state. One deterministic object per
-user:
-
-```text
-ACCOUNTS.getByName("acct:<user_id>")
-```
-
-New tokens are routeable (`br.<user_id>.<secret>`). The user id in the token is
-only a routing hint; AccountDO verifies the full token hash before granting
-access.
-
-AccountDO owns:
-
-- `account_profile` — user id + handle snapshot.
-- `account_tokens` — token hashes, token ids, last seen, revocation.
-- `account_rooms` — account-local mirror of room membership and scopes;
-  canonical room lists still come from Registry during this migration.
-- `rate_buckets` — per-user and per-token token buckets.
-- `daily_usage` — compact per-route counters and byte totals.
-
-AccountDO does not store command event logs or file content. It stores the
-minimum durable state required to answer "is this request allowed?" in one
-per-user coordination point.
-
-### R2 (`bashroom-rooms`)
-
-Durable file store.
+R2 keys are:
 
 ```text
 users/<user_id>/<room>/<path>
 ```
 
-One bucket, single-user-prefixed. Multi-tenant prefix isolation via
-scoped R2 tokens is deferred — current builds use the worker's bucket binding for
-all access, and sandboxes mount the user's prefix through the binding.
+This is a per-user ownership model. Cross-account shared *rooms* are not a
+supported product contract: a membership row alone cannot make two user
+prefixes refer to the same canonical object set. Role links are intentionally
+narrower: they authorize one owner-scoped document without creating a room
+membership or a second storage identity.
 
-### Cloudflare Sandbox
+R2 object `etag`, `version`, `uploaded`, and `size` are authoritative metadata.
+Local/FUSE directory mtimes are not product truth.
 
-One sandbox per `user_id`, kept warm with `sleepAfter = "15m"`.
+### Write consistency
 
-- Image: `docker.io/cloudflare/sandbox:0.10.2` (stock; no user-id baked
-  into the image — the worker tells the sandbox who it's serving at mount
-  time).
-- `/rooms` is FUSE-mounted from R2 lazily on first request after a cold
-  start. Subsequent calls reuse the warm mount.
-- `/usr/local/bin/bashroom` is a sandbox-only helper. It supports
-  `rooms`, `create-room`, `mounts`, `who`, `history`, `pair`, and `join`.
-  For anything else it runs local `bash -lc ...` inside the current
-  sandbox. `login`, `token`, `mcp`, and `destroy` are rejected.
-- Outbound network: only `bashroom.internal` is intentionally handled by
-  Worker code for control-plane calls. Do not pass public internet
-  credentials into the sandbox.
-- Each MCP call uses a **fresh named session** inside the warm sandbox.
-  `cwd`, environment variables, and `/tmp` do not leak between calls —
-  only `/rooms` (R2-backed) persists. This matches v1 semantics and
-  sidesteps the "sleep silently wipes warm state" trap that
-  `defaultSession` would create.
+- Web writes and `bashroom_write` go directly to R2.
+- Both enforce decoded byte limits and room `write` scope.
+- Web sends the etag it read; MCP callers can send `base_etag`.
+- A failed conditional PUT returns `conflict` instead of clobbering a newer
+  object.
+- Shell writes use FUSE and therefore retain normal shell behavior, but they do
+  not currently expose per-file etags or changed-path precision.
 
-### Laptop CLI (`bin/bashroom.js`)
+## Sandbox boundary
 
-The human admin surface. Subcommands:
+There is one Sandbox DO per authenticated `user_id`, configured with
+`sleepAfter = "15m"`. The container image is pinned to
+`docker.io/cloudflare/sandbox:0.12.3` in `Dockerfile`.
 
-- `bashroom login` — device-flow OAuth, stores account token at
-  `~/.bashroom/config.json` (mode 0600).
-- `bashroom rooms` — list rooms with role.
-- `bashroom mounts` — list room mounts with actor + scopes.
-- `bashroom create-room <name>` / `bashroom destroy <room> --yes` —
-  room lifecycle.
-- `bashroom join <invite>` / `bashroom pair <room>` — membership via
-  short-lived pair codes.
-- `bashroom who <room>` / `bashroom history <room>` — observability.
-- `bashroom mcp` — stdio MCP server proxy.
-- `bashroom '<bash>'` — raw bash passthrough to the sandbox (this is
-  what the MCP proxy uses internally).
-
-### MCP tools
-
-Model-facing tools:
-
-- `bashroom` — real bash in the user's sandbox. Use for command execution,
-  scripts, shell pipelines, and advanced `rg`/`find` workflows.
-- `bashroom_write` — direct file write under `/rooms/<room>/...`, bypassing
-  shell quoting and heredoc hazards. Hard cap: 5 MB per write.
-- `bashroom_tree` — direct R2 prefix listing. `/rooms` lists mounted rooms;
-  `/rooms/<room>/<prefix>` lists bounded file metadata.
-- `bashroom_read` — direct bounded R2 text range read. Defaults to 64 KB,
-  max 512 KB per call.
-- `bashroom_search` — bounded literal text search over R2 objects. Defaults
-  to 50 matches, 200 files, and 256 KB scanned per file.
-- `bashroom_stat` — direct R2 metadata for one file: size, modified time,
-  etag, version, content type, custom metadata.
-
-Room lifecycle and destructive admin remain outside the model-facing MCP tool
-surface. Agents can still use the visible sandbox CLI (`bashroom create-room`,
-`bashroom pair`, etc.) through the shell when appropriate, while destructive
-room deletion stays laptop-only.
-
-The CLI's room-admin subcommands hit `/account/room-*` HTTP endpoints
-on the worker. They never share a code path with the MCP tool.
-
-### Sandbox CLI (`bin/sandbox-bashroom.js`)
-
-The sandbox image copies this script to `/usr/local/bin/bashroom`.
-
-- Sends POST JSON to `http://bashroom.internal/account/*` with no auth
-  header. The outbound handler supplies identity from Worker-side
-  per-sandbox params.
-- Does not read `~/.bashroom/config.json`.
-- Does not implement login, token printing, MCP stdio, or destructive
-  room deletion.
-- Falls back to local `bash -lc` for non-control commands, avoiding a
-  recursive Worker -> Sandbox -> Worker remote-bash stack.
-
-### `/web` (read-only browser view)
-
-`/web/api/rooms`, `/web/api/tree`, and `/web/api/file` read directly from
-R2 plus the account gate. For routeable tokens the Worker verifies through
-AccountDO, then reads canonical room lists through Registry's internal
-user-id path and heals the AccountDO room mirror. Never touches the sandbox.
-The web view stays useful even if the FUSE mount is broken.
-
-The browser path intentionally separates metadata from content:
+On first shell use, the Worker mounts:
 
 ```text
-/web/api/rooms?active=<room>
-  -> account rooms + optional active-room R2 metadata tree
-/web/api/tree?room=<room>
-  -> path, size_bytes, updated_at, etag, version, content_type
-/web/api/file?room=<room>&path=<path>
-  -> one selected file body + the same R2 metadata
+binding: ROOMS_R2
+prefix:  /users/<user_id>/
+path:    /rooms
 ```
 
-There is intentionally no full-room content snapshot endpoint. Full-room
-snapshots turn one click into "read every object in the room"; tree + file
-keeps room navigation cheap and lets R2's object metadata (`uploaded`, `size`,
-`etag`, `version`) be the source of truth for file modified time.
+The mount uses Sandbox SDK R2-binding egress through the exported
+`ContainerProxy`. No R2 access key or secret is written into the container.
+A local sentinel forces warm containers with the former credential-bearing
+mount to unmount and migrate once.
 
-### Agent-readable endpoints
+Each shell call creates a fresh named process session and reaps it after the
+response. `cwd` and environment do not carry between calls. The container
+filesystem is still warm and shared: `/tmp` may persist and is visible to
+concurrent calls. Only `/rooms` is a durable product guarantee.
 
-Two static-ish endpoints follow the [llms.txt convention](https://llmstxt.org/)
-so an LLM can discover bashroom without HTML parsing:
+Outbound network is denied except for `bashroom.internal`. The sandbox helper
+uses that internal route for non-destructive room control; the Worker supplies
+the trusted user identity from the Sandbox binding, never from a container
+token.
 
-- `/llms.txt` — table of contents per the spec: H1 + blockquote summary
-  + H2 link sections pointing at README, skill, MCP, source.
-- `/skill.md` — the bundled `skills/bashroom/SKILL.md` served verbatim.
-  The worker imports the file at build time via wrangler's text-import
-  rule (`type: "Text"`, `globs: ["**/*.md"]` in `wrangler.jsonc`), so
-  there's no drift between the repo source and the served version.
+## Authentication and OAuth
 
-Neither endpoint touches the sandbox or R2; they're string constants
-emitted by the worker.
+Two Durable Objects split the hot and cold path:
 
-### OG / social-share image
+- AccountDO verifies routeable bearer tokens, meters requests, and returns the
+  account's room/scopes mirror.
+- Registry owns GitHub/device OAuth, legacy tokens, canonical memberships,
+  share capabilities, and audit events.
 
-`src/og.ts` exports `ogSvg()` — the single source for the 1200×630
-social-preview image. `scripts/render-og.ts` imports it directly and
-rasterizes via `rsvg-convert`, so `assets/og.png` never drifts from the
-`/og.svg` the worker serves (both come from one function). The hero is the
-room file-tree — the product mental model — with brand top-left and tagline
-bottom-right on the fleet diagonal.
+MCP OAuth implements discovery, dynamic client registration, authorization
+code flow, and PKCE S256. Redirect registration accepts public HTTPS URLs and
+loopback HTTP URLs only, with exact-match validation at authorize and token
+exchange. GitHub receives only an opaque `mcp.<state>` value; the registered
+redirect URI, client state, and short-lived authorization code remain in the
+Registry row. This prevents callback-state tampering from selecting a redirect
+target.
 
-bashroom is the canonical reference for the fleet's **static OG lineage**
-(one SVG → `rsvg-convert` → one PNG asset), shared with pingpong and quack.
-The cross-site playbook — the one-centered-hero rule, the composition
-grammar, the per-site palette freedom, the static-vs-dynamic render split,
-and the font/URL/crop gotchas — lives in [`docs/OG-DESIGN.md`](docs/OG-DESIGN.md).
-That doc is the shared design source so a new fleet site's OG lands in the
-family without re-deriving it.
+All deferred Worker work receives the current `ExecutionContext` explicitly.
+There is no module-global request context because isolates may interleave
+requests.
 
-## Wrangler config (`wrangler.jsonc`)
+## Web and live activity
 
-Bindings:
+`/web` is a reader/editor backed directly by R2:
 
-- `REGISTRY` durable object (class `Registry`, SQLite-backed)
-- `ACCOUNTS` durable object (class `AccountDO`, SQLite-backed)
-- `SANDBOXES` durable object (class `Sandbox`, SQLite-backed via SDK)
-- `ROOMS_R2` r2 bucket (`bashroom-rooms`)
-- `containers[]` — image `./Dockerfile` (one-line `FROM
-  docker.io/cloudflare/sandbox:0.10.2`), instance type `lite`, up to 50
-  concurrent instances.
+- `/web/api/rooms`, `/tree`, `/file`, `/raw`, and `/search` are authenticated.
+- `PUT /web/api/file` requires `write` scope and uses etag CAS.
+- `/s/<slug>` carries one immutable `view`, `comment`, or `edit` role. View
+  links may expose a file or room prefix anonymously. Comment/Edit links are
+  exact-file capabilities and require a separate Bashroom account identity.
+- `DocumentCollab` is keyed by the canonical R2 document identity, so all role
+  links for that file share one inline comment thread. Anchors keep rendered
+  text offsets plus the selected quote; the client re-anchors a unique quote
+  after nearby edits and marks ambiguous/missing anchors as moved.
+- Active content types from shares are downgraded to text and rendered
+  Markdown is sanitized under a restrictive CSP. Mermaid fences render in
+  strict mode; ASCII/text diagram fences remain source-faithful.
 
-Migrations:
+RoomHub is keyed by `<user_id>:<room>`. It keeps a small activity ring and
+relays ephemeral draft frames. Every outgoing write or draft is filtered
+against each socket's share prefix. View/Comment sockets are receive-only;
+an authenticated Edit socket may send drafts for its one document. Durable
+saves still use R2 etag CAS rather than treating draft frames as storage.
+Each draft carries the writer's Markdown-source caret offset. Readers map that
+offset into sanitized rendered text and paint an actor-colored cursor; caret
+movement is ephemeral and never enters R2 or the activity log.
 
-- `v1` — `new_sqlite_classes: ["Room"]` (legacy)
-- `v2` — `new_sqlite_classes: ["Registry"]`
-- `v3` — `new_sqlite_classes: ["Sandbox"]`
-- `v4` — `deleted_classes: ["Room"]`
-- `v5` — `new_sqlite_classes: ["AccountDO"]`
+## Audit truth
 
-## Security rules (carry-forward + v3 additions)
+Audit rows record:
 
-- Do not pass worker or R2 master credentials into user-visible shell state.
-- Do not rely on a sandbox environment variable as an unobservable secret.
-  The sandbox control helper sends no bearer token; the outbound handler
-  supplies identity from trusted Worker-side params.
-- Do not add hidden pre-exec parsing to `runShellV2`. Control-plane
-  behavior should stay visible as a real executable on `PATH`.
-- Outbound network is denied unless a deployment is explicitly opted in
-  or routed to a narrow internal handler like `bashroom.internal`.
-- Treat every shell command as untrusted code, even when it comes from a
-  signed-in user's local MCP proxy. The sandbox provides Firecracker-level
-  isolation between users; R2 binding + prefix mount provides tenant data
-  isolation.
+- room lifecycle/control events;
+- direct MCP writes;
+- direct web writes;
+- role-link edits/comments with the recipient handle and account id; and
+- shell commands, attributed to each room explicitly mentioned in the command
+  (or to the account-level log when no room is mentioned).
 
-## Current behavior
+This is observability, not version recovery. Shell changed paths are heuristic
+and currently reported as empty. Do not claim that every filesystem mutation
+is reconstructable.
 
-- MCP execution shape unchanged: `bashroom({ command, stdin? })`.
-- MCP storage/context tools are direct R2 reads/lists, not shell wrappers.
-- `bashroom` response shape unchanged. `changed_paths` is `[]` — FUSE
-  does not natively surface per-file change events. Per-file change
-  tracking is deferred (see below).
-- Each MCP call is independent. `cd`, env vars, and `/tmp` files do not
-  carry between calls. `/rooms` is the only durable surface.
-- `bashroom <control-subcommand>` inside the sandbox is handled by the
-  sandbox helper. Ordinary `bashroom <anything else>` runs local bash.
-- The model can inspect per-file mtimes with shell tools like `stat`, but
-  directory mtimes from the R2 FUSE mount are synthetic. Product UI should
-  use R2 object metadata (`uploaded`) for last-modified displays.
+## Build and source layout
 
-## Deferred work
+Runtime source is committed, including:
 
-- Shared rooms across users (pair codes mint membership; current builds only
-  mounts owned rooms).
-- Sessions-as-git (`git init` per room plus daily commit cron — trivial
-  to add later because `git` is already in the sandbox image).
-- Per-file `changed_paths` precision (probably `find -newer` or inotify).
-- Multi-tenant R2 prefix isolation via scoped tokens (single-user means
-  the worker's bucket binding is the only access path for now).
-- Browser terminal feature via `sandbox.terminal()` — out of scope; the
-  MCP path uses `session.exec()` only.
-- Cleanup of the `_diag/` and `_diagnostic/` probe objects in R2 from
-  the migration window. Safe to leave; harmless and bounded.
+```text
+src/index.ts
+src/security.ts
+src/document-collab.ts
+src/web-collab.ts
+src/web-ui.ts
+src/web-landing.ts
+src/web-device.ts
+bin/bashroom.js
+bin/sandbox-bashroom.js
+skills/bashroom/SKILL.md
+```
 
-## Non-goals
+The Worker bundles `skills/bashroom/SKILL.md` and serves the exact bytes at
+`/skill.md`; the repo skill and hosted agent guidance therefore share one
+source. `npm run check` runs TypeScript, focused security tests, and the CLI
+smoke test. A clean checkout must pass the same command.
 
-These are explicit boundaries, not "later":
+## Security invariants
 
-- Bashroom is not a general code-execution platform. The MCP surface is the
-  only interface; the sandbox is an implementation detail.
-- Bashroom is not a sandbox provider. We use Cloudflare's; we do not
-  expose sandbox lifecycle, image config, or network policy to users.
-- Bashroom does not own session export, transcript parsing, or model
-  summarization. Those are CLI / external concerns.
+- Never put bearer tokens, R2 credentials, or OAuth secrets in the sandbox.
+- Parse and authorize the exact room before every direct R2 operation.
+- Enforce limits on decoded bytes, not JavaScript character count.
+- Use etag compare-and-swap for read/modify/write flows.
+- Treat Markdown, filenames, WebSocket frames, and shell commands as untrusted.
+- Keep public share events inside their authorized prefix.
+- Never return owner storage coordinates or sibling paths to a role-link user.
+- Keep destructive room deletion outside the model-facing MCP surface.
 
-## Migration history
+## Infrastructure tradeoffs
 
-v1 → v2 was a hard cutover: single-user, one deploy, no soak period.
-File contents moved from per-room Durable Object snapshots to
-`users/<user_id>/<room>/<path>` in the `bashroom-rooms` R2 bucket. The
-Room DO class is dropped in the `v4` migration tag (kept in the
-migration log for replay safety; do not remove past tags).
+Why each layer is what it is, and what was deliberately rejected. Evidence
+and dated measurements behind these calls live in NOTES.md.
 
-## Validation standard
+**Files live in R2, not in Durable Objects, not in D1, not in S3.**
+R2 is strongly consistent, S3-compatible (so the sandbox can FUSE-mount it
+— the whole `/rooms` illusion depends on this), has commit-time conditional
+puts (etag CAS + If-None-Match:* create-only), zero egress, and no
+per-value size ceiling that fights 5MB documents. DO storage cannot be
+mounted, costs more per byte, and funnels every read through a
+single-threaded actor. D1 is one global database — our hot operations are
+per-entity read-modify-write races, which sharded actors make atomic by
+construction; the one global-database-shaped thing we have (Registry) is
+our documented bottleneck, evidence against centralizing further. S3 would
+match R2 semantically but adds egress fees and long-lived credentials the
+binding-mode mounts just eliminated.
 
-Every implementation step must preserve:
+**Coordination is optimistic CAS, not CRDT, not consensus, not git.**
+The decision rule is topology: (1) a single authority every writer can
+reach exists (R2 behind one Worker) → consensus protocols are redundant —
+Durable Objects already run consensus underneath; a DO IS a
+platform-provided ordered actor. (2) Writers are never partitioned from
+that authority (agents call our API) → CRDTs' coordination-free merging
+buys nothing and costs merge semantics we can't control. (3) The workload
+is handoff-shaped (agents take turns on shared live memory), not
+parallel-attempt-shaped → git-style branch/fork/merge (Cloudflare
+Artifacts, Mesa) solves a different product. Conflicts are rare and
+explicit: losers get the current etag and retry. Escalation path if
+conflict rates ever demand it: the measured per-room RoomText sequencer
+described below, not a CRDT protocol.
 
-- CLI surface compatibility: `bashroom login`, `bashroom rooms`,
-  `bashroom create-room`, `bashroom mcp`, raw bash passthrough.
-- MCP contract compatibility: `bashroom({command, stdin?})` returns
-  `{stdout, stderr, exitCode, changed, changed_paths}`.
-- Account token never appears in model-visible tool arguments.
-- In-sandbox room admin works through `/usr/local/bin/bashroom` without
-  exposing a bearer token.
-- Default network-denied commands fail closed, except the explicit
-  `bashroom.internal` control channel.
-- Migrated room files match the pre-migration snapshot byte-for-byte.
+**RoomText is a measured candidate, not production authority yet.** The
+isolated implementation in `src/room-text.ts` and `src/room-text-store.ts`
+stores one room's collaborative text as exact UTF-8 snapshot BLOBs plus a
+contiguous canonical ChangeSet tail in DO SQLite. A bounded cache holds
+immutable CodeMirror `Text` trees for active files; strings exist only at
+open/export/checkpoint boundaries. Idempotent requests, revision advance,
+canonical update, and room commit persist in one synchronous transaction.
+Recovery checkpoints every 128 updates or 256 KB of tail; clients more than
+256 updates or 1 MB of update payload behind reset to the current snapshot.
+Checkpoint pruning retains 384 canonical updates or 8 MB, which keeps the
+physical live-sync log below 512 rows between pruning passes. This retention
+is not a substitute for future user-visible file-version snapshots.
+
+The workerd and cross-library results are in
+`benchmarks/room-text/RESULTS.md`. Do not wire RoomText into web/MCP writes
+until the production cutover can make it the sole authority. Dual-writing R2
+and SQLite cannot be atomic and would create split-brain. Until that cutover,
+all current R2/etag behavior documented above remains the product truth.
+
+**Durable Objects are small synchronous arbiters, never large
+orchestrators.** Measured (NOTES.md): request delivery is strictly
+serialized and storage-gated read-modify-write is atomic, but any
+non-storage await is a yield point that loses concurrent updates. So DOs
+here hold the atomic moment only — presence fan-out, comment threads,
+counters, candidate RoomText sequencing — and all I/O composition stays in the
+Worker. Granularity follows consistency boundaries: per-room where events
+share a timeline (RoomHub), per-document where threads serialize
+(DocumentCollab), per-user for isolation (AccountDO, Sandbox), global only
+where unavoidable (Registry).
+
+**The shell path trades integrity for zero ceremony, knowingly.** POSIX
+write() cannot carry a precondition, so bash writes are unconditional
+last-write-wins (see Known limits). The alternatives — commit ceremony
+(git-shaped) or a custom CAS FUSE shim (gcsfuse-style, prior art in
+NOTES.md) — are deliberately deferred until measured conflict rates
+justify them. Mitigations shipped instead: agents are steered to
+bashroom_write (CAS + create_only), and the seeded room conventions teach
+create_only-based lock files.
+
+## Known limits
+
+- No cross-account canonical shared-room identity.
+- No file-version recovery or CRDT merge layer.
+- Concurrent divergent drafts do not merge: the latest live frame is shown,
+  and competing durable saves still resolve through an explicit etag conflict.
+- Shell writes bypass CAS: `echo > file` over the FUSE mount is an
+  unconditional S3 put — POSIX write() carries no precondition slot, so the
+  etag/create_only protections exist only on the MCP and web write paths
+  (even `>>` is a whole-object read-modify-write under s3fs). Agents are
+  steered to bashroom_write for anything contested.
+- No exact changed-path capture for arbitrary shell commands.
+- Ranged text reads use byte offsets; callers should page at UTF-8 boundaries.
+- The global Registry remains on legacy/cold authorization paths and can still
+  be a coordination bottleneck there.
+
+Document role links provide scoped collaboration; they do not turn the room
+into a shared filesystem or provide CRDT merging/version recovery.
