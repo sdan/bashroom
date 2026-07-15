@@ -1,0 +1,1592 @@
+{
+ "config": {
+  "ONE_WAY_MS": 25,
+  "KEYSTROKE_MS": 80,
+  "KEYSTROKES": 60,
+  "AGENT_AT": 30,
+  "AUTOSAVE_MS": 700,
+  "REFETCH_DEBOUNCE_MS": 350
+ },
+ "a": {
+  "path": "A: whole-file CAS + refetch (current prod semantics)",
+  "events": [
+   {
+    "t": 0.017707999999998947,
+    "type": "keystroke",
+    "i": 0
+   },
+   {
+    "t": 80.542,
+    "type": "keystroke",
+    "i": 1
+   },
+   {
+    "t": 161.698625,
+    "type": "keystroke",
+    "i": 2
+   },
+   {
+    "t": 242.88083299999997,
+    "type": "keystroke",
+    "i": 3
+   },
+   {
+    "t": 323.119458,
+    "type": "keystroke",
+    "i": 4
+   },
+   {
+    "t": 404.36291600000004,
+    "type": "keystroke",
+    "i": 5
+   },
+   {
+    "t": 485.194916,
+    "type": "keystroke",
+    "i": 6
+   },
+   {
+    "t": 566.3366659999999,
+    "type": "keystroke",
+    "i": 7
+   },
+   {
+    "t": 646.89575,
+    "type": "keystroke",
+    "i": 8
+   },
+   {
+    "t": 728.0620829999999,
+    "type": "keystroke",
+    "i": 9
+   },
+   {
+    "t": 780.4875,
+    "type": "human-saved",
+    "chars": 10
+   },
+   {
+    "t": 861.6971249999999,
+    "type": "keystroke",
+    "i": 10
+   },
+   {
+    "t": 942.8154159999999,
+    "type": "keystroke",
+    "i": 11
+   },
+   {
+    "t": 1024.149625,
+    "type": "keystroke",
+    "i": 12
+   },
+   {
+    "t": 1104.784875,
+    "type": "keystroke",
+    "i": 13
+   },
+   {
+    "t": 1183.5517499999999,
+    "type": "observer-saw",
+    "latency": 455.37087500000007,
+    "content": "the quick "
+   },
+   {
+    "t": 1184.781416,
+    "type": "keystroke",
+    "i": 14
+   },
+   {
+    "t": 1265.1779999999999,
+    "type": "keystroke",
+    "i": 15
+   },
+   {
+    "t": 1346.320416,
+    "type": "keystroke",
+    "i": 16
+   },
+   {
+    "t": 1427.4285,
+    "type": "keystroke",
+    "i": 17
+   },
+   {
+    "t": 1508.5807909999999,
+    "type": "keystroke",
+    "i": 18
+   },
+   {
+    "t": 1559.924,
+    "type": "human-saved",
+    "chars": 19
+   },
+   {
+    "t": 1641.042125,
+    "type": "keystroke",
+    "i": 19
+   },
+   {
+    "t": 1722.119833,
+    "type": "keystroke",
+    "i": 20
+   },
+   {
+    "t": 1803.334625,
+    "type": "keystroke",
+    "i": 21
+   },
+   {
+    "t": 1884.429375,
+    "type": "keystroke",
+    "i": 22
+   },
+   {
+    "t": 1962.871958,
+    "type": "observer-saw",
+    "latency": 454.28274999999985,
+    "content": "the quick brown fox"
+   },
+   {
+    "t": 1965.044791,
+    "type": "keystroke",
+    "i": 23
+   },
+   {
+    "t": 2045.237625,
+    "type": "keystroke",
+    "i": 24
+   },
+   {
+    "t": 2126.339625,
+    "type": "keystroke",
+    "i": 25
+   },
+   {
+    "t": 2206.715,
+    "type": "keystroke",
+    "i": 26
+   },
+   {
+    "t": 2287.8305410000003,
+    "type": "keystroke",
+    "i": 27
+   },
+   {
+    "t": 2340.1108750000003,
+    "type": "human-saved",
+    "chars": 28
+   },
+   {
+    "t": 2421.2272080000002,
+    "type": "keystroke",
+    "i": 28
+   },
+   {
+    "t": 2501.381291,
+    "type": "keystroke",
+    "i": 29
+   },
+   {
+    "t": 2581.7697080000003,
+    "type": "keystroke",
+    "i": 30
+   },
+   {
+    "t": 2661.4991250000003,
+    "type": "keystroke",
+    "i": 31
+   },
+   {
+    "t": 2685.641458,
+    "type": "agent-wrote",
+    "ok": true
+   },
+   {
+    "t": 2742.858666,
+    "type": "keystroke",
+    "i": 32
+   },
+   {
+    "t": 2742.895625,
+    "type": "observer-saw",
+    "latency": 455.0501669999999,
+    "content": "# agent header\n\nthe quick brown fox jumps ov"
+   },
+   {
+    "t": 2823.9850410000004,
+    "type": "keystroke",
+    "i": 33
+   },
+   {
+    "t": 2905.079708,
+    "type": "keystroke",
+    "i": 34
+   },
+   {
+    "t": 2984.481208,
+    "type": "keystroke",
+    "i": 35
+   },
+   {
+    "t": 3064.2441660000004,
+    "type": "keystroke",
+    "i": 36
+   },
+   {
+    "t": 3087.331958,
+    "type": "observer-saw",
+    "latency": 401.6837919999998,
+    "content": "# agent header\n\nthe quick brown fox jumps ov"
+   },
+   {
+    "t": 3115.824791,
+    "type": "human-conflict-load-theirs",
+    "lost": 9
+   },
+   {
+    "t": 3196.9470410000004,
+    "type": "keystroke",
+    "i": 37
+   },
+   {
+    "t": 3278.199791,
+    "type": "keystroke",
+    "i": 38
+   },
+   {
+    "t": 3359.407416,
+    "type": "keystroke",
+    "i": 39
+   },
+   {
+    "t": 3439.601208,
+    "type": "keystroke",
+    "i": 40
+   },
+   {
+    "t": 3520.4841250000004,
+    "type": "keystroke",
+    "i": 41
+   },
+   {
+    "t": 3601.4247910000004,
+    "type": "keystroke",
+    "i": 42
+   },
+   {
+    "t": 3681.957541,
+    "type": "keystroke",
+    "i": 43
+   },
+   {
+    "t": 3763.049958,
+    "type": "keystroke",
+    "i": 44
+   },
+   {
+    "t": 3844.1697910000003,
+    "type": "keystroke",
+    "i": 45
+   },
+   {
+    "t": 3895.655458,
+    "type": "human-saved",
+    "chars": 53
+   },
+   {
+    "t": 3976.8709160000003,
+    "type": "keystroke",
+    "i": 46
+   },
+   {
+    "t": 4057.660083,
+    "type": "keystroke",
+    "i": 47
+   },
+   {
+    "t": 4138.478791,
+    "type": "keystroke",
+    "i": 48
+   },
+   {
+    "t": 4219.643875,
+    "type": "keystroke",
+    "i": 49
+   },
+   {
+    "t": 4300.524125,
+    "type": "keystroke",
+    "i": 50
+   },
+   {
+    "t": 4304.185708,
+    "type": "observer-saw",
+    "latency": 459.9837909999992,
+    "content": "# agent header\n\nthe quick brown fox jumps ovzy dog an"
+   },
+   {
+    "t": 4381.517833,
+    "type": "keystroke",
+    "i": 51
+   },
+   {
+    "t": 4462.726,
+    "type": "keystroke",
+    "i": 52
+   },
+   {
+    "t": 4543.830916,
+    "type": "keystroke",
+    "i": 53
+   },
+   {
+    "t": 4624.925749999999,
+    "type": "keystroke",
+    "i": 54
+   },
+   {
+    "t": 4677.322166,
+    "type": "human-saved",
+    "chars": 62
+   },
+   {
+    "t": 4758.114375,
+    "type": "keystroke",
+    "i": 55
+   },
+   {
+    "t": 4838.9821249999995,
+    "type": "keystroke",
+    "i": 56
+   },
+   {
+    "t": 4920.258916,
+    "type": "keystroke",
+    "i": 57
+   },
+   {
+    "t": 5000.567833,
+    "type": "keystroke",
+    "i": 58
+   },
+   {
+    "t": 5080.273416,
+    "type": "observer-saw",
+    "latency": 455.3386250000003,
+    "content": "# agent header\n\nthe quick brown fox jumps ovzy dog and keeps t"
+   },
+   {
+    "t": 5080.2853749999995,
+    "type": "keystroke",
+    "i": 59
+   },
+   {
+    "t": 5213.593583,
+    "type": "human-saved",
+    "chars": 67
+   },
+   {
+    "t": 5691.851083,
+    "type": "observer-saw",
+    "latency": 530.4582910000008,
+    "content": "# agent header\n\nthe quick brown fox jumps ovzy dog and keeps typing"
+   }
+  ],
+  "lostKeystrokes": 9,
+  "agentSurvived": true,
+  "humanTextSurvived": false,
+  "finalContent": "# agent header\n\nthe quick brown fox jumps ovzy dog and keeps typing",
+  "observerLatencies": [
+   455.37087500000007,
+   454.28274999999985,
+   455.0501669999999,
+   401.6837919999998,
+   459.9837909999992,
+   455.3386250000003,
+   530.4582910000008
+  ]
+ },
+ "b": {
+  "path": "B: RoomText rebase over WS (real workerd)",
+  "events": [
+   {
+    "t": 278.0690420000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 0,
+      "to": 0,
+      "insert": "t"
+     }
+    ]
+   },
+   {
+    "t": 278.14650000000074,
+    "type": "keystroke",
+    "i": 0,
+    "revision": 1
+   },
+   {
+    "t": 367.7656670000006,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 1,
+      "to": 1,
+      "insert": "h"
+     }
+    ]
+   },
+   {
+    "t": 367.80866700000024,
+    "type": "keystroke",
+    "i": 1,
+    "revision": 2
+   },
+   {
+    "t": 455.06883300000027,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 2,
+      "to": 2,
+      "insert": "e"
+     }
+    ]
+   },
+   {
+    "t": 455.117792,
+    "type": "keystroke",
+    "i": 2,
+    "revision": 3
+   },
+   {
+    "t": 539.1803330000002,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 3,
+      "to": 3,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 539.2232080000003,
+    "type": "keystroke",
+    "i": 3,
+    "revision": 4
+   },
+   {
+    "t": 629.2685420000007,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 4,
+      "to": 4,
+      "insert": "q"
+     }
+    ]
+   },
+   {
+    "t": 629.3279170000005,
+    "type": "keystroke",
+    "i": 4,
+    "revision": 5
+   },
+   {
+    "t": 718.8180420000008,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 5,
+      "to": 5,
+      "insert": "u"
+     }
+    ]
+   },
+   {
+    "t": 718.8595420000001,
+    "type": "keystroke",
+    "i": 5,
+    "revision": 6
+   },
+   {
+    "t": 804.2549170000002,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 6,
+      "to": 6,
+      "insert": "i"
+     }
+    ]
+   },
+   {
+    "t": 804.2879580000008,
+    "type": "keystroke",
+    "i": 6,
+    "revision": 7
+   },
+   {
+    "t": 912.9559170000002,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 7,
+      "to": 7,
+      "insert": "c"
+     }
+    ]
+   },
+   {
+    "t": 921.1081250000007,
+    "type": "keystroke",
+    "i": 7,
+    "revision": 8
+   },
+   {
+    "t": 1020.4985830000005,
+    "type": "keystroke",
+    "i": 8,
+    "revision": 9
+   },
+   {
+    "t": 1020.5295420000002,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 8,
+      "to": 8,
+      "insert": "k"
+     }
+    ]
+   },
+   {
+    "t": 1106.8455000000004,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 9,
+      "to": 9,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 1107.4201670000002,
+    "type": "keystroke",
+    "i": 9,
+    "revision": 10
+   },
+   {
+    "t": 1211.2299170000006,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 10,
+      "to": 10,
+      "insert": "b"
+     }
+    ]
+   },
+   {
+    "t": 1211.2845830000006,
+    "type": "keystroke",
+    "i": 10,
+    "revision": 11
+   },
+   {
+    "t": 1310.3113750000002,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 11,
+      "to": 11,
+      "insert": "r"
+     }
+    ]
+   },
+   {
+    "t": 1310.3850000000002,
+    "type": "keystroke",
+    "i": 11,
+    "revision": 12
+   },
+   {
+    "t": 1394.7804170000009,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 12,
+      "to": 12,
+      "insert": "o"
+     }
+    ]
+   },
+   {
+    "t": 1394.8342080000002,
+    "type": "keystroke",
+    "i": 12,
+    "revision": 13
+   },
+   {
+    "t": 1478.4855000000007,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 13,
+      "to": 13,
+      "insert": "w"
+     }
+    ]
+   },
+   {
+    "t": 1478.5364170000003,
+    "type": "keystroke",
+    "i": 13,
+    "revision": 14
+   },
+   {
+    "t": 1568.4465420000006,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 14,
+      "to": 14,
+      "insert": "n"
+     }
+    ]
+   },
+   {
+    "t": 1568.520958,
+    "type": "keystroke",
+    "i": 14,
+    "revision": 15
+   },
+   {
+    "t": 1652.8070000000007,
+    "type": "keystroke",
+    "i": 15,
+    "revision": 16
+   },
+   {
+    "t": 1652.8349170000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 15,
+      "to": 15,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 1746.0234170000003,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 16,
+      "to": 16,
+      "insert": "f"
+     }
+    ]
+   },
+   {
+    "t": 1746.0930420000004,
+    "type": "keystroke",
+    "i": 16,
+    "revision": 17
+   },
+   {
+    "t": 1830.9424580000004,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 17,
+      "to": 17,
+      "insert": "o"
+     }
+    ]
+   },
+   {
+    "t": 1830.9937500000005,
+    "type": "keystroke",
+    "i": 17,
+    "revision": 18
+   },
+   {
+    "t": 1917.0646670000006,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 18,
+      "to": 18,
+      "insert": "x"
+     }
+    ]
+   },
+   {
+    "t": 1917.109625,
+    "type": "keystroke",
+    "i": 18,
+    "revision": 19
+   },
+   {
+    "t": 2001.9979170000006,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 19,
+      "to": 19,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 2002.0998749999999,
+    "type": "keystroke",
+    "i": 19,
+    "revision": 20
+   },
+   {
+    "t": 2086.285250000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 20,
+      "to": 20,
+      "insert": "j"
+     }
+    ]
+   },
+   {
+    "t": 2086.307125000001,
+    "type": "keystroke",
+    "i": 20,
+    "revision": 21
+   },
+   {
+    "t": 2171.8077919999996,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 21,
+      "to": 21,
+      "insert": "u"
+     }
+    ]
+   },
+   {
+    "t": 2171.84425,
+    "type": "keystroke",
+    "i": 21,
+    "revision": 22
+   },
+   {
+    "t": 2258.2596250000006,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 22,
+      "to": 22,
+      "insert": "m"
+     }
+    ]
+   },
+   {
+    "t": 2258.3077919999996,
+    "type": "keystroke",
+    "i": 22,
+    "revision": 23
+   },
+   {
+    "t": 2344.8925419999996,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 23,
+      "to": 23,
+      "insert": "p"
+     }
+    ]
+   },
+   {
+    "t": 2344.9221670000006,
+    "type": "keystroke",
+    "i": 23,
+    "revision": 24
+   },
+   {
+    "t": 2429.412375,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 24,
+      "to": 24,
+      "insert": "s"
+     }
+    ]
+   },
+   {
+    "t": 2429.446833,
+    "type": "keystroke",
+    "i": 24,
+    "revision": 25
+   },
+   {
+    "t": 2512.725458000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 25,
+      "to": 25,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 2512.752958000001,
+    "type": "keystroke",
+    "i": 25,
+    "revision": 26
+   },
+   {
+    "t": 2597.8003750000007,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 26,
+      "to": 26,
+      "insert": "o"
+     }
+    ]
+   },
+   {
+    "t": 2597.8235830000012,
+    "type": "keystroke",
+    "i": 26,
+    "revision": 27
+   },
+   {
+    "t": 2683.010333,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 27,
+      "to": 27,
+      "insert": "v"
+     }
+    ]
+   },
+   {
+    "t": 2683.0438329999997,
+    "type": "keystroke",
+    "i": 27,
+    "revision": 28
+   },
+   {
+    "t": 2767.46975,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 28,
+      "to": 28,
+      "insert": "e"
+     }
+    ]
+   },
+   {
+    "t": 2767.5030000000006,
+    "type": "keystroke",
+    "i": 28,
+    "revision": 29
+   },
+   {
+    "t": 2852.5920829999995,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 29,
+      "to": 29,
+      "insert": "r"
+     }
+    ]
+   },
+   {
+    "t": 2852.6799580000006,
+    "type": "keystroke",
+    "i": 29,
+    "revision": 30
+   },
+   {
+    "t": 2937.7996249999997,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 30,
+      "to": 30,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 2937.8355420000007,
+    "type": "keystroke",
+    "i": 30,
+    "revision": 31
+   },
+   {
+    "t": 2997.0017500000013,
+    "type": "observer-update",
+    "clientId": "agent",
+    "changes": [
+     {
+      "from": 0,
+      "to": 0,
+      "insert": "# agent header\n\n"
+     }
+    ]
+   },
+   {
+    "t": 2997.0354580000003,
+    "type": "agent-wrote",
+    "revision": 32
+   },
+   {
+    "t": 3022.8229169999995,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 47,
+      "to": 47,
+      "insert": "t"
+     }
+    ]
+   },
+   {
+    "t": 3022.856708000001,
+    "type": "keystroke",
+    "i": 31,
+    "revision": 33
+   },
+   {
+    "t": 3118.278292000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 48,
+      "to": 48,
+      "insert": "h"
+     }
+    ]
+   },
+   {
+    "t": 3118.311417000001,
+    "type": "keystroke",
+    "i": 32,
+    "revision": 34
+   },
+   {
+    "t": 3205.2862079999995,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 49,
+      "to": 49,
+      "insert": "e"
+     }
+    ]
+   },
+   {
+    "t": 3205.3179579999996,
+    "type": "keystroke",
+    "i": 33,
+    "revision": 35
+   },
+   {
+    "t": 3292.305042,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 50,
+      "to": 50,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 3292.3430420000004,
+    "type": "keystroke",
+    "i": 34,
+    "revision": 36
+   },
+   {
+    "t": 3386.517250000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 51,
+      "to": 51,
+      "insert": "l"
+     }
+    ]
+   },
+   {
+    "t": 3386.5944170000002,
+    "type": "keystroke",
+    "i": 35,
+    "revision": 37
+   },
+   {
+    "t": 3482.2233749999996,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 52,
+      "to": 52,
+      "insert": "a"
+     }
+    ]
+   },
+   {
+    "t": 3482.312250000001,
+    "type": "keystroke",
+    "i": 36,
+    "revision": 38
+   },
+   {
+    "t": 3571.3205420000013,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 53,
+      "to": 53,
+      "insert": "z"
+     }
+    ]
+   },
+   {
+    "t": 3571.3685830000013,
+    "type": "keystroke",
+    "i": 37,
+    "revision": 39
+   },
+   {
+    "t": 3656.559333000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 54,
+      "to": 54,
+      "insert": "y"
+     }
+    ]
+   },
+   {
+    "t": 3656.634333,
+    "type": "keystroke",
+    "i": 38,
+    "revision": 40
+   },
+   {
+    "t": 3742.9643749999996,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 55,
+      "to": 55,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 3743.437417000001,
+    "type": "keystroke",
+    "i": 39,
+    "revision": 41
+   },
+   {
+    "t": 3827.9645419999997,
+    "type": "keystroke",
+    "i": 40,
+    "revision": 42
+   },
+   {
+    "t": 3828.002917,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 56,
+      "to": 56,
+      "insert": "d"
+     }
+    ]
+   },
+   {
+    "t": 3912.694292,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 57,
+      "to": 57,
+      "insert": "o"
+     }
+    ]
+   },
+   {
+    "t": 3912.734542,
+    "type": "keystroke",
+    "i": 41,
+    "revision": 43
+   },
+   {
+    "t": 3997.643750000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 58,
+      "to": 58,
+      "insert": "g"
+     }
+    ]
+   },
+   {
+    "t": 3997.6804580000007,
+    "type": "keystroke",
+    "i": 42,
+    "revision": 44
+   },
+   {
+    "t": 4082.1967920000006,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 59,
+      "to": 59,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 4082.2492500000008,
+    "type": "keystroke",
+    "i": 43,
+    "revision": 45
+   },
+   {
+    "t": 4168.205750000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 60,
+      "to": 60,
+      "insert": "a"
+     }
+    ]
+   },
+   {
+    "t": 4168.245417,
+    "type": "keystroke",
+    "i": 44,
+    "revision": 46
+   },
+   {
+    "t": 4251.133542,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 61,
+      "to": 61,
+      "insert": "n"
+     }
+    ]
+   },
+   {
+    "t": 4251.176167,
+    "type": "keystroke",
+    "i": 45,
+    "revision": 47
+   },
+   {
+    "t": 4335.301292,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 62,
+      "to": 62,
+      "insert": "d"
+     }
+    ]
+   },
+   {
+    "t": 4335.335500000001,
+    "type": "keystroke",
+    "i": 46,
+    "revision": 48
+   },
+   {
+    "t": 4419.782583,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 63,
+      "to": 63,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 4419.840667,
+    "type": "keystroke",
+    "i": 47,
+    "revision": 49
+   },
+   {
+    "t": 4504.346167,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 64,
+      "to": 64,
+      "insert": "k"
+     }
+    ]
+   },
+   {
+    "t": 4504.379375,
+    "type": "keystroke",
+    "i": 48,
+    "revision": 50
+   },
+   {
+    "t": 4589.113792,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 65,
+      "to": 65,
+      "insert": "e"
+     }
+    ]
+   },
+   {
+    "t": 4589.142833,
+    "type": "keystroke",
+    "i": 49,
+    "revision": 51
+   },
+   {
+    "t": 4674.425000000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 66,
+      "to": 66,
+      "insert": "e"
+     }
+    ]
+   },
+   {
+    "t": 4674.497125,
+    "type": "keystroke",
+    "i": 50,
+    "revision": 52
+   },
+   {
+    "t": 4758.297875,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 67,
+      "to": 67,
+      "insert": "p"
+     }
+    ]
+   },
+   {
+    "t": 4758.331250000001,
+    "type": "keystroke",
+    "i": 51,
+    "revision": 53
+   },
+   {
+    "t": 4843.518292000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 68,
+      "to": 68,
+      "insert": "s"
+     }
+    ]
+   },
+   {
+    "t": 4843.552250000001,
+    "type": "keystroke",
+    "i": 52,
+    "revision": 54
+   },
+   {
+    "t": 4928.223417000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 69,
+      "to": 69,
+      "insert": " "
+     }
+    ]
+   },
+   {
+    "t": 4928.258208000001,
+    "type": "keystroke",
+    "i": 53,
+    "revision": 55
+   },
+   {
+    "t": 5013.179333,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 70,
+      "to": 70,
+      "insert": "t"
+     }
+    ]
+   },
+   {
+    "t": 5013.214333,
+    "type": "keystroke",
+    "i": 54,
+    "revision": 56
+   },
+   {
+    "t": 5097.216542,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 71,
+      "to": 71,
+      "insert": "y"
+     }
+    ]
+   },
+   {
+    "t": 5097.250042,
+    "type": "keystroke",
+    "i": 55,
+    "revision": 57
+   },
+   {
+    "t": 5182.094375000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 72,
+      "to": 72,
+      "insert": "p"
+     }
+    ]
+   },
+   {
+    "t": 5182.147583,
+    "type": "keystroke",
+    "i": 56,
+    "revision": 58
+   },
+   {
+    "t": 5268.860042,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 73,
+      "to": 73,
+      "insert": "i"
+     }
+    ]
+   },
+   {
+    "t": 5268.903708,
+    "type": "keystroke",
+    "i": 57,
+    "revision": 59
+   },
+   {
+    "t": 5353.598375,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 74,
+      "to": 74,
+      "insert": "n"
+     }
+    ]
+   },
+   {
+    "t": 5353.631000000001,
+    "type": "keystroke",
+    "i": 58,
+    "revision": 60
+   },
+   {
+    "t": 5440.620833000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 75,
+      "to": 75,
+      "insert": "g"
+     }
+    ]
+   },
+   {
+    "t": 5440.676208000001,
+    "type": "keystroke",
+    "i": 59,
+    "revision": 61
+   },
+   {
+    "t": 5527.210000000001,
+    "type": "observer-update",
+    "clientId": "writer",
+    "changes": [
+     {
+      "from": 76,
+      "to": 76,
+      "insert": "."
+     }
+    ]
+   }
+  ],
+  "lostKeystrokes": 0,
+  "agentSurvived": true,
+  "humanTextSurvived": true,
+  "finalContent": "# agent header\n\nthe quick brown fox jumps over the lazy dog and keeps typing.",
+  "observerLatencies": [
+   54.46783300000061,
+   58.37358300000051,
+   56.06945900000028,
+   52.88508399999955,
+   58.59199999999964,
+   57.915500000000065,
+   54.23320899999999,
+   77.29899999999998,
+   68.44174999999996,
+   55.447417000000314,
+   73.07141600000068,
+   67.00675000000047,
+   53.26245899999958,
+   52.53295799999978,
+   58.7872499999994,
+   53.191374999999425,
+   57.66229199999998,
+   53.99041699999998,
+   54.7792500000005,
+   53.74687500000073,
+   53.65866599999936,
+   54.398583000000144,
+   55.7271669999991,
+   55.417084000000614,
+   53.72954200000095,
+   52.81129099999998,
+   54.30116699999962,
+   54.025916999999026,
+   53.58299999999872,
+   54.40308399999958,
+   54.007166999999754,
+   53.34529199999997,
+   64.3144169999996,
+   55.24920899999961,
+   55.806125000000975,
+   63.07125000000087,
+   55.132917000000816,
+   58.263458000001265,
+   54.16004099999918,
+   55.79324999999881,
+   53.877707999999984,
+   53.58229200000096,
+   53.78383400000166,
+   53.955832999999984,
+   54.83954199999971,
+   52.78833400000076,
+   53.03870900000038,
+   53.733000000000175,
+   53.39966699999968,
+   53.652125000000524,
+   54.53162499999962,
+   52.92387500000041,
+   54.10295899999983,
+   53.876625000000786,
+   53.82104100000106,
+   53.85383300000103,
+   54.66350000000057,
+   55.56920899999932,
+   53.64704100000017,
+   55.87079199999971,
+   54.87175000000025
+  ],
+  "agentObserverLatency": 52.73283300000003
+ }
+}

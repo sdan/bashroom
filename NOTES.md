@@ -5,6 +5,24 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-16 — Cutover A/B: the deciding experiment (rule PASSED)
+
+The scenario that breaks production (agent whole-file write while a human
+types, 60 keystrokes, agent at #30) run on both paths with identical 25ms
+one-way simulated network. Path A = current prod semantics simulated from
+shipped constants (autosave 700ms, refetch debounce 350ms, conflict =
+load-theirs); Path B = real RoomText over the workerd WS probe. Driver:
+benchmarks/room-text/ab-cutover.mjs; raw events in ab-cutover-results.json;
+animated replay artifact published from the same data.
+
+Pre-registered rule (cut over only if B loses zero keystrokes where A
+loses any, at p50 observer latency <= A): PASSED. A lost 7-9 keystrokes
+per run (timing race, final doc visibly mangled mid-sentence); B lost 0,
+byte-exact, both contributions merged. Writer->observer p50: 454ms (A,
+7 batch jumps) vs 54ms (B, 61 live events) — 8.4x. Cutover is justified
+architecturally; the remaining gate is operational (production DO mount,
+promote/demote boundary, staging soak) plus task #9 (MCP comment anchors).
+
 ## 2026-07-15 — Chunk-aligned hashing: adopt with a size gate (Experiment 2)
 
 Hypothesis: caching per-node content hashes keyed by rope-node identity
