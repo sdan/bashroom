@@ -2339,10 +2339,27 @@ const WEB_INDEX_HTML = `<!doctype html>
     el._lastHtml = html;
     el.innerHTML = html;
     // Fresh nodes need fresh handlers; the memo above means this only runs
-    // when the markup actually changed.
+    // when the markup actually changed. No stopPropagation: the click must
+    // bubble to document.onclick (the share menu's closer) so the two
+    // popups never stack — pointerdown owns panel dismissal, so bubbling
+    // can't close the panel this click just opened.
     el.querySelectorAll("[data-actor]").forEach((b) => {
-      b.onclick = (e) => { e.stopPropagation(); toggleActorPanel(b.dataset.actor, b); };
+      b.onclick = () => toggleActorPanel(b.dataset.actor, b);
     });
+    // The innerHTML wipe above detached an open panel's trigger — re-anchor
+    // onto the actor's fresh button (refreshing the rows' relative times),
+    // or close if the actor left the row entirely.
+    if (actorPanelEl) {
+      const next = [...el.querySelectorAll("[data-actor]")].find((b) => b.dataset.actor === actorPanelActor);
+      if (next) {
+        actorPanelTrigger = next;
+        next.setAttribute("aria-expanded", "true");
+        placeActorPanel(actorPanelEl, next);
+        actorPanelEl.innerHTML = actorPanelHtml(actorPanelActor);
+      } else {
+        closeActorPanel(false);
+      }
+    }
   }
 
   // ── Actor activity panel ──
@@ -2353,6 +2370,12 @@ const WEB_INDEX_HTML = `<!doctype html>
   let actorPanelEl = null;
   let actorPanelActor = "";
   let actorPanelTrigger = null;
+  // Which actor's panel was open when the pointer went down — the click that
+  // follows a pointerdown dismissal of its own trigger's panel must finish
+  // as a toggle-close, not an instant reopen (Safari/Firefox never focus
+  // buttons on mousedown, so focusout can't tell the trigger apart).
+  let actorDownOpenFor = "";
+  let actorDownAt = 0;
 
   function actorPanelHtml(actor) {
     const anon = presenceRoster.some((v) => v && v.name === actor && v.anon);
@@ -2387,8 +2410,20 @@ const WEB_INDEX_HTML = `<!doctype html>
     }
   }
 
+  // Fixed coordinates from the trigger's rect, right-aligned like the share
+  // menu, clamped so the 268px surface never leaves the viewport. The sticky
+  // doc bar means the trigger doesn't move while the panel is open, so fixed
+  // positioning holds.
+  function placeActorPanel(panel, trigger) {
+    const rect = trigger.getBoundingClientRect();
+    panel.style.position = "fixed";
+    panel.style.top = (rect.bottom + 8) + "px";
+    panel.style.right = Math.max(8, Math.min(window.innerWidth - rect.right, window.innerWidth - 276)) + "px";
+  }
+
   function toggleActorPanel(actor, trigger) {
     if (actorPanelEl && actorPanelActor === actor) { closeActorPanel(false); return; }
+    if (actor === actorDownOpenFor && Date.now() - actorDownAt < 500) { actorDownOpenFor = ""; return; }
     closeActorPanel(false);
     const panel = document.createElement("div");
     panel.className = "share-menu actor-panel";
@@ -2396,14 +2431,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     panel.setAttribute("aria-label", actor + " — recent activity");
     panel.tabIndex = -1; // focus target so Escape/focusout work from the panel
     panel.innerHTML = actorPanelHtml(actor);
-    // Fixed coordinates from the trigger's rect, right-aligned like the
-    // share menu, clamped so the 268px surface never leaves the viewport.
-    // The sticky doc bar means the trigger doesn't move while the panel is
-    // open, so fixed positioning holds.
-    const rect = trigger.getBoundingClientRect();
-    panel.style.position = "fixed";
-    panel.style.top = (rect.bottom + 8) + "px";
-    panel.style.right = Math.max(8, Math.min(window.innerWidth - rect.right, window.innerWidth - 276)) + "px";
+    placeActorPanel(panel, trigger);
     panel.onkeydown = (e) => {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeActorPanel(true); }
     };
@@ -2418,10 +2446,23 @@ const WEB_INDEX_HTML = `<!doctype html>
     panel.focus();
   }
 
-  // Outside-click dismissal — addEventListener, NOT document.onclick, which
-  // the share-menu wiring owns and reassigns on every render.
-  document.addEventListener("click", (e) => {
+  // Outside-press dismissal on pointerdown — addEventListener, NOT
+  // document.onclick (the share-menu wiring owns and reassigns that), and
+  // pointerdown because it fires before focus moves and before click-level
+  // stopPropagation (share button, tree rows) can swallow the event.
+  // Recording the open actor FIRST lets the trigger's own click read what
+  // this press dismissed and stay a toggle instead of a reopen.
+  document.addEventListener("pointerdown", (e) => {
+    actorDownOpenFor = actorPanelEl ? actorPanelActor : "";
+    actorDownAt = Date.now();
     if (actorPanelEl && !actorPanelEl.contains(e.target)) closeActorPanel(false);
+  });
+  // Escape with focus back on the trigger — the one focus position the
+  // panel's own keydown can't see (focusout deliberately ignores it). Any
+  // other focus move already closed the panel, so this can't double-fire:
+  // the in-panel handler stops propagation before this listener runs.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && actorPanelEl) closeActorPanel(false);
   });
 
   function showToast(text, color) {
