@@ -10,6 +10,8 @@ import {
   encodeRoomText,
   mapRoomTextAnchors,
   rebaseRoomTextChange,
+  roomTextContentDigest,
+  roomTextDigestOfString,
   roomTextUpdateToken,
   type RoomTextAnchor,
   type WireTextChange,
@@ -34,6 +36,10 @@ const RETAIN_HISTORY_BYTES = 8_000_000;
 const SOFT_SNAPSHOT_DOC_BYTES = 8_000;
 const HARD_COMPACT_MIN_UPDATES = 256;
 const HARD_COMPACT_MIN_DELTA_BYTES = 64_000;
+// Root-hash log window for diffDigest catch-up. A client whose remembered
+// root fell out of this window gets the full listing (baseKnown false),
+// mirroring how RESET_REQUIRED closes the bounded sync window.
+const MAX_DIGEST_LOG_ROOTS = 256;
 const persistedJsonEncoder = new TextEncoder();
 
 type FileRow = {
@@ -69,6 +75,17 @@ type RequestRow = {
   epoch: number;
   submitted_base_revision: number;
   revision: number;
+};
+
+type DigestRow = {
+  file_id: string;
+  path: string;
+  content_hash: string;
+  byte_length: number;
+  revision: number;
+  first_seq: number;
+  last_seq: number;
+  updated_at: number;
 };
 
 type CachedText = {
@@ -241,6 +258,46 @@ export type AdvanceFloorResult =
     }
   | RoomTextFailure;
 
+/** One file's digest index entry, as reported to hosts. */
+export type RoomTextFileDigest = {
+  fileId: string;
+  path: string;
+  contentHash: string;
+  byteLength: number;
+  revision: number;
+  updatedAt: number;
+};
+
+export type FileDigestResult =
+  | ({ ok: true; protocol: typeof ROOM_TEXT_PROTOCOL } & RoomTextFileDigest)
+  | RoomTextFailure;
+
+export type RoomDigestResult =
+  | {
+      ok: true;
+      protocol: typeof ROOM_TEXT_PROTOCOL;
+      rootHash: string;
+      fileCount: number;
+    }
+  | RoomTextFailure;
+
+export type DiffDigestResult =
+  | {
+      ok: true;
+      protocol: typeof ROOM_TEXT_PROTOCOL;
+      rootHash: string;
+      // False when the client's root fell out of the bounded root log (or
+      // never existed): the diff is then relative to an empty room, so
+      // `added` is the full listing — the explicit full-resync signal.
+      baseKnown: boolean;
+      changed: RoomTextFileDigest[];
+      added: RoomTextFileDigest[];
+      // Paths deleted since the client's root. Always empty today: the store
+      // has no delete path yet; tombstone rows attach here when it grows one.
+      removed: string[];
+    }
+  | RoomTextFailure;
+
 export type RoomTextFailure = {
   ok: false;
   error:
@@ -291,6 +348,7 @@ export class RoomTextStore {
       const doc = decodeRoomText(source);
       const now = Date.now();
       const bytes = exactArrayBuffer(source);
+      const contentHash = roomTextContentDigest(doc, source.byteLength);
 
       try {
         this.storage.transactionSync(() => {
@@ -302,6 +360,7 @@ export class RoomTextStore {
              ) VALUES (?, ?, 1, 0, 0, 0, ?, ?, ?, 0, ?, ?)`,
             fileId, path, bytes, doc.length, source.byteLength, now, now,
           );
+          this.writeDigest(fileId, path, contentHash, source.byteLength, 0, now);
         });
       } catch (error) {
         if (isSqlConstraint(error)) return { ok: false, error: "ALREADY_EXISTS" };
@@ -385,6 +444,9 @@ export class RoomTextStore {
       const shouldCheckpoint = revision - row.snapshot_revision >= CHECKPOINT_EVERY_UPDATES
         || nextTailBytes >= CHECKPOINT_TAIL_BYTES;
       const checkpointBytes = shouldCheckpoint ? encodeRoomText(applied.doc) : undefined;
+      // Size-gated and pure: small docs hash their content string, large docs
+      // reuse cached subtree digests and rehash only the dirty spine.
+      const contentHash = roomTextContentDigest(applied.doc, applied.byteLength);
 
       let response!: PushRoomTextSuccess;
       this.storage.transactionSync(() => {
@@ -491,6 +553,9 @@ export class RoomTextStore {
           normalized.clientId, normalized.requestId, normalized.json,
           normalized.fileId, row.epoch, normalized.baseRevision, revision, now,
         );
+        // Fresh accept only (replays returned above): the digest index and
+        // root log move in the same transaction as the update they describe.
+        this.writeDigest(normalized.fileId, row.path, contentHash, applied.byteLength, revision, now);
       });
 
       // Storage is authoritative. Only publish the new immutable cache root
@@ -866,6 +931,83 @@ export class RoomTextStore {
     }
   }
 
+  /** The maintained digest row for one file; never recomputed on read. */
+  digestOf(fileIdInput: string): FileDigestResult {
+    try {
+      const fileId = validateKey(fileIdInput, "fileId");
+      const row = this.storage.sql.exec<DigestRow>(
+        `SELECT file_id, path, content_hash, byte_length, revision,
+                first_seq, last_seq, updated_at
+           FROM room_text_digests WHERE file_id = ?`,
+        fileId,
+      ).toArray()[0];
+      if (!row) return { ok: false, error: "NOT_FOUND" };
+      return { ok: true, protocol: ROOM_TEXT_PROTOCOL, ...toFileDigest(row) };
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  /** Room root hash over every file digest, ordered by path. */
+  roomDigest(): RoomDigestResult {
+    try {
+      const rows = this.digestRows();
+      return {
+        ok: true,
+        protocol: ROOM_TEXT_PROTOCOL,
+        rootHash: rootHashOf(rows),
+        fileCount: rows.length,
+      };
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  /**
+   * The O(changed) agent-catchup read: given the room root a client last
+   * synced, return exactly the files whose digests moved since. The root log
+   * maps that root to its digest sequence; per-file first_seq/last_seq split
+   * the answer into added and changed without touching unchanged rows'
+   * content. An unknown or expired root diffs against the empty room.
+   */
+  diffDigest(clientRootHash: string): DiffDigestResult {
+    try {
+      if (typeof clientRootHash !== "string" || clientRootHash.length > 64) {
+        return { ok: false, error: "INVALID_REQUEST", message: "client root hash is invalid" };
+      }
+      const rows = this.digestRows();
+      const rootHash = rootHashOf(rows);
+      const empty = { changed: [], added: [], removed: [] };
+      if (clientRootHash === rootHash) {
+        return { ok: true, protocol: ROOM_TEXT_PROTOCOL, rootHash, baseKnown: true, ...empty };
+      }
+      // A root can recur when content reverts exactly; the latest occurrence
+      // yields the smallest correct diff.
+      const logged = this.storage.sql.exec<{ seq: number | null }>(
+        "SELECT MAX(seq) AS seq FROM room_text_digest_log WHERE root_hash = ?",
+        clientRootHash,
+      ).one().seq;
+      const baseSeq = logged ?? -1;
+      const changed: RoomTextFileDigest[] = [];
+      const added: RoomTextFileDigest[] = [];
+      for (const row of rows) {
+        if (row.last_seq <= baseSeq) continue;
+        (row.first_seq > baseSeq ? added : changed).push(toFileDigest(row));
+      }
+      return {
+        ok: true,
+        protocol: ROOM_TEXT_PROTOCOL,
+        rootHash,
+        baseKnown: logged !== null,
+        changed,
+        added,
+        removed: [],
+      };
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
   /** Probe/test hook: simulates hibernation without changing durable state. */
   clearCache(): void {
     this.cache.clear();
@@ -956,7 +1098,30 @@ export class RoomTextStore {
         request_id TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS room_text_digests (
+        file_id TEXT PRIMARY KEY,
+        path TEXT NOT NULL UNIQUE,
+        content_hash TEXT NOT NULL,
+        byte_length INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        first_seq INTEGER NOT NULL,
+        last_seq INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS room_text_digest_log (
+        seq INTEGER PRIMARY KEY,
+        root_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS room_text_digest_log_root_idx
+        ON room_text_digest_log(root_hash);
     `);
+    // Seed the pre-mutation root so a client that synced the empty room
+    // still gets an O(changed) diff once files appear.
+    this.storage.sql.exec(
+      "INSERT OR IGNORE INTO room_text_digest_log (seq, root_hash, created_at) VALUES (0, ?, 0)",
+      rootHashOf([]),
+    );
   }
 
   private fileRow(fileId: string): FileRow | undefined {
@@ -1147,6 +1312,57 @@ export class RoomTextStore {
     return mustPrune ? Math.max(existingFloor, floor) : existingFloor;
   }
 
+  private digestRows(): DigestRow[] {
+    return this.storage.sql.exec<DigestRow>(
+      `SELECT file_id, path, content_hash, byte_length, revision,
+              first_seq, last_seq, updated_at
+         FROM room_text_digests
+        ORDER BY path`,
+    ).toArray();
+  }
+
+  /**
+   * Digest index maintenance for one accepted mutation, called inside the
+   * same synchronous transaction that commits it: upsert the file's digest
+   * row, log the new room root at the next digest sequence, and prune the
+   * log to its bounded window. first_seq survives updates so diffDigest can
+   * split added from changed.
+   */
+  private writeDigest(
+    fileId: string,
+    path: string,
+    contentHash: string,
+    byteLength: number,
+    revision: number,
+    now: number,
+  ): void {
+    const seq = (this.storage.sql.exec<{ seq: number | null }>(
+      "SELECT MAX(seq) AS seq FROM room_text_digest_log",
+    ).one().seq ?? -1) + 1;
+    this.storage.sql.exec(
+      `INSERT INTO room_text_digests (
+         file_id, path, content_hash, byte_length, revision,
+         first_seq, last_seq, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(file_id) DO UPDATE SET
+         content_hash = excluded.content_hash,
+         byte_length = excluded.byte_length,
+         revision = excluded.revision,
+         last_seq = excluded.last_seq,
+         updated_at = excluded.updated_at`,
+      fileId, path, contentHash, byteLength, revision, seq, seq, now,
+    );
+    this.storage.sql.exec(
+      "INSERT INTO room_text_digest_log (seq, root_hash, created_at) VALUES (?, ?, ?)",
+      seq, rootHashOf(this.digestRows()), now,
+    );
+    this.storage.sql.exec(
+      `DELETE FROM room_text_digest_log
+        WHERE seq NOT IN (SELECT seq FROM room_text_digest_log ORDER BY seq DESC LIMIT ?)`,
+      MAX_DIGEST_LOG_ROOTS,
+    );
+  }
+
   private remember(entry: CachedText): void {
     this.cache.delete(entry.fileId);
     this.cache.set(entry.fileId, entry);
@@ -1234,6 +1450,30 @@ function parseStoredChangeSet(row: UpdateRow): ChangeSet {
   } catch {
     throw new RoomTextError("STORAGE_CORRUPT", `invalid ChangeSet at revision ${row.revision}`);
   }
+}
+
+function toFileDigest(row: DigestRow): RoomTextFileDigest {
+  return {
+    fileId: row.file_id,
+    path: row.path,
+    contentHash: row.content_hash,
+    byteLength: row.byte_length,
+    revision: row.revision,
+    updatedAt: row.updated_at,
+  };
+}
+
+/**
+ * Room root: digest of the canonical per-file listing, ordered by path.
+ * NUL separates fields because validatePath forbids it in paths and the
+ * other fields are digit/hex strings, so the serialization is unambiguous.
+ */
+function rootHashOf(rows: readonly DigestRow[]): string {
+  let serialized = "";
+  for (const row of rows) {
+    serialized += `${row.path}\0${row.content_hash}\0${row.byte_length}\0`;
+  }
+  return roomTextDigestOfString(serialized);
 }
 
 function toCanonicalUpdate(row: UpdateRow): CanonicalRoomTextUpdate {

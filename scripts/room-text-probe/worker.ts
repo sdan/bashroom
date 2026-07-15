@@ -5,7 +5,13 @@ import {
   type PushRoomTextInput,
   type RoomTextVersionArtifact,
 } from "../../src/room-text-store";
-import { encodeRoomText, roomTextFromString, roomTextUpdateToken } from "../../src/room-text";
+import {
+  encodeRoomText,
+  roomTextDigestOfString,
+  roomTextFromString,
+  roomTextHashedLeaves,
+  roomTextUpdateToken,
+} from "../../src/room-text";
 import {
   ROOM_TEXT_CLOSE_INCOMPATIBLE,
   type RoomTextBroadcastUpdate,
@@ -379,6 +385,36 @@ export class RoomTextProbe extends DurableObject<Env> {
       }
       if (request.method === "GET" && url.pathname === "/janitor/r2") {
         return Response.json({ ok: true, objects: this.r2.dump() });
+      }
+      if (request.method === "GET" && url.pathname === "/digest") {
+        return Response.json(this.texts.digestOf(fileId));
+      }
+      if (request.method === "GET" && url.pathname === "/digest/room") {
+        return Response.json(this.texts.roomDigest());
+      }
+      if (request.method === "GET" && url.pathname === "/digest/diff") {
+        return Response.json(this.texts.diffDigest(url.searchParams.get("root") ?? ""));
+      }
+      if (request.method === "GET" && url.pathname === "/digest/verify") {
+        // The gate for both hash paths: the maintained digest row must equal
+        // a from-scratch hash of the document's current content.
+        const opened = this.texts.openText(fileId);
+        if (!opened.ok) return Response.json(opened);
+        const digest = this.texts.digestOf(fileId);
+        if (!digest.ok) return Response.json(digest);
+        const fromScratch = roomTextDigestOfString(opened.content);
+        return Response.json({
+          ok: true,
+          contentHash: digest.contentHash,
+          fromScratch,
+          match: digest.contentHash === fromScratch,
+          byteLength: digest.byteLength,
+          revision: digest.revision,
+        });
+      }
+      if (request.method === "GET" && url.pathname === "/digest/stats") {
+        // Monotonic incremental-path leaf counter; probes assert on deltas.
+        return Response.json({ ok: true, hashedLeaves: roomTextHashedLeaves() });
       }
       if (request.method === "POST" && url.pathname === "/evict") {
         this.texts.clearCache();

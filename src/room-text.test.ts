@@ -10,7 +10,10 @@ import {
   rebaseRoomTextChange,
   replayRoomText,
   roomTextByteLength,
+  roomTextContentDigest,
+  roomTextDigestOfString,
   roomTextFromString,
+  roomTextHashedLeaves,
 } from "./room-text";
 
 function expectCode(run: () => unknown, code: RoomTextError["code"]): void {
@@ -154,6 +157,70 @@ describe("RoomText changes", () => {
     expectCode(() => replayRoomText(snapshot, 7, [
       { revision: 9, updateToken: "a/2", changes: second },
     ]), "STORAGE_CORRUPT");
+  });
+});
+
+describe("RoomText content digest", () => {
+  // Large enough to clear the 32 KB size gate onto the incremental path.
+  const bigContent = Array.from({ length: 1_500 }, (_, line) => `line ${line} ${"x".repeat(40)}`).join("\n");
+
+  it("gates on size but both paths agree with the from-scratch string hash", () => {
+    for (const content of ["", "alpha\r\nbeta\n", "🙂 family 👩‍👩‍👧‍👦\n", bigContent]) {
+      const doc = roomTextFromString(content);
+      expect(roomTextContentDigest(doc, roomTextByteLength(doc))).toBe(roomTextDigestOfString(content));
+    }
+  });
+
+  it("is structure-independent: differently shaped trees with equal content hash equally", () => {
+    // Shape A: one balanced build from the full string. Shape B: grown by
+    // appending chunks, so its rope carries a different node layout.
+    const shaped = roomTextFromString(bigContent);
+    let grown = roomTextFromString("");
+    let byteLength = 0;
+    for (let offset = 0; offset < bigContent.length; offset += 5_000) {
+      const chunk = bigContent.slice(offset, offset + 5_000);
+      const applied = applyRoomTextChange(
+        grown,
+        changeSetFromWire([{ from: grown.length, to: grown.length, insert: chunk }], grown.length),
+        byteLength,
+      );
+      grown = applied.doc;
+      byteLength = applied.byteLength;
+    }
+    expect(grown.toString()).toBe(bigContent);
+    expect(roomTextContentDigest(grown, byteLength))
+      .toBe(roomTextContentDigest(shaped, roomTextByteLength(shaped)));
+  });
+
+  it("folds length into the digest so NUL-prefixed strings cannot collide", () => {
+    // A bare polynomial hashes "\0a" and "a" identically (leading zeros
+    // vanish); the length suffix keeps the digests distinct.
+    expect(roomTextDigestOfString("\0a")).not.toBe(roomTextDigestOfString("a"));
+    expect(roomTextDigestOfString("\0")).not.toBe(roomTextDigestOfString("\0\0"));
+  });
+
+  it("rehashes the dirty spine on an edit, not the whole document", () => {
+    const doc = roomTextFromString(bigContent);
+    const before = roomTextHashedLeaves();
+    roomTextContentDigest(doc, roomTextByteLength(doc));
+    const fullHash = roomTextHashedLeaves() - before;
+    expect(fullHash).toBeGreaterThan(16);
+
+    // Same tree again: every node digest is already cached.
+    roomTextContentDigest(doc, roomTextByteLength(doc));
+    expect(roomTextHashedLeaves() - before).toBe(fullHash);
+
+    // One small edit dirties a single leaf spine.
+    const applied = applyRoomTextChange(
+      doc,
+      changeSetFromWire([{ from: 10, to: 10, insert: "!" }], doc.length),
+      roomTextByteLength(doc),
+    );
+    const beforeEdit = roomTextHashedLeaves();
+    roomTextContentDigest(applied.doc, applied.byteLength);
+    const editHash = roomTextHashedLeaves() - beforeEdit;
+    expect(editHash).toBeGreaterThan(0);
+    expect(editHash * 8).toBeLessThan(fullHash);
   });
 });
 
