@@ -383,6 +383,19 @@ const WEB_INDEX_HTML = `<!doctype html>
   .share-option strong { align-self: end; font-size: 12.5px; font-weight: 600; }
   .share-option small { align-self: start; color: var(--ink-faint); font-size: 10.5px; line-height: 1.3; text-wrap: pretty; }
   :root[data-theme="dark"] .share-menu { box-shadow: 0 0 0 1px rgba(255,255,255,.1), 0 10px 30px rgba(0,0,0,.28); }
+  /* ── Actor activity panel ──
+     Anchored under a clicked presence face/pill, on the share-menu surface
+     (same width/padding/shadow tokens). Lives on <body> with fixed inline
+     coordinates: the telemetry lane it triggers from clips and fade-masks
+     its descendants, so a child panel could never escape the lane. */
+  .actor-panel .actor-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px 8px; border-bottom: 1px solid var(--rule); margin-bottom: 4px; }
+  .actor-panel .actor-head strong { font-size: 12.5px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .actor-panel .actor-head small { color: var(--ink-faint); font-size: 10.5px; margin-left: auto; flex-shrink: 0; }
+  .actor-panel .actor-row { display: flex; align-items: baseline; gap: 6px; padding: 5px 10px; font-family: var(--mono); font-size: 11px; }
+  .actor-panel .actor-row .actor-verb { color: var(--ink-faint); flex-shrink: 0; }
+  .actor-panel .actor-row .actor-path { color: var(--ink); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .actor-panel .actor-row .actor-when { color: var(--ink-faint); flex-shrink: 0; }
+  .actor-panel .actor-empty { padding: 5px 10px 7px; font-size: 11.5px; color: var(--ink-faint); }
   .doc-save-state { white-space: nowrap; }
   @media (prefers-reduced-motion: reduce) {
     .doc-action, .doc-action .icon-stack svg, .doc-action .label-stack span { transition: none; }
@@ -600,28 +613,55 @@ const WEB_INDEX_HTML = `<!doctype html>
      write is fresh (<90s). Boxing this made ambient telemetry louder than
      the actions, which is backwards. */
   .doc-activity .presence { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+  /* Pills and faces are BUTTONS (they open the actor activity panel) —
+     reset the UA chrome; font: inherit keeps the lane's mono readout.
+     font shorthand resets font-variant, so tabular-nums must follow it. */
   .presence .p-pill {
     display: inline-flex; align-items: center; gap: 5px;
-    color: var(--ink-dim);
+    border: 0; background: transparent; padding: 0; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+    font: inherit; color: var(--ink-dim);
     white-space: nowrap; font-variant-numeric: tabular-nums;
   }
+  .presence .p-pill:focus-visible, .presence .p-face:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
   /* Anonymous share-link viewers (dealt an animal by the hub) read dimmer
      than named handles — ambient audience, not actors. */
   .presence .p-anon { color: var(--ink-faint); }
   /* Live roster as a Notion-style avatar stack: signed-in handles are
      GitHub logins, so github.com/<handle>.png is a real profile photo for
-     free; animals get their initial on the actor color. Overlap + a bg
-     ring makes N viewers read as one object instead of a list. */
+     free; animals get a geometric face drawn on the actor color. Overlap +
+     a bg ring makes N viewers read as one object instead of a list. */
   .presence .p-stack { display: inline-flex; align-items: center; }
-  .presence .p-face {
+  .presence .p-face, .actor-panel .p-face {
     position: relative; overflow: hidden; flex-shrink: 0;
     width: 22px; height: 22px; border-radius: 50%;
     display: inline-flex; align-items: center; justify-content: center;
+    border: 0; padding: 0; -webkit-appearance: none; appearance: none;
     font: 600 10px/1 var(--sans); color: #fff;
     box-shadow: 0 0 0 2px var(--bg);
   }
-  .presence .p-face + .p-face { margin-left: -7px; }
-  .presence .p-face img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .presence .p-face { cursor: pointer; }
+  .presence .p-face svg, .actor-panel .p-face svg { width: 15px; height: 15px; display: block; }
+  .presence .p-face img, .actor-panel .p-face img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  /* Hover-expand: the collapsed overlap fans out into spaced faces + name
+     labels on hover (or keyboard focus in the stack). CSS-only — margin and
+     max-width transitions, each entry a ~30ms beat later — and the collapsed
+     metrics are exactly the old stack's, so nothing moves until intent. */
+  .presence .p-entry { display: inline-flex; align-items: center; }
+  .presence .p-entry + .p-entry { margin-left: -7px; transition: margin-left 160ms ease-out; }
+  .presence .p-stack:hover .p-entry + .p-entry,
+  .presence .p-stack:focus-within .p-entry + .p-entry { margin-left: 6px; }
+  .presence .p-name {
+    display: inline-block; max-width: 0; opacity: 0; overflow: hidden;
+    white-space: nowrap; color: var(--ink-dim);
+    transition: max-width 180ms ease-out, opacity 140ms ease-out, margin-left 180ms ease-out;
+  }
+  .presence .p-stack:hover .p-name,
+  .presence .p-stack:focus-within .p-name { max-width: 96px; opacity: 1; margin-left: 5px; }
+  .presence .p-entry:nth-child(2), .presence .p-entry:nth-child(2) .p-name { transition-delay: 30ms; }
+  .presence .p-entry:nth-child(3), .presence .p-entry:nth-child(3) .p-name { transition-delay: 60ms; }
+  .presence .p-entry:nth-child(4), .presence .p-entry:nth-child(4) .p-name { transition-delay: 90ms; }
+  .presence .p-entry:nth-child(5), .presence .p-entry:nth-child(5) .p-name { transition-delay: 120ms; }
   .presence .p-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
   .presence .p-kind { display: inline-flex; color: var(--ink-faint); flex-shrink: 0; }
   .presence .p-kind svg { width: 9px; height: 9px; display: block; }
@@ -681,6 +721,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   @media (prefers-reduced-motion: reduce) {
     .toast { transition: none; }
     .presence .p-dot.live { animation: none; }
+    .presence .p-entry, .presence .p-entry + .p-entry, .presence .p-name { transition: none; }
     .remote-caret::before { animation: none; }
   }
 
@@ -706,6 +747,31 @@ const WEB_INDEX_HTML = `<!doctype html>
 
   .empty { font-size: 14px; color: var(--ink-dim); padding: 10px 14px; }
   .empty code { font-family: var(--mono); font-size: 12px; background: var(--hover); padding: 2px 6px; border-radius: 3px; color: var(--link); }
+
+  /* ── Skeleton loading ──
+     Ghost layout while a room tree / document body is in flight, built from
+     the REAL layout's own boxes (.room-head, .tree .row, article h1/p) so
+     the content landing causes zero layout shift. One shared gradient sweep
+     — linear easing, because this is progress-like motion — kept quiet by
+     staying inside the surface palette; static ghosts under
+     prefers-reduced-motion. Tokens only, so both themes come for free. */
+  .sk {
+    display: inline-block; vertical-align: middle; height: 12px; border-radius: 4px;
+    background: linear-gradient(90deg, var(--hover) 25%, var(--guide) 50%, var(--hover) 75%);
+    background-size: 200% 100%;
+    animation: sk-sweep 1.6s linear infinite;
+  }
+  /* Ghost rows reuse .room-head/.row for their exact metrics but must never
+     act like rows — no hover fill, no cursor, no clicks. */
+  .sk-ghost, .room-head.sk-ghost, .tree .row.sk-ghost { pointer-events: none; cursor: default; }
+  /* Article ghosts sit inside the article's own h1/p line boxes — the line
+     strut owns the height, the bar just marks where ink will land. */
+  .sk-doc h1 .sk { height: 0.62em; width: 52%; border-radius: 6px; }
+  .sk-crumb { height: 9px; width: 90px; }
+  @keyframes sk-sweep { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    .sk { animation: none; background: var(--hover); }
+  }
 
   /* Cross-room search — quiet input pinned under the brand; results replace
      the room sections while a query is active. */
@@ -1834,8 +1900,30 @@ const WEB_INDEX_HTML = `<!doctype html>
   let presenceFilePendingSince = 0;
   let provenanceTimer = 0;
   let toastTimer = 0;
-  const presenceActors = new Map(); // actor -> { ts, path } (active room only)
+  const presenceActors = new Map(); // actor -> { ts, path, source, editing, log } (active room only)
   const seenActors = new Set();     // joined-toast fires once per actor per session
+
+  // Feed one event into an actor's entry + its activity ring (newest first,
+  // capped at 8) — the per-actor history the face/pill panels list. Draft
+  // frames arrive every ~300ms; a same-path same-verb head row only
+  // refreshes its timestamp, so the ring holds distinct actions rather than
+  // a keystroke log.
+  function recordActor(actor, ev) {
+    const entry = presenceActors.get(actor) || {};
+    entry.ts = ev.ts;
+    entry.path = ev.path;
+    entry.source = ev.source || "";
+    entry.editing = !!ev.editing;
+    const log = (entry.log = entry.log || []);
+    const verb = ev.editing ? "editing" : "wrote";
+    if (log[0] && log[0].path === ev.path && log[0].verb === verb) {
+      log[0].ts = ev.ts;
+    } else {
+      log.unshift({ ts: ev.ts, path: ev.path, verb });
+      if (log.length > 8) log.length = 8;
+    }
+    presenceActors.set(actor, entry);
+  }
 
   function actorColor(actor) {
     const a = String(actor || "").toLowerCase();
@@ -1843,6 +1931,45 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (a.indexOf("claude") !== -1) return "var(--actor-claude)";
     if (a.indexOf("codex") !== -1) return "var(--actor-codex)";
     return "var(--actor-guest)";
+  }
+
+  // Animal FACES for anonymous viewers — one tiny geometric face per name in
+  // the hub's fixed ANON_ANIMALS deck (see index.ts). 2-3 strokes each, drawn
+  // in currentColor on the actor disc, sized to stay legible at 22px: each
+  // face is one strong species cue (ears/horns/beak/tusk/gills) plus eyes.
+  // A name outside the set falls back to the initial letter, same as before.
+  const FACE_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+  const ANIMAL_FACES = {
+    otter: '<path d="M5 6.5a2 2 0 1 0 4 0a2 2 0 1 0-4 0M15 6.5a2 2 0 1 0 4 0a2 2 0 1 0-4 0"/><path d="M9 12h.01M15 12h.01" stroke-width="2.6"/><path d="M12 15h.01M7.5 16.5c1.4 1 2.9 1.5 4.5 1.5s3.1-.5 4.5-1.5"/>',
+    heron: '<path d="M8 5.5c1.5-1.2 3.2-1.4 4.8-.8" /><path d="M8.5 9.5h.01" stroke-width="2.6"/><path d="M11.5 10.5l9 2.2-8.7 2.6"/>',
+    lynx: '<path d="M5.5 9.5l.8-5.5 4 3M18.5 9.5l-.8-5.5-4 3"/><path d="M9 13h.01M15 13h.01" stroke-width="2.6"/><path d="M9.5 17c.8.6 1.6.9 2.5.9s1.7-.3 2.5-.9"/>',
+    capybara: '<path d="M5.5 7.5l2.2-2M18.5 7.5l-2.2-2"/><path d="M9 11h.01M15 11h.01" stroke-width="2.6"/><path d="M10.5 15h.01M13.5 15h.01M9 18h6"/>',
+    ibex: '<path d="M8.5 7C6.8 6 5.8 4 6.3 1.8M15.5 7c1.7-1 2.7-3 2.2-5.2"/><path d="M9 12h.01M15 12h.01" stroke-width="2.6"/><path d="M10.5 16h3M12 16v3"/>',
+    puffin: '<path d="M7.5 9.5h.01" stroke-width="2.6"/><path d="M11 9.5l8.5 1.7-1.7 5.6-6.8-2z"/><path d="M15.7 10.4l-1.3 5.3"/>',
+    gecko: '<path d="M6 9.5a2.6 2.6 0 1 0 5.2 0a2.6 2.6 0 1 0-5.2 0M12.8 9.5a2.6 2.6 0 1 0 5.2 0a2.6 2.6 0 1 0-5.2 0"/><path d="M8 16c1.2 1.2 2.5 1.8 4 1.8s2.8-.6 4-1.8"/>',
+    marmot: '<path d="M5.5 7a1.8 1.8 0 1 0 3.6 0a1.8 1.8 0 1 0-3.6 0M14.9 7a1.8 1.8 0 1 0 3.6 0a1.8 1.8 0 1 0-3.6 0"/><path d="M9 12h.01M15 12h.01" stroke-width="2.6"/><path d="M10.5 15v3.5h3V15M12 15.5v3"/>',
+    narwhal: '<path d="M12.5 8.5L21 2M15.2 6.5l.9.9M17.6 4.3l.9.9"/><path d="M9 13h.01M15 13h.01" stroke-width="2.6"/><path d="M9.5 17c.8.7 1.6 1 2.5 1s1.7-.3 2.5-1"/>',
+    kestrel: '<path d="M8 9h.01M16 9h.01" stroke-width="2.6"/><path d="M8 12v3M16 12v3"/><path d="M11 11.5l2 1.6-2 1.6"/>',
+    axolotl: '<path d="M5 8.5L2.5 7M5 12H2M5 15.5L2.5 17M19 8.5L21.5 7M19 12h3M19 15.5l2.5 1.5"/><path d="M9 11h.01M15 11h.01" stroke-width="2.6"/><path d="M8.5 14.5c1 1.1 2.2 1.6 3.5 1.6s2.5-.5 3.5-1.6"/>',
+    wombat: '<path d="M6 7.5L7.5 4l2.2 2.5M18 7.5L16.5 4l-2.2 2.5"/><path d="M8.5 11.5h.01M15.5 11.5h.01" stroke-width="2.6"/><path d="M10 15.5a2 1.6 0 1 0 4 0a2 1.6 0 1 0-4 0"/>',
+    tapir: '<path d="M6 6.5a1.8 1.8 0 1 0 3.6 0a1.8 1.8 0 1 0-3.6 0M14.4 6.5a1.8 1.8 0 1 0 3.6 0a1.8 1.8 0 1 0-3.6 0"/><path d="M8.5 11h.01M14.5 11h.01" stroke-width="2.6"/><path d="M11 13.5c3.2-.4 5 .8 5 2.7 0 1.4-.9 2.3-2.4 2.3"/>',
+    quokka: '<path d="M4.8 6.5a2 2 0 1 0 4 0a2 2 0 1 0-4 0M15.2 6.5a2 2 0 1 0 4 0a2 2 0 1 0-4 0"/><path d="M9 11.5h.01M15 11.5h.01" stroke-width="2.6"/><path d="M12 13.8h.01M8 15c1 1.7 2.4 2.5 4 2.5s3-.8 4-2.5"/>',
+    raven: '<path d="M7.5 5.5l2.5-1.8"/><path d="M9.5 8.5h.01" stroke-width="2.6"/><path d="M11.5 9.5l9 2-7.7 3.4"/>',
+    seal: '<path d="M9 11h.01M15 11h.01" stroke-width="2.6"/><path d="M5.5 14.5h2.5M16 14.5h2.5"/><path d="M12 13h.01M9.5 15.5c.8.7 1.6 1 2.5 1s1.7-.3 2.5-1"/>',
+  };
+  function animalFaceSvg(name) {
+    const paths = ANIMAL_FACES[String(name || "").toLowerCase()];
+    return paths ? '<svg ' + FACE_ATTRS + '>' + paths + '</svg>' : "";
+  }
+
+  // Inner content of a .p-face disc: animal face for anonymous viewers
+  // (initial fallback outside the set), GitHub avatar over an initial for
+  // signed-in handles — a broken avatar load removes the img and the
+  // initial underneath shows through.
+  function faceInnerHtml(name, anon) {
+    if (anon) return animalFaceSvg(name) || escHtml(String(name).slice(0, 1).toUpperCase());
+    return escHtml(String(name).slice(0, 1).toUpperCase())
+      + '<img src="https://github.com/' + encodeURIComponent(name) + '.png?size=44" alt="" loading="lazy" onerror="this.remove()" />';
   }
 
   // Person or coding agent? Events carry source: "web" is a human at the
@@ -1971,7 +2098,7 @@ const WEB_INDEX_HTML = `<!doctype html>
 
   function handleDraftFrame(msg) {
     if (msg.path !== state.activePath || presenceRoom !== state.activeRoom) return;
-    presenceActors.set(msg.actor, { ts: Date.now(), path: msg.path, editing: true, source: "web" });
+    recordActor(msg.actor, { ts: Date.now(), path: msg.path, editing: true, source: "web" });
     renderPresence();
     if ((inlineKey || editing) && editDraft !== lastSaved) {
       if (followWarned !== msg.actor) {
@@ -2070,13 +2197,13 @@ const WEB_INDEX_HTML = `<!doctype html>
       if (msg.type === "hello") {
         presenceActors.clear();
         for (const ev of (msg.recent || []).slice().reverse()) {
-          presenceActors.set(ev.actor, { ts: ev.ts, path: ev.path, source: ev.source || "" });
+          recordActor(ev.actor, { ts: ev.ts, path: ev.path, source: ev.source || "" });
           seenActors.add(ev.actor); // history never toasts
         }
         presenceViewers = msg.viewers || 0;
         presenceRoster = Array.isArray(msg.roster) ? msg.roster : [];
       } else if (msg.type === "write") {
-        presenceActors.set(msg.actor, { ts: msg.ts, path: msg.path, source: msg.source || "" });
+        recordActor(msg.actor, { ts: msg.ts, path: msg.path, source: msg.source || "" });
         // Self-echo dedupe by ETAG, not identity: if this tab already holds
         // the exact version the event announces, there's nothing to fetch.
         // Identity comparison was wrong twice over — it hid agent writes
@@ -2148,6 +2275,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     presenceActors.clear();
     presenceViewers = 0;
     presenceRoster = [];
+    closeActorPanel(false); // panel data belonged to the room we just left
   }
 
   // Patch ONLY the presence row — never a full render for a presence tick.
@@ -2176,27 +2304,28 @@ const WEB_INDEX_HTML = `<!doctype html>
       const story = entry[1].editing
         ? actor + " is editing this room right now"
         : actor + " last wrote " + timeAgo(entry[1].ts) + " via " + via;
-      html += '<span class="p-pill" title="' + escHtml(story) + '">'
+      html += '<button class="p-pill" type="button" data-actor="' + escHtml(actor) + '" title="' + escHtml(story) + '" aria-haspopup="dialog" aria-expanded="false">'
         + '<span class="p-dot' + (live ? " live" : "") + '" style="background:' + actorColor(actor) + '"></span>'
         + '<span class="p-kind">' + actorGlyph(actor, entry[1].source) + '</span>'
         + escHtml(actor) + " " + verb
-        + "</span>";
+        + "</button>";
     }
     // Roster: connections that aren't already shown as writers (and aren't
-    // this tab), as a Notion-style avatar stack. Handles are GitHub logins,
-    // so github.com/<handle>.png is their real profile photo; a broken load
-    // removes the img and the actor-colored initial underneath shows through.
-    // Animals never get an img — they have no profile by definition.
+    // this tab), as a Notion-style avatar stack. Each face is a button that
+    // opens the actor's activity panel; the .p-name label next to it stays
+    // width-0 until the stack's hover fan-out reveals it.
     const self = String(state.handle || "");
     const roster = presenceRoster.filter((v) => v && v.name && v.name !== self && !shown.has(v.name)).slice(0, 5);
     if (roster.length) {
       let stack = '<span class="p-stack">';
-      let depth = 20; // earlier faces stack ON TOP (Notion order) — otherwise the next circle clips this one's initial
+      let depth = 20; // earlier faces stack ON TOP (Notion order) — otherwise the next circle clips this one's face
       for (const v of roster) {
-        stack += '<span class="p-face' + (v.anon ? " p-anon" : "") + '" title="' + escHtml(v.name) + '" style="background:' + actorColor(v.name) + ';z-index:' + (depth -= 1) + '">'
-          + escHtml(String(v.name).slice(0, 1).toUpperCase())
-          + (v.anon ? "" : '<img src="https://github.com/' + encodeURIComponent(v.name) + '.png?size=44" alt="" loading="lazy" onerror="this.remove()" />')
-          + "</span>";
+        stack += '<span class="p-entry">'
+          + '<button class="p-face' + (v.anon ? " p-anon" : "") + '" type="button" data-actor="' + escHtml(v.name) + '" title="' + escHtml(v.name) + '" aria-haspopup="dialog" aria-expanded="false" style="background:' + actorColor(v.name) + ';z-index:' + (depth -= 1) + '">'
+          + faceInnerHtml(v.name, v.anon)
+          + '</button>'
+          + '<span class="p-name">' + escHtml(v.name) + '</span>'
+          + '</span>';
       }
       stack += "</span>";
       html += stack;
@@ -2209,7 +2338,132 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (el._lastHtml === html) return;
     el._lastHtml = html;
     el.innerHTML = html;
+    // Fresh nodes need fresh handlers; the memo above means this only runs
+    // when the markup actually changed. No stopPropagation: the click must
+    // bubble to document.onclick (the share menu's closer) so the two
+    // popups never stack — pointerdown owns panel dismissal, so bubbling
+    // can't close the panel this click just opened.
+    el.querySelectorAll("[data-actor]").forEach((b) => {
+      b.onclick = () => toggleActorPanel(b.dataset.actor, b);
+    });
+    // The innerHTML wipe above detached an open panel's trigger — re-anchor
+    // onto the actor's fresh button (refreshing the rows' relative times),
+    // or close if the actor left the row entirely.
+    if (actorPanelEl) {
+      const next = [...el.querySelectorAll("[data-actor]")].find((b) => b.dataset.actor === actorPanelActor);
+      if (next) {
+        actorPanelTrigger = next;
+        next.setAttribute("aria-expanded", "true");
+        placeActorPanel(actorPanelEl, next);
+        actorPanelEl.innerHTML = actorPanelHtml(actorPanelActor);
+      } else {
+        closeActorPanel(false);
+      }
+    }
   }
+
+  // ── Actor activity panel ──
+  // Clicking a presence face or writer pill opens a small anchored panel
+  // listing that actor's ring entries (verb + path + time) — data the client
+  // already holds; no fetch. Body-level like the toast: it must survive
+  // #app innerHTML wipes and escape the telemetry lane's overflow clip.
+  let actorPanelEl = null;
+  let actorPanelActor = "";
+  let actorPanelTrigger = null;
+  // Which actor's panel was open when the pointer went down — the click that
+  // follows a pointerdown dismissal of its own trigger's panel must finish
+  // as a toggle-close, not an instant reopen (Safari/Firefox never focus
+  // buttons on mousedown, so focusout can't tell the trigger apart).
+  let actorDownOpenFor = "";
+  let actorDownAt = 0;
+
+  function actorPanelHtml(actor) {
+    const anon = presenceRoster.some((v) => v && v.name === actor && v.anon);
+    const entry = presenceActors.get(actor);
+    const log = (entry && entry.log) || [];
+    let html = '<div class="actor-head">'
+      + '<span class="p-face' + (anon ? " p-anon" : "") + '" style="background:' + actorColor(actor) + '">' + faceInnerHtml(actor, anon) + '</span>'
+      + '<strong>' + escHtml(actor) + '</strong>'
+      + (anon ? '<small>anonymous viewer</small>' : '')
+      + '</div>';
+    if (!log.length) html += '<div class="actor-empty">Here now — no recent writes in this room.</div>';
+    for (const row of log) {
+      html += '<div class="actor-row">'
+        + '<span class="actor-verb">' + (row.verb === "editing" ? "editing" : "wrote") + '</span>'
+        + '<span class="actor-path" title="' + escHtml(row.path || "") + '">' + escHtml(row.path || "") + '</span>'
+        + '<span class="actor-when">' + timeAgo(row.ts) + '</span>'
+        + '</div>';
+    }
+    return html;
+  }
+
+  function closeActorPanel(refocus) {
+    if (!actorPanelEl) return;
+    actorPanelEl.remove();
+    actorPanelEl = null;
+    actorPanelActor = "";
+    const t = actorPanelTrigger;
+    actorPanelTrigger = null;
+    if (t && document.contains(t)) {
+      t.setAttribute("aria-expanded", "false");
+      if (refocus) t.focus();
+    }
+  }
+
+  // Fixed coordinates from the trigger's rect, right-aligned like the share
+  // menu, clamped so the 268px surface never leaves the viewport. The sticky
+  // doc bar means the trigger doesn't move while the panel is open, so fixed
+  // positioning holds.
+  function placeActorPanel(panel, trigger) {
+    const rect = trigger.getBoundingClientRect();
+    panel.style.position = "fixed";
+    panel.style.top = (rect.bottom + 8) + "px";
+    panel.style.right = Math.max(8, Math.min(window.innerWidth - rect.right, window.innerWidth - 276)) + "px";
+  }
+
+  function toggleActorPanel(actor, trigger) {
+    if (actorPanelEl && actorPanelActor === actor) { closeActorPanel(false); return; }
+    if (actor === actorDownOpenFor && Date.now() - actorDownAt < 500) { actorDownOpenFor = ""; return; }
+    closeActorPanel(false);
+    const panel = document.createElement("div");
+    panel.className = "share-menu actor-panel";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", actor + " — recent activity");
+    panel.tabIndex = -1; // focus target so Escape/focusout work from the panel
+    panel.innerHTML = actorPanelHtml(actor);
+    placeActorPanel(panel, trigger);
+    panel.onkeydown = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeActorPanel(true); }
+    };
+    panel.onfocusout = (e) => {
+      if (!panel.contains(e.relatedTarget) && e.relatedTarget !== trigger) closeActorPanel(false);
+    };
+    document.body.appendChild(panel);
+    actorPanelEl = panel;
+    actorPanelActor = actor;
+    actorPanelTrigger = trigger;
+    trigger.setAttribute("aria-expanded", "true");
+    panel.focus();
+  }
+
+  // Outside-press dismissal on pointerdown — addEventListener, NOT
+  // document.onclick (the share-menu wiring owns and reassigns that), and
+  // pointerdown because it fires before focus moves and before click-level
+  // stopPropagation (share button, tree rows) can swallow the event.
+  // Recording the open actor FIRST lets the trigger's own click read what
+  // this press dismissed and stay a toggle instead of a reopen.
+  document.addEventListener("pointerdown", (e) => {
+    actorDownOpenFor = actorPanelEl ? actorPanelActor : "";
+    actorDownAt = Date.now();
+    if (actorPanelEl && !actorPanelEl.contains(e.target)) closeActorPanel(false);
+  });
+  // Escape with focus back on the trigger — the one focus position the
+  // panel's own keydown can't see (focusout deliberately ignores it). Any
+  // other focus move already closed the panel, so this can't double-fire:
+  // the in-panel handler stops propagation before this listener runs.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && actorPanelEl) closeActorPanel(false);
+  });
 
   function showToast(text, color) {
     let t = document.getElementById("toast");
@@ -2382,11 +2636,41 @@ const WEB_INDEX_HTML = `<!doctype html>
     return root.kids;
   }
 
+  // ── Skeleton builders ──
+  // Ghosts are assembled from the same elements the real content uses
+  // (.section/.room-head, .tree .row, article h1/p), so their metrics are
+  // definitionally the content's metrics — landing swaps ink into the same
+  // boxes instead of reflowing the page. Widths vary so the ghosts read as
+  // a layout, not a barcode.
+  function skeletonRoomsHtml() {
+    return [64, 92, 56, 76, 48].map(w =>
+      '<div class="section" aria-hidden="true"><div class="room-head sk-ghost">'
+      + '<span class="chev"></span>'
+      + '<span class="name"><span class="sk" style="width:' + w + 'px"></span></span>'
+      + '</div></div>').join("");
+  }
+  function skeletonTreeHtml() {
+    return [104, 72, 88].map(w =>
+      '<li aria-hidden="true"><div class="row sk-ghost">'
+      + '<span class="chev hidden"></span>'
+      + '<span class="icon"></span>'
+      + '<span class="label"><span class="sk" style="width:' + w + 'px"></span></span>'
+      + '</div></li>').join("");
+  }
+  function skeletonDocHtml() {
+    // article carries the real 65vh floor + 20vh trailing pad, so the page
+    // height (and the scrollbar) don't jump when the document lands.
+    return '<article class="sk-doc" role="status" aria-label="Loading document">'
+      + '<h1><span class="sk"></span></h1>'
+      + ['96%', '88%', '93%', '71%', '42%'].map(w => '<p><span class="sk" style="width:' + w + '"></span></p>').join("")
+      + '</article>';
+  }
+
   function roomTreeInnerHtml(room) {
     const roomTree = trees.get(room);
     if (Array.isArray(roomTree)) return renderTree(room, buildTree(roomTree));
     if (isErrorRecord(roomTree)) return '<li class="empty">Couldn\\'t load. <span class="retry-link">Click room to retry.</span></li>';
-    return '<li class="empty">Loading…</li>';
+    return skeletonTreeHtml();
   }
 
   function sidebarSectionsHtml() {
@@ -2406,7 +2690,7 @@ const WEB_INDEX_HTML = `<!doctype html>
             \${open ? '<ul class="tree">' + treeHtml + '</ul>' : ''}
           </div>\`;
         }).join("")
-      : roomsLoading ? '<div class="empty">Loading rooms…</div>'
+      : roomsLoading ? skeletonRoomsHtml()
       : '<div class="empty">No rooms. Use <code>bashroom room create</code>.</div>';
   }
 
@@ -2567,6 +2851,9 @@ const WEB_INDEX_HTML = `<!doctype html>
   function render() {
     if (!state.token) return renderLogin();
     document.body.classList.remove("login-view");
+    // The innerHTML wipe below detaches the actor panel's trigger — an open
+    // panel would float unanchored, so it closes with the DOM it points at.
+    closeActorPanel(false);
 
     // Preserve sidebar scroll across full rerenders. app.innerHTML wipes the
     // DOM, so the new <aside> would otherwise reset to scrollTop=0 — the
@@ -2600,6 +2887,12 @@ const WEB_INDEX_HTML = `<!doctype html>
     const treeIsErr = isErrorRecord(tree);
     const activeFileIsErr = isErrorRecord(activeFile);
     const activeFileLoading = state.activeRoom && state.activePath && !activeFile && fileInflight.has(activeKey);
+    // Room addressed but its first tree hasn't landed — content is on its
+    // way (fetchTree picks a default file), so the pane skeletons instead of
+    // narrating "Loading…" in an empty state that then reflows away. Share
+    // mode never loads a tree (one granted document, no sidebar): there this
+    // must stay false or a failed file fetch would skeleton forever.
+    const treeLoading = Boolean(!share && state.activeRoom && !tree && !treeIsErr);
     // Modeless editing stays primary. Preview is a per-document opt-in used
     // for renderers (Mermaid today, more allowlisted blocks later).
     const inlineMode = Boolean(activeFile && !activeFileIsErr && !activeFile.is_binary && !cmLoadFailed);
@@ -2645,12 +2938,12 @@ const WEB_INDEX_HTML = `<!doctype html>
               </div>
           </div>\`
       : "";
-    const documentHeader = (activeFile && !activeFileIsErr) || activeFileLoading
+    const documentHeader = (activeFile && !activeFileIsErr) || activeFileLoading || treeLoading
       ? \`<header class="doc-header">
-          <div class="doc-location" title="\${escHtml(state.activeRoom + "/" + docPath)}">
+          <div class="doc-location" title="\${escHtml(state.activeRoom + (docPath ? "/" + docPath : ""))}">
             <span class="doc-room">\${escHtml(state.activeRoom)}</span>
             <span class="doc-separator" aria-hidden="true">/</span>
-            <span class="doc-path">\${escHtml(docPath)}</span>
+            <span class="doc-path">\${docPath ? escHtml(docPath) : '<span class="sk sk-crumb" aria-hidden="true"></span>'}</span>
           </div>
           <div class="doc-activity">
             <span class="presence" id="presence-row"></span>
@@ -2659,12 +2952,12 @@ const WEB_INDEX_HTML = `<!doctype html>
           \${docActionsHtml}
         </header>\`
       : "";
+    // In-flight loads (treeLoading / activeFileLoading) never reach this —
+    // they render the skeleton document below instead of a message.
     const emptyMsg = !state.activeRoom ? "Pick a room."
       : treeIsErr ? "Couldn't load <code>" + state.activeRoom + "</code>. Click the room in the sidebar to retry."
-      : !tree ? "Loading <code>" + state.activeRoom + "</code>…"
       : !state.activePath ? "Pick a file."
       : activeFileIsErr ? "Couldn't load <code>" + state.activePath + "</code>."
-      : activeFileLoading ? "Loading <code>" + state.activePath + "</code>…"
       : "File <code>" + state.activePath + "</code> not in <code>" + state.activeRoom + "</code>.";
     // Fallback (cmLoadFailed) explicit-edit flow: textarea + Save/Cancel.
     const editorHtml = '<div id="cm-mount"></div>'
@@ -2694,6 +2987,7 @@ const WEB_INDEX_HTML = `<!doctype html>
           ? '<div class="empty">Binary file. Use the Bashroom shell to inspect it.</div>'
           : inlineMode ? (previewing ? '<article>' + md + '</article>' : inlineHtml)
           : (editing ? editorHtml : '<article>' + md + '</article>'))
+      : (treeLoading || activeFileLoading) ? skeletonDocHtml()
       : '<div class="empty">' + emptyMsg + '</div>';
 
     app.innerHTML = \`
