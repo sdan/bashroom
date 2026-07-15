@@ -1,23 +1,139 @@
 import { DurableObject } from "cloudflare:workers";
-import { RoomTextStore, type PushRoomTextInput } from "../../src/room-text-store";
+import {
+  RoomTextStore,
+  type PushRoomTextInput,
+  type RoomTextVersionArtifact,
+} from "../../src/room-text-store";
 import { encodeRoomText, roomTextFromString } from "../../src/room-text";
 
 type Env = {
   ROOM_TEXT_PROBE: DurableObjectNamespace<RoomTextProbe>;
 };
 
+const janitorEncoder = new TextEncoder();
+const janitorDecoder = new TextDecoder();
+
+type MockR2Object = { bytes: Uint8Array; etag: string };
+
+/**
+ * Map-backed stand-in for R2 with etag CAS semantics: create-only put
+ * (onlyIf null) and compare-and-swap put (onlyIf etag). Instance memory is
+ * durable enough for a probe run because "crashes" are injected throws that
+ * never tear down the isolate.
+ */
+class MockR2 {
+  private readonly objects = new Map<string, MockR2Object>();
+  private version = 0;
+
+  get(key: string): MockR2Object | undefined {
+    return this.objects.get(key);
+  }
+
+  /** onlyIf undefined = unconditional; null = create-only; string = etag CAS. */
+  put(key: string, bytes: Uint8Array, onlyIf?: string | null): MockR2Object | null {
+    const current = this.objects.get(key);
+    if (onlyIf === null && current) return null;
+    if (typeof onlyIf === "string" && current?.etag !== onlyIf) return null;
+    const object = { bytes: bytes.slice(), etag: `mock-etag-${++this.version}` };
+    this.objects.set(key, object);
+    return object;
+  }
+
+  dump(): Record<string, { etag: string; size: number; base64: string }> {
+    const objects: Record<string, { etag: string; size: number; base64: string }> = {};
+    for (const [key, object] of this.objects) {
+      objects[key] = { etag: object.etag, size: object.bytes.byteLength, base64: toBase64(object.bytes) };
+    }
+    return objects;
+  }
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/** Deterministic single-object serialization of the store's artifact parts. */
+function serializeArtifact(artifact: Extract<RoomTextVersionArtifact, { ok: true }>): Uint8Array {
+  return janitorEncoder.encode(JSON.stringify({
+    epoch: artifact.epoch,
+    revision: artifact.revision,
+    snapshot_base64: toBase64(new Uint8Array(artifact.snapshot_bytes)),
+    composed_changes_json: artifact.composed_changes_json,
+  }));
+}
+
+class InjectedCrash extends Error {}
+
 /** Isolated workerd wrapper around the real RoomText SQLite adapter. */
 export class RoomTextProbe extends DurableObject<Env> {
   private readonly texts: RoomTextStore;
+  private readonly r2 = new MockR2();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.texts = new RoomTextStore(ctx.storage);
   }
 
+  /** Real alarm wiring for the janitor; only the target read awaits storage. */
+  async alarm(): Promise<void> {
+    const target = await this.ctx.storage.get<{ room: string; file: string }>("janitor:target");
+    if (target) this.runJanitor(target.room, target.file, false);
+  }
+
+  /**
+   * The history janitor: compact cold rows, export the version artifact,
+   * make it durable (create-only PUT — artifacts are immutable once
+   * written), flip HEAD (etag CAS, skipped when the manifest is already
+   * visible), then advance the floor. This ordering makes a crash at any
+   * point recoverable by simply firing again.
+   */
+  private runJanitor(room: string, fileId: string, crashBeforeHeadFlip: boolean) {
+    const compacted = this.texts.compactHistory(fileId);
+    if (!compacted.ok) return compacted;
+    const artifact = this.texts.exportVersionArtifact(fileId);
+    if (!artifact.ok) return artifact;
+    const manifest = this.texts.buildHeadManifest(fileId);
+    if (!manifest.ok) return manifest;
+
+    const prefix = `rooms/${room}/.history/${fileId}`;
+    const artifactKey = `${prefix}/${artifact.epoch}@${artifact.revision}`;
+    const headKey = `${prefix}/HEAD`;
+    const artifactWritten = this.r2.put(artifactKey, serializeArtifact(artifact), null) !== null;
+    if (crashBeforeHeadFlip) throw new InjectedCrash("injected crash between artifact PUT and HEAD flip");
+
+    const currentHead = this.r2.get(headKey);
+    let headFlip: "flipped" | "already-visible";
+    if (currentHead && janitorDecoder.decode(currentHead.bytes) === manifest.manifestJson) {
+      headFlip = "already-visible";
+    } else {
+      const flipped = this.r2.put(headKey, janitorEncoder.encode(manifest.manifestJson), currentHead ? currentHead.etag : null);
+      // A lost CAS means another writer flipped concurrently; the next fire
+      // reconciles against whatever HEAD it observes.
+      if (!flipped) return { ok: false as const, error: "HEAD_CAS_LOST" };
+      headFlip = "flipped";
+    }
+
+    const advanced = this.texts.advanceFloorAfterFlush(fileId, artifact.revision);
+    if (!advanced.ok) return advanced;
+    return {
+      ok: true as const,
+      revision: artifact.revision,
+      artifactKey,
+      artifactWritten,
+      headFlip,
+      compacted: { mode: compacted.mode, composedRows: compacted.composedRows },
+      advanced: { historyFloor: advanced.historyFloor, prunedUpdates: advanced.prunedUpdates },
+    };
+  }
+
   async fetch(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url);
+      const room = url.searchParams.get("room") || "probe-room";
       if (request.method === "POST" && url.pathname === "/create") {
         const body = await request.json<{ fileId: string; path: string; content: string }>();
         return Response.json(this.texts.createText({
@@ -45,6 +161,40 @@ export class RoomTextProbe extends DurableObject<Env> {
       }
       if (request.method === "POST" && url.pathname === "/checkpoint") {
         return Response.json(this.texts.checkpointText(fileId));
+      }
+      if (request.method === "POST" && url.pathname === "/compact") {
+        return Response.json(this.texts.compactHistory(fileId));
+      }
+      if (request.method === "GET" && url.pathname === "/export") {
+        const artifact = this.texts.exportVersionArtifact(fileId);
+        if (!artifact.ok) return Response.json(artifact);
+        return Response.json({
+          ok: true,
+          epoch: artifact.epoch,
+          revision: artifact.revision,
+          snapshot_base64: toBase64(new Uint8Array(artifact.snapshot_bytes)),
+          composed_changes_json: artifact.composed_changes_json,
+        });
+      }
+      if (request.method === "POST" && url.pathname === "/advance") {
+        return Response.json(this.texts.advanceFloorAfterFlush(fileId, Number(url.searchParams.get("revision"))));
+      }
+      if (request.method === "POST" && url.pathname === "/janitor/schedule") {
+        await this.ctx.storage.put("janitor:target", { room, file: fileId });
+        await this.ctx.storage.setAlarm(Date.now() + 25);
+        return Response.json({ ok: true });
+      }
+      if (request.method === "POST" && url.pathname === "/janitor/fire") {
+        const crash = url.searchParams.get("crash") === "before-head-flip";
+        try {
+          return Response.json(this.runJanitor(room, fileId, crash));
+        } catch (error) {
+          if (error instanceof InjectedCrash) return Response.json({ ok: false, crashed: true });
+          throw error;
+        }
+      }
+      if (request.method === "GET" && url.pathname === "/janitor/r2") {
+        return Response.json({ ok: true, objects: this.r2.dump() });
       }
       if (request.method === "POST" && url.pathname === "/evict") {
         this.texts.clearCache();
