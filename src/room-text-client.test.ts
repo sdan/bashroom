@@ -213,6 +213,27 @@ describe("RoomTextClient handshake and FSM", () => {
     expect(h.log.opened).toBe(before + 1);
   });
 
+  it("watches the handshake: a server that never answers the connect frame is a zombie", () => {
+    const h = makeHarness();
+    h.client.start();
+    h.client.handleSocketOpen();
+    expect(h.client.state()).toBe("hydrating");
+    h.clock.advance(30_000);
+    expect(h.log.frames.at(-1)).toMatchObject({ type: "ping" });
+    h.clock.advance(2_000);
+    expect(h.log.closes.at(-1)?.[0]).toBe(ROOM_TEXT_CLOSE_ZOMBIE);
+    expect(h.client.state()).toBe("backoff");
+  });
+
+  it("stop() during connect asks the host to tear down the pending transport", () => {
+    const h = makeHarness();
+    h.client.start();
+    expect(h.log.opened).toBe(1);
+    h.client.stop();
+    expect(h.log.closes.at(-1)).toEqual([1000, "client stopped"]);
+    expect(h.client.state()).toBe("stopped");
+  });
+
   it("treats a pong — or any other frame — as proof of life", () => {
     const h = makeHarness();
     connect(h);
@@ -249,6 +270,37 @@ describe("RoomTextClient compose buffer and outbox", () => {
       changes: [{ from: 1, to: 1, insert: "XY" }],
     });
     expect(h.client.localText()).toBe("aXYb");
+  });
+
+  it("holds the second speculative update until the head confirms (single in-flight push)", () => {
+    const h = makeHarness();
+    connect(h, "ab");
+    h.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    h.clock.advance(100);
+    h.client.edit([{ from: 2, to: 2, insert: "Y" }]);
+    h.clock.advance(100);
+    // Only the chain's head may be in flight: its base IS the confirmed
+    // revision (canonical). A second push would declare a base that merely
+    // guesses the head commits unrebased — a foreign interleave would turn
+    // that guess into a misapplied change server-side.
+    expect(pushes(h)).toHaveLength(1);
+    const [head] = pushes(h)[0];
+    expect(head).toMatchObject({ baseRevision: 0, changes: [{ from: 1, to: 1, insert: "X" }] });
+    // A foreign commit lands first: the head commits REBASED, so the guess
+    // would have been wrong. Still nothing extra goes out.
+    h.client.handleFrame(broadcast(1, "other", "r1", [{ from: 0, to: 0, insert: "!" }]));
+    expect(pushes(h)).toHaveLength(1);
+    // The head's echo confirms it and rebases the waiting entry onto the
+    // real canonical chain; only now does the second push transmit.
+    h.client.handleFrame(broadcast(2, "c1", head.requestId, [{ from: 2, to: 2, insert: "X" }], 1));
+    const sent = pushes(h);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toHaveLength(1);
+    expect(sent[1][0]).toMatchObject({
+      baseRevision: 2, // the confirmed revision, not a guess
+      changes: [{ from: 3, to: 3, insert: "Y" }],
+    });
+    expect(h.client.localText()).toBe("!aXYb");
   });
 
   it("takes the broadcast echo as the commit ack (fast path, no rebase)", () => {

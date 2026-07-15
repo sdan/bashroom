@@ -151,7 +151,8 @@ type OutboxEntry = {
   /**
    * Exact payload of the last transmission. Replayed verbatim after a
    * snapshot hydration so the server's idempotency row can answer with the
-   * original commit; rebuilt after a delta hydration once `changes` rebases.
+   * original commit; cleared for speculative entries on every hydration —
+   * the transmission died with its socket — and rebuilt by markSent.
    */
   sent: { epoch: number; baseRevision: number; changes: WireTextChange[] } | null;
   /**
@@ -220,7 +221,10 @@ export class RoomTextClient {
   }
 
   stop(): void {
-    const wasLive = this.clientState === "hydrating" || this.clientState === "connected";
+    // "connecting" counts as live: openSocket() was issued, so the host owns
+    // a transport (possibly still dialing) that must be torn down with us.
+    const wasLive = this.clientState === "connecting" || this.clientState === "hydrating"
+      || this.clientState === "connected";
     this.clearReconnect();
     this.cancelPingCycle();
     this.clearDraftFlush();
@@ -241,6 +245,9 @@ export class RoomTextClient {
       epoch: this.epoch,
       lastRevision: this.confirmedRevision,
     });
+    // The handshake is watched too: a server that never answers the connect
+    // frame is a zombie like any other, not a state to wait in forever.
+    this.armPingCycle();
   }
 
   /** The host's transport closed (or failed to open). */
@@ -255,7 +262,7 @@ export class RoomTextClient {
     if (this.clientState !== "hydrating" && this.clientState !== "connected") return;
     // Any inbound frame is proof of life: cancel a pending zombie verdict
     // and push the next ping out by a full interval.
-    if (this.clientState === "connected") this.armPingCycle();
+    this.armPingCycle();
     switch (frame.type) {
       case "hydration":
         this.handleHydration(frame);
@@ -316,13 +323,7 @@ export class RoomTextClient {
     };
     this.draft = null;
     this.outbox.push(entry);
-    if (this.clientState !== "connected") return;
-    const wire = changeSetToWire(entry.changes);
-    entry.sent = { epoch: this.epoch, baseRevision: entry.baseRevision, changes: wire };
-    this.config.effects.sendFrame({
-      type: "push",
-      pushes: [this.pushInput(entry.requestId, this.epoch, entry.baseRevision, wire)],
-    });
+    this.sendNext();
   }
 
   private handleHydration(frame: Extract<RoomTextServerFrame, { type: "hydration" }>): void {
@@ -405,7 +406,11 @@ export class RoomTextClient {
     if (!committed.length) return;
     if (!this.integrateCommitted(committed)) {
       this.forceResync("broadcast does not extend the confirmed document");
+      return;
     }
+    // The broadcast may have confirmed the in-flight entry (echo-as-ack) and
+    // rebased the chain behind it: the next entry can go out now.
+    this.sendNext();
   }
 
   private handleAck(frame: Extract<RoomTextServerFrame, { type: "ack" }>): void {
@@ -527,23 +532,55 @@ export class RoomTextClient {
 
   /**
    * Resend the durable outbox after hydration, ORIGINAL tokens throughout.
-   * Speculative entries go in their current (delta-rebased) form; replay-only
-   * entries repeat their last transmission verbatim so the idempotency
-   * envelope still matches if the server already committed them. One frame
-   * carries the whole outbox: the server processes it in one turn and its
-   * broadcast batches the accepted updates into one frame.
+   * Replay-only entries repeat their last transmission verbatim so the
+   * idempotency envelope still matches if the server already committed them.
+   * Speculative transmissions died with the old socket: their `sent` payloads
+   * are cleared and only the chain's head goes back out (see sendNext). One
+   * frame carries the replays plus that head, so the server processes them in
+   * one turn and its broadcast batches the accepted updates into one frame.
    */
   private resendOutbox(): void {
-    if (!this.outbox.length) return;
-    const pushes = this.outbox.map((entry) => {
+    const pushes: PushRoomTextInput[] = [];
+    for (const entry of this.outbox) {
       if (!entry.speculative && entry.sent) {
-        return this.pushInput(entry.requestId, entry.sent.epoch, entry.sent.baseRevision, entry.sent.changes);
+        pushes.push(this.pushInput(entry.requestId, entry.sent.epoch, entry.sent.baseRevision, entry.sent.changes));
+      } else if (entry.speculative) {
+        entry.sent = null;
       }
-      const wire = changeSetToWire(entry.changes);
-      entry.sent = { epoch: this.epoch, baseRevision: entry.baseRevision, changes: wire };
-      return this.pushInput(entry.requestId, this.epoch, entry.baseRevision, wire);
-    });
-    this.config.effects.sendFrame({ type: "push", pushes });
+    }
+    const head = this.nextUnsent();
+    if (head) pushes.push(this.markSent(head));
+    if (pushes.length) this.config.effects.sendFrame({ type: "push", pushes });
+  }
+
+  /**
+   * Transmit at most ONE unconfirmed speculative update. The head of the
+   * speculative chain always bases on the confirmed revision — canonical by
+   * construction — so the server's rebase over later rows is sound. A second
+   * in-flight push would declare a base that assumes the head commits
+   * unrebased; a foreign commit interleaving between the two turns that guess
+   * into a misapplied change server-side (the base would name a canonical
+   * revision whose document is NOT what the changes were written against).
+   * Later entries wait for the echo that confirms the head and rebases them
+   * onto the new confirmed revision.
+   */
+  private sendNext(): void {
+    if (this.clientState !== "connected") return;
+    const head = this.nextUnsent();
+    if (!head) return;
+    this.config.effects.sendFrame({ type: "push", pushes: [this.markSent(head)] });
+  }
+
+  /** The speculative chain's head, only while nothing of the chain is in flight. */
+  private nextUnsent(): OutboxEntry | null {
+    const head = this.outbox.find((entry) => entry.speculative);
+    return head && !head.sent ? head : null;
+  }
+
+  private markSent(entry: OutboxEntry): PushRoomTextInput {
+    const wire = changeSetToWire(entry.changes);
+    entry.sent = { epoch: this.epoch, baseRevision: entry.baseRevision, changes: wire };
+    return this.pushInput(entry.requestId, this.epoch, entry.baseRevision, wire);
   }
 
   private pushInput(
