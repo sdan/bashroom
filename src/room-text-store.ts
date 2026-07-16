@@ -42,6 +42,27 @@ const HARD_COMPACT_MIN_DELTA_BYTES = 64_000;
 const MAX_DIGEST_LOG_ROOTS = 256;
 const persistedJsonEncoder = new TextEncoder();
 
+// ── Group-commit lab instrumentation ────────────────────────────────────
+// Monotonic full-document BLOB write counters (same pattern as
+// roomTextHashedLeaves in room-text.ts): every statement that writes a
+// whole-document blob adds its byte length here, so harnesses measure the
+// PHYSICAL head-write amplification instead of inferring it. Counters tick
+// at statement execution, so a rolled-back transaction still counts (SQLite
+// performed the write before undoing it) — only crash tests notice.
+let headBlobWrites = 0;
+let headBlobBytes = 0;
+let snapshotBlobWrites = 0;
+let snapshotBlobBytes = 0;
+
+export function roomTextStoreWriteStats(): {
+  headBlobWrites: number;
+  headBlobBytes: number;
+  snapshotBlobWrites: number;
+  snapshotBlobBytes: number;
+} {
+  return { headBlobWrites, headBlobBytes, snapshotBlobWrites, snapshotBlobBytes };
+}
+
 type FileRow = {
   file_id: string;
   path: string;
@@ -105,6 +126,30 @@ type HeadRow = {
   content_utf16_length: number;
 };
 
+/**
+ * Per-file overlay state for one open push batch (group-commit prototype).
+ * The files row advances per push inside the batch transaction, but the
+ * heads row does not — this overlay carries the in-batch document between
+ * pushes and everything finalizeDeferredHead needs at the batch boundary.
+ */
+type DeferredHead = {
+  fileId: string;
+  path: string;
+  epoch: number;
+  // heads-row revision when the batch first touched this file; the
+  // optimistic WHERE clause of the single deferred head UPDATE.
+  startHeadRevision: number;
+  revision: number;
+  byteLength: number;
+  doc: Text;
+  // Virtual checkpoint cadence (thresholds identical to pushText; the
+  // physical snapshot write lands once, at the batch-final revision).
+  snapshotRevision: number;
+  pendingTailBytes: number;
+  checkpointPending: boolean;
+  now: number;
+};
+
 export type CreateRoomTextInput = {
   fileId: string;
   path: string;
@@ -165,6 +210,11 @@ export type PushRoomTextSuccess = {
   // is pure and synchronous (mapRoomTextAnchors); the host wires the result
   // into DocumentCollab.remapCommentAnchors — this store never imports it.
   anchors?: RoomTextAnchor[];
+  // Group-commit prototype: true when THIS call committed the revision
+  // (fresh accept). Absent on idempotent replays and on the classic
+  // pushText path. Lets a batch caller emit broadcast-vs-replay frames
+  // without re-reading the head before every push.
+  fresh?: boolean;
 };
 
 export type PushRoomTextResult = PushRoomTextSuccess | RoomTextFailure;
@@ -435,6 +485,10 @@ export class RoomTextStore {
              ) VALUES (?, 1, 0, ?, ?, ?)`,
             fileId, bytes, doc.length, now,
           );
+          headBlobWrites++;
+          headBlobBytes += source.byteLength;
+          snapshotBlobWrites++;
+          snapshotBlobBytes += source.byteLength;
           this.writeDigest(fileId, path, contentHash, source.byteLength, 0, now);
         });
       } catch (error) {
@@ -605,6 +659,10 @@ export class RoomTextStore {
         if (updated.rowsWritten !== 1) {
           throw new RoomTextError("STORAGE_CORRUPT", "file head changed during synchronous commit");
         }
+        if (checkpointBytes) {
+          snapshotBlobWrites++;
+          snapshotBlobBytes += checkpointBytes.byteLength;
+        }
         const headUpdated = this.storage.sql.exec(
           `UPDATE room_text_heads
               SET revision = ?, content_bytes = ?, content_utf16_length = ?,
@@ -616,6 +674,8 @@ export class RoomTextStore {
         if (headUpdated.rowsWritten !== 1) {
           throw new RoomTextError("STORAGE_CORRUPT", "durable head changed during synchronous commit");
         }
+        headBlobWrites++;
+        headBlobBytes += headBytes.byteLength;
         if (checkpointBytes) {
           const retainedFloor = this.retentionFloor(
             normalized.fileId,
@@ -666,6 +726,304 @@ export class RoomTextStore {
         return { ok: false, error: "IDEMPOTENCY_MISMATCH" };
       }
       return failureFrom(error);
+    }
+  }
+
+  /**
+   * Group-commit prototype (dependent-update-chain lab): commit N pushes
+   * with ONE materialized-head encode + ONE room_text_heads blob write per
+   * touched file, at the batch boundary. Everything else — canonical update
+   * rows, idempotency records, commit sequencing, revision numbering, the
+   * digest index and root log — is written per push exactly as pushText
+   * writes it, so pulls/reconnects/replays observe identical state.
+   *
+   * Atomicity: the WHOLE batch runs inside one transactionSync, so crash
+   * atomicity widens from per-push to per-batch — a thrown invariant error
+   * rolls back every push in the batch (all-or-nothing; this is the one
+   * semantic change vs. sequential pushText). Ordinary per-push REJECTIONS
+   * (stale epoch, floor, bad args, idempotency mismatch) return failure
+   * results without writes and never abort their siblings' commits.
+   *
+   * Checkpoint cadence: threshold crossings are tracked virtually per push;
+   * the physical snapshot blob is written once at the batch boundary at the
+   * batch-final revision (never staler than baseline's mid-batch cadence).
+   */
+  pushTextBatch(inputs: readonly PushRoomTextInput[]): PushRoomTextResult[] {
+    const results: PushRoomTextResult[] = new Array(inputs.length);
+    const deferred = new Map<string, DeferredHead>();
+    try {
+      this.storage.transactionSync(() => {
+        for (let index = 0; index < inputs.length; index++) {
+          results[index] = this.pushOneDeferred(inputs[index], deferred);
+        }
+        // Batch boundary: the single per-file head materialization.
+        for (const state of deferred.values()) this.finalizeDeferredHead(state);
+      });
+    } catch (error) {
+      // The batch rolled back as a unit. Nothing was published to the cache
+      // mid-batch, but drop touched entries defensively so the next read
+      // rebuilds from the durable (pre-batch) truth.
+      for (const fileId of deferred.keys()) this.cache.delete(fileId);
+      throw error;
+    }
+    // Storage is authoritative: publish cache roots only after commit.
+    for (const state of deferred.values()) {
+      this.remember({
+        fileId: state.fileId,
+        path: state.path,
+        epoch: state.epoch,
+        revision: state.revision,
+        byteLength: state.byteLength,
+        doc: state.doc,
+      });
+    }
+    return results;
+  }
+
+  /**
+   * One push inside an open batch transaction. Phase 1 (validate + plan)
+   * performs NO writes, so its failures convert to per-push results. Phase 2
+   * (writes) mirrors pushText's transaction body minus the head-row write;
+   * a throw there is an invariant failure that must abort the whole batch.
+   */
+  private pushOneDeferred(
+    input: PushRoomTextInput,
+    deferred: Map<string, DeferredHead>,
+  ): PushRoomTextResult {
+    type Staged = {
+      normalized: ReturnType<typeof normalizePush>;
+      row: FileRow;
+      state: DeferredHead | undefined;
+      current: CachedText;
+      canonical: ChangeSet;
+      applied: { doc: Text; byteLength: number; byteDelta: number };
+      revision: number;
+      now: number;
+      canonicalJson: string;
+      canonicalJsonBytes: number;
+      shouldCheckpoint: boolean;
+      snapshotRevision: number;
+      pendingTail: number;
+      contentHash: string;
+      updateToken: string;
+    };
+    let staged: Staged;
+    try {
+      const normalized = normalizePush(input);
+      // Dedup runs inside THE batch transaction; earlier accepts in this
+      // very batch are visible here, so an in-batch retry replays cleanly.
+      const existing = this.storage.sql.exec<RequestRow>(
+        `SELECT normalized_input, file_id, epoch,
+                submitted_base_revision, revision
+           FROM room_text_requests WHERE client_id = ? AND request_id = ?`,
+        normalized.clientId, normalized.requestId,
+      ).toArray()[0];
+      if (existing) {
+        return existing.normalized_input === normalized.json
+          ? this.responseForRequest(existing, normalized.clientId, normalized.requestId)
+          : { ok: false, error: "IDEMPOTENCY_MISMATCH" };
+      }
+      const row = this.fileRow(normalized.fileId);
+      if (!row) return { ok: false, error: "NOT_FOUND" };
+      // The files row already carries every in-batch revision (same
+      // transaction), but the heads row is stale until the batch boundary:
+      // the overlay entry — not loadCurrent — is the in-batch document.
+      const state = deferred.get(normalized.fileId);
+      const current: CachedText = state
+        ? {
+            fileId: state.fileId,
+            path: state.path,
+            epoch: state.epoch,
+            revision: state.revision,
+            byteLength: state.byteLength,
+            doc: state.doc,
+          }
+        : this.loadCurrent(row);
+      if (normalized.epoch !== row.epoch) {
+        return this.resetFailure("EPOCH_MISMATCH", current);
+      }
+      if (normalized.baseRevision > row.head_revision) {
+        return { ok: false, error: "FUTURE_REVISION", epoch: row.epoch, revision: row.head_revision };
+      }
+      const lag = row.head_revision - normalized.baseRevision;
+      if (normalized.baseRevision < row.history_floor || lag > MAX_SYNC_UPDATES
+        || this.tailBytesAfter(row, normalized.baseRevision) > MAX_SYNC_TAIL_BYTES) {
+        return this.resetFailure("RESET_REQUIRED", current);
+      }
+      // current.revision === row.head_revision in both overlay and cold
+      // paths, so lengthAtRevision never takes its loadCurrent head branch
+      // (which would read the stale heads row mid-batch).
+      const baseLength = normalized.baseRevision === current.revision
+        ? current.doc.length
+        : this.lengthAtRevision(row, normalized.baseRevision);
+      const submitted = changeSetFromWire(normalized.changes, baseLength);
+      if (submitted.empty) {
+        return { ok: false, error: "INVALID_CHANGE", message: "an update must change the document" };
+      }
+      const overRows = this.updateRows(normalized.fileId, row.epoch, normalized.baseRevision, row.head_revision);
+      validateUpdateChain(overRows, normalized.baseRevision, baseLength, row.head_revision);
+      const updateToken = roomTextUpdateToken(normalized.clientId, normalized.requestId);
+      const canonical = rebaseRoomTextChange(
+        submitted,
+        updateToken,
+        overRows.map((update) => ({
+          updateToken: update.update_token,
+          changes: parseStoredChangeSet(update),
+        })),
+      );
+      const applied = applyRoomTextChange(current.doc, canonical, current.byteLength);
+      const revision = row.head_revision + 1;
+      const canonicalJson = JSON.stringify(canonical.toJSON());
+      const canonicalJsonBytes = persistedJsonEncoder.encode(canonicalJson).byteLength;
+      if (canonicalJsonBytes > MAX_PERSISTED_JSON_BYTES) {
+        return { ok: false, error: "REQUEST_TOO_LARGE", message: "canonical update is too large to persist safely" };
+      }
+      // Virtual checkpoint cadence: identical thresholds to pushText, but
+      // the physical snapshot write happens once at the batch boundary.
+      const snapshotRevision = state ? state.snapshotRevision : row.snapshot_revision;
+      const pendingTail = (state ? state.pendingTailBytes : row.recovery_tail_bytes) + canonicalJsonBytes;
+      const shouldCheckpoint = revision - snapshotRevision >= CHECKPOINT_EVERY_UPDATES
+        || pendingTail >= CHECKPOINT_TAIL_BYTES;
+      const contentHash = roomTextContentDigest(applied.doc, applied.byteLength);
+      staged = {
+        normalized, row, state, current, canonical, applied, revision,
+        now: Date.now(), canonicalJson, canonicalJsonBytes,
+        shouldCheckpoint, snapshotRevision, pendingTail, contentHash, updateToken,
+      };
+    } catch (error) {
+      // No writes have happened for this push; convert exactly as pushText
+      // would. failureFrom rethrows unknown errors, aborting the batch.
+      return failureFrom(error);
+    }
+
+    // ── Phase 2: writes (any throw below aborts the whole batch) ──
+    const { normalized, row, applied, revision, now } = staged;
+    const commit = this.storage.sql.exec<{ sequence: number }>(
+      `INSERT INTO room_text_commits (client_id, request_id, created_at)
+       VALUES (?, ?, ?) RETURNING sequence`,
+      normalized.clientId, normalized.requestId, now,
+    ).one().sequence;
+    const response: PushRoomTextSuccess = {
+      ok: true,
+      protocol: ROOM_TEXT_PROTOCOL,
+      fileId: normalized.fileId,
+      epoch: row.epoch,
+      submittedBaseRevision: normalized.baseRevision,
+      revision,
+      roomCommit: commit,
+      byteLength: applied.byteLength,
+      update: {
+        revision,
+        parentRevision: row.head_revision,
+        clientId: normalized.clientId,
+        requestId: normalized.requestId,
+        changes: changeSetToWire(staged.canonical),
+      },
+      ...(Array.isArray(input.anchors)
+        ? { anchors: mapRoomTextAnchors(staged.canonical, input.anchors) }
+        : {}),
+      fresh: true,
+    };
+    this.storage.sql.exec(
+      `INSERT INTO room_text_updates (
+         file_id, epoch, revision, base_revision, update_token,
+         client_id, request_id, changes_json, before_utf16_length,
+         after_utf16_length, byte_delta, after_byte_length,
+         room_commit, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      normalized.fileId, row.epoch, revision, normalized.baseRevision,
+      staged.updateToken, normalized.clientId, normalized.requestId,
+      staged.canonicalJson, staged.current.doc.length, applied.doc.length,
+      applied.byteDelta, applied.byteLength, commit, now,
+    );
+    // Small-column head advance only; content blobs wait for the boundary.
+    // recovery_tail_bytes mirrors the virtual cadence so the durable value
+    // is correct if this batch never crosses a checkpoint threshold.
+    const updated = this.storage.sql.exec(
+      `UPDATE room_text_files
+          SET head_revision = ?, byte_length = ?, recovery_tail_bytes = ?,
+              updated_at = ?
+        WHERE file_id = ? AND epoch = ? AND head_revision = ?`,
+      revision, applied.byteLength, staged.shouldCheckpoint ? 0 : staged.pendingTail, now,
+      normalized.fileId, row.epoch, row.head_revision,
+    );
+    if (updated.rowsWritten !== 1) {
+      throw new RoomTextError("STORAGE_CORRUPT", "file head changed during batched commit");
+    }
+    this.storage.sql.exec(
+      `INSERT INTO room_text_requests (
+         client_id, request_id, normalized_input, file_id, epoch,
+         submitted_base_revision, revision, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      normalized.clientId, normalized.requestId, normalized.json,
+      normalized.fileId, row.epoch, normalized.baseRevision, revision, now,
+    );
+    this.writeDigest(normalized.fileId, row.path, staged.contentHash, applied.byteLength, revision, now);
+    deferred.set(normalized.fileId, {
+      fileId: normalized.fileId,
+      path: row.path,
+      epoch: row.epoch,
+      startHeadRevision: staged.state ? staged.state.startHeadRevision : row.head_revision,
+      revision,
+      byteLength: applied.byteLength,
+      doc: applied.doc,
+      snapshotRevision: staged.shouldCheckpoint ? revision : staged.snapshotRevision,
+      pendingTailBytes: staged.shouldCheckpoint ? 0 : staged.pendingTail,
+      checkpointPending: (staged.state?.checkpointPending ?? false) || staged.shouldCheckpoint,
+      now,
+    });
+    return response;
+  }
+
+  /**
+   * The batch-boundary head materialization: ONE encode of the final doc,
+   * ONE room_text_heads blob write per file, plus the deferred checkpoint
+   * (snapshot at the batch-final revision) when a threshold was crossed.
+   */
+  private finalizeDeferredHead(state: DeferredHead): void {
+    const headBytes = encodeRoomText(state.doc);
+    if (headBytes.byteLength !== state.byteLength) {
+      throw new RoomTextError("STORAGE_CORRUPT", "deferred head byte length diverged from tracked state");
+    }
+    const headBuffer = exactArrayBuffer(headBytes);
+    const headUpdated = this.storage.sql.exec(
+      `UPDATE room_text_heads
+          SET revision = ?, content_bytes = ?, content_utf16_length = ?,
+              updated_at = ?
+        WHERE file_id = ? AND epoch = ? AND revision = ?`,
+      state.revision, headBuffer, state.doc.length,
+      state.now, state.fileId, state.epoch, state.startHeadRevision,
+    );
+    if (headUpdated.rowsWritten !== 1) {
+      throw new RoomTextError("STORAGE_CORRUPT", "durable head changed during batched commit");
+    }
+    headBlobWrites++;
+    headBlobBytes += headBytes.byteLength;
+    if (!state.checkpointPending) return;
+    const row = this.fileRow(state.fileId);
+    if (!row || row.epoch !== state.epoch || row.head_revision !== state.revision) {
+      throw new RoomTextError("STORAGE_CORRUPT", "file row diverged during batched checkpoint");
+    }
+    const checkpointed = this.storage.sql.exec(
+      `UPDATE room_text_files
+          SET snapshot_revision = ?, snapshot_bytes = ?,
+              snapshot_utf16_length = ?, recovery_tail_bytes = 0,
+              updated_at = ?
+        WHERE file_id = ? AND epoch = ? AND head_revision = ?`,
+      state.revision, headBuffer, state.doc.length, state.now,
+      state.fileId, state.epoch, state.revision,
+    );
+    if (checkpointed.rowsWritten !== 1) {
+      throw new RoomTextError("STORAGE_CORRUPT", "file head changed during batched checkpoint");
+    }
+    snapshotBlobWrites++;
+    snapshotBlobBytes += headBytes.byteLength;
+    const retainedFloor = this.retentionFloor(state.fileId, state.epoch, row.history_floor);
+    if (retainedFloor > row.history_floor) {
+      this.storage.sql.exec(
+        "UPDATE room_text_files SET history_floor = ? WHERE file_id = ? AND epoch = ?",
+        retainedFloor, state.fileId, state.epoch,
+      );
     }
   }
 
@@ -789,6 +1147,8 @@ export class RoomTextStore {
         if (updated.rowsWritten !== 1) {
           throw new RoomTextError("STORAGE_CORRUPT", "file changed during synchronous checkpoint");
         }
+        snapshotBlobWrites++;
+        snapshotBlobBytes += snapshot.byteLength;
       });
       return this.openResult(current);
     } catch (error) {

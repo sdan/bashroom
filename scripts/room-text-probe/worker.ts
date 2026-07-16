@@ -3,6 +3,7 @@ import {
   RoomTextStore,
   decideRoomTextPublication,
   isRetryableRoomTextFailure,
+  roomTextStoreWriteStats,
   type PushRoomTextInput,
   type RoomTextVersionArtifact,
 } from "../../src/room-text-store";
@@ -335,9 +336,10 @@ export class RoomTextProbe extends DurableObject<Env> {
       this.handleConnect(ws, frame);
     } else if (frame.type === "push") {
       // One message, N pushes, ONE broadcast flush — the batching contract.
-      for (const push of Array.isArray(frame.pushes) ? frame.pushes : []) {
-        this.handlePush(ws, push);
-      }
+      // Group-commit seam: the whole outbox commits as one store batch, so
+      // the materialized head is encoded + written once per file per message.
+      const pushes = Array.isArray(frame.pushes) ? frame.pushes : [];
+      if (pushes.length > 0) this.handlePushBatch(ws, pushes);
     } else if (frame.type === "ping") {
       this.sendFrame(ws, { type: "pong", at: frame.at });
     } else if (typeof (frame as { type?: string }).type === "string" && (frame as { type: string }).type.startsWith("jj-")) {
@@ -439,6 +441,47 @@ export class RoomTextProbe extends DurableObject<Env> {
       revision: result.revision,
       ...(rebased ? { rebasedChanges: result.update.changes } : {}),
     });
+  }
+
+  /**
+   * Group-commit path: N pushes -> one pushTextBatch call -> the same frame
+   * per push that handlePush would emit (discard / broadcast-as-ack /
+   * replay ack). `fresh` on the batch result replaces the head-before read.
+   */
+  private handlePushBatch(ws: WebSocket, pushes: PushRoomTextInput[]): void {
+    const results = this.texts.pushTextBatch(pushes);
+    for (let index = 0; index < results.length; index++) {
+      const push = pushes[index];
+      const result = results[index];
+      const token = push && typeof push.clientId === "string" && typeof push.requestId === "string"
+        ? roomTextUpdateToken(push.clientId, push.requestId)
+        : "";
+      if (!result.ok) {
+        this.sendFrame(ws, {
+          type: "discard",
+          updateToken: token,
+          code: result.error,
+          retryable: isRetryableRoomTextFailure(result.error),
+          ...(result.message ? { message: result.message } : {}),
+        });
+        continue;
+      }
+      if (result.fresh) {
+        this.queueBroadcast(result.fileId, result.epoch, {
+          ...result.update,
+          updateToken: roomTextUpdateToken(result.update.clientId, result.update.requestId),
+        });
+        continue;
+      }
+      const rebased = result.update.parentRevision > result.submittedBaseRevision;
+      this.sendFrame(ws, {
+        type: "ack",
+        updateToken: token,
+        status: "commit",
+        revision: result.revision,
+        ...(rebased ? { rebasedChanges: result.update.changes } : {}),
+      });
+    }
   }
 
   private queueBroadcast(fileId: string, epoch: number, update: RoomTextBroadcastUpdate): void {
@@ -655,6 +698,17 @@ export class RoomTextProbe extends DurableObject<Env> {
       if (request.method === "POST" && url.pathname === "/push") {
         const body = await request.json<PushRoomTextInput>();
         return Response.json(this.texts.pushText(body));
+      }
+      if (request.method === "POST" && url.pathname === "/push-batch") {
+        // Group-commit lab: N pushes, one batch transaction, one deferred
+        // head write per file. Per-push results come back positionally.
+        const body = await request.json<{ pushes: PushRoomTextInput[] }>();
+        const pushes = Array.isArray(body.pushes) ? body.pushes : [];
+        return Response.json({ ok: true, results: this.texts.pushTextBatch(pushes) });
+      }
+      if (request.method === "GET" && url.pathname === "/write-stats") {
+        // Monotonic full-document blob write counters from the store module.
+        return Response.json({ ok: true, ...roomTextStoreWriteStats() });
       }
       const fileId = url.searchParams.get("file") || "";
       if (request.method === "GET" && url.pathname === "/open") {

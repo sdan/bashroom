@@ -10,17 +10,11 @@ const root = path.resolve(import.meta.dirname, "../..");
 const wrangler = path.join(root, "node_modules", ".bin", "wrangler");
 const config = path.join(root, "scripts", "room-text-probe", "wrangler.jsonc");
 
+// Group-commit lane port isolation (assigned range 8850-8859): fixed ports
+// instead of ephemeral ones so concurrent lab lanes never collide.
+let nextFixedPort = Number(process.env.ROOM_TEXT_ADVERSARIAL_PORT ?? 8855);
 async function freePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.unref();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      assert.ok(address && typeof address !== "string");
-      server.close((error) => error ? reject(error) : resolve(address.port));
-    });
-  });
+  return nextFixedPort++;
 }
 
 async function waitForReady(child, base, output, timeoutMs = 30_000) {

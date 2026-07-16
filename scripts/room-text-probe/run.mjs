@@ -51,12 +51,13 @@ function run(command, args) {
   });
 }
 
-async function withServer(port, task) {
+async function withServer(port, inspectorPort, task) {
   const persistence = await mkdtemp(path.join(os.tmpdir(), "bashroom-room-text-probe-"));
   const args = [
     "dev",
     "-c", "scripts/room-text-probe/wrangler.jsonc",
     "--port", String(port),
+    "--inspector-port", String(inspectorPort),
     "--persist-to", persistence,
     "--log-level", "error",
   ];
@@ -86,9 +87,11 @@ async function withServer(port, task) {
   }
 }
 
-// Fixed probe ports so concurrent harnesses on one machine stay apart:
-// 8796 exercises the HTTP surface, 8797 the WebSocket sync surface.
-const port = Number(process.env.ROOM_TEXT_PROBE_PORT ?? 8796);
-const wsPort = Number(process.env.ROOM_TEXT_PROBE_WS_PORT ?? 8797);
-await withServer(port, (base) => run(process.execPath, ["scripts/room-text-probe/blast.mjs", base]));
-await withServer(wsPort, (base) => run(process.execPath, ["scripts/room-text-probe/blast-ws.mjs", base]));
+// Fixed probe ports so concurrent harnesses on one machine stay apart.
+// Group-commit lane allocation (8850-8859): 8850 exercises the HTTP
+// surface, 8851 the WebSocket sync surface, 8852 the shared inspector.
+const port = Number(process.env.ROOM_TEXT_PROBE_PORT ?? 8850);
+const wsPort = Number(process.env.ROOM_TEXT_PROBE_WS_PORT ?? 8851);
+const inspectorPort = Number(process.env.ROOM_TEXT_PROBE_INSPECTOR_PORT ?? 8852);
+await withServer(port, inspectorPort, (base) => run(process.execPath, ["scripts/room-text-probe/blast.mjs", base]));
+await withServer(wsPort, inspectorPort, (base) => run(process.execPath, ["scripts/room-text-probe/blast-ws.mjs", base]));
