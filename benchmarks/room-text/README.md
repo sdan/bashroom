@@ -12,7 +12,12 @@ The suite deliberately has separate scoreboards:
    fresh Bashroom and JSON Joy models with exact-byte verification.
 3. `workerd-benchmark.mjs` — Bashroom HTTP → Durable Object → SQLite durable
    acknowledgement and cold recovery.
-4. `liveblocks-local.mjs` — Liveblocks/Yjs writer → local sync server → observer
+4. `realistic-workerd.mjs` — self-contained B-only workerd stress: a measured
+   19-DO fleet plus a deliberately concentrated 679-file worst-case DO, pinned
+   editing-trace transactions on 8/100/900 KB documents, foreign interleavings,
+   protocol-faithful offline backlog drain, retries, cache clears, and process-
+   restart recovery.
+5. `liveblocks-local.mjs` — Liveblocks/Yjs writer → local sync server → observer
    visibility and reconnect. This is not a durable-ack measurement.
 
 ## Install and run
@@ -22,7 +27,34 @@ cd benchmarks/room-text
 npm install
 npm run bench
 npm run bench:liveblocks
+npm run bench:workerd-realistic:smoke
 ```
+
+The realistic workerd driver starts Wrangler itself with a fresh persistence
+directory, stops and restarts the process against that same SQLite state, and
+writes every raw request sample to a JSON file (printed as `rawResultPath`).
+The default `medium` profile reproduces all 679 supported files from the
+measured 680-file, 19-room corpus—the >1 MB file is explicitly skipped—in both
+fleet-shaped and single-DO stress topologies, then replays 256 real trace
+transactions at each document size. Contents are deterministic fixtures, not
+private room text. Use the smoke command above for a fast correctness run, or
+the full pinned trace for an intensive run:
+
+```bash
+ROOM_TEXT_REALISTIC_PROFILE=full npm run bench:workerd-realistic
+ROOM_TEXT_REALISTIC_TRACE_LIMIT=1523 \
+ROOM_TEXT_REALISTIC_REPEATS=3 \
+ROOM_TEXT_REALISTIC_RESULT_PATH=/tmp/room-text-realistic.json \
+  npm run bench:workerd-realistic
+```
+
+Individual controls are `ROOM_TEXT_REALISTIC_SIZES`, `..._ROOM_SCALE`,
+`..._BACKLOG_DEPTH`, `..._CACHE_EVERY`, `..._RETRY_EVERY`,
+`..._FOREIGN_EVERY`, `..._PRESSURE_UPDATES`, `..._PRESSURE_SWEEP_EVERY`,
+`..._PRESSURE_BURST`, and `..._ROOM_CONCURRENCY`. These are local workerd
+measurements, not production-region SLOs. The existing probe exposes only
+per-file commits, so neither topology phase pretends to exercise an
+atomic multi-file shell commit.
 
 The workerd benchmark needs the isolated probe running in another terminal:
 
@@ -42,7 +74,13 @@ that chooses a free port and fresh temporary SQLite directory:
 
 ```bash
 npm run test:room-text-workerd
+npm run test:room-text-adversarial
 ```
+
+The adversarial command uses fixed, probe-only SQLite triggers and R2 gates.
+It prints `PASS` for preserved invariants and `REPRODUCED GAP` for a known bug;
+reproduced gaps are successful experiments, not claims that the system passed.
+Unexpected behavior still exits nonzero.
 
 The blast script is the correctness gate. It covers 50-way stale concurrency,
 50 identical retries, cache eviction, exact checkpoint recovery, the maximum

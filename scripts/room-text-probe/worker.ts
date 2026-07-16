@@ -109,10 +109,215 @@ export class RoomTextProbe extends DurableObject<Env> {
   // In-memory is safe — the queue always drains in the same turn it fills.
   private readonly pendingBroadcast: Array<{ fileId: string; epoch: number; update: RoomTextBroadcastUpdate }> = [];
   private broadcastScheduled = false;
+  private janitorGate?: {
+    state: "armed" | "paused" | "released";
+    wait: Promise<void>;
+    release: () => void;
+  };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.texts = new RoomTextStore(ctx.storage);
+  }
+
+  private armJanitorGate(): Record<string, unknown> {
+    if (this.janitorGate) return { ok: false, error: "janitor gate is already active" };
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    this.janitorGate = { state: "armed", wait, release };
+    return { ok: true, state: "armed" };
+  }
+
+  private janitorGateStatus(): Record<string, unknown> {
+    return { ok: true, state: this.janitorGate?.state ?? "idle" };
+  }
+
+  private releaseJanitorGate(): Record<string, unknown> {
+    const gate = this.janitorGate;
+    if (!gate || gate.state !== "paused") return { ok: false, error: "janitor is not paused" };
+    gate.state = "released";
+    gate.release();
+    return { ok: true, state: "released" };
+  }
+
+  /** Probe-only yield immediately after an artifact PUT completes. */
+  private async pauseAfterArtifactPut(): Promise<void> {
+    const gate = this.janitorGate;
+    if (!gate || gate.state !== "armed") return;
+    gate.state = "paused";
+    await gate.wait;
+    if (this.janitorGate === gate) this.janitorGate = undefined;
+  }
+
+  /**
+   * Probe-only, fixed fault points. SQLite triggers let the adversarial test
+   * abort the REAL RoomText transaction after specific writes without adding
+   * fault branches to production code or exposing an arbitrary SQL endpoint.
+   */
+  private disarmFaultTriggers(): void {
+    this.ctx.storage.sql.exec(`
+      DROP TRIGGER IF EXISTS room_text_probe_abort_head_update;
+      DROP TRIGGER IF EXISTS room_text_probe_abort_digest_log_insert;
+    `);
+  }
+
+  private armFaultTrigger(kind: string): { ok: true; kind: string } | { ok: false; error: string } {
+    this.disarmFaultTriggers();
+    if (kind === "abort-head-update") {
+      this.ctx.storage.sql.exec(`
+        CREATE TRIGGER room_text_probe_abort_head_update
+        BEFORE UPDATE ON room_text_heads
+        BEGIN
+          SELECT RAISE(ABORT, 'room-text probe: abort head update');
+        END;
+      `);
+      return { ok: true, kind };
+    }
+    if (kind === "abort-digest-log-insert") {
+      this.ctx.storage.sql.exec(`
+        CREATE TRIGGER room_text_probe_abort_digest_log_insert
+        AFTER INSERT ON room_text_digest_log
+        BEGIN
+          SELECT RAISE(ABORT, 'room-text probe: abort digest log insert');
+        END;
+      `);
+      return { ok: true, kind };
+    }
+    return { ok: false, error: "unknown fixed fault trigger" };
+  }
+
+  /** Exact durable state used to prove failed transactions left no fragments. */
+  private faultState(fileId: string): Record<string, unknown> {
+    const file = this.ctx.storage.sql.exec<{
+      epoch: number;
+      head_revision: number;
+      history_floor: number;
+      snapshot_revision: number;
+      snapshot_bytes: ArrayBuffer;
+      snapshot_utf16_length: number;
+      byte_length: number;
+      recovery_tail_bytes: number;
+    }>(
+      `SELECT epoch, head_revision, history_floor, snapshot_revision,
+              snapshot_bytes, snapshot_utf16_length, byte_length,
+              recovery_tail_bytes
+         FROM room_text_files WHERE file_id = ?`,
+      fileId,
+    ).toArray()[0];
+    const head = this.ctx.storage.sql.exec<{
+      epoch: number;
+      revision: number;
+      content_bytes: ArrayBuffer;
+      content_utf16_length: number;
+    }>(
+      `SELECT epoch, revision, content_bytes, content_utf16_length
+         FROM room_text_heads WHERE file_id = ?`,
+      fileId,
+    ).toArray()[0];
+    const digest = this.ctx.storage.sql.exec<{
+      content_hash: string;
+      byte_length: number;
+      revision: number;
+      first_seq: number;
+      last_seq: number;
+    }>(
+      `SELECT content_hash, byte_length, revision, first_seq, last_seq
+         FROM room_text_digests WHERE file_id = ?`,
+      fileId,
+    ).toArray()[0];
+    const updates = this.ctx.storage.sql.exec<{
+      revision: number;
+      base_revision: number;
+      update_token: string;
+      changes_json: string;
+      room_commit: number;
+    }>(
+      `SELECT revision, base_revision, update_token, changes_json, room_commit
+         FROM room_text_updates WHERE file_id = ? ORDER BY revision`,
+      fileId,
+    ).toArray();
+    const requests = this.ctx.storage.sql.exec<{
+      client_id: string;
+      request_id: string;
+      revision: number;
+    }>(
+      `SELECT client_id, request_id, revision
+         FROM room_text_requests WHERE file_id = ? ORDER BY revision`,
+      fileId,
+    ).toArray();
+    const fileCommits = this.ctx.storage.sql.exec<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM room_text_commits
+        WHERE sequence IN (
+          SELECT room_commit FROM room_text_updates WHERE file_id = ?
+        )`,
+      fileId,
+    ).one().count;
+    const globals = this.ctx.storage.sql.exec<{
+      commits: number;
+      digest_log_rows: number;
+      digest_log_max_seq: number | null;
+    }>(
+      `SELECT
+         (SELECT COUNT(*) FROM room_text_commits) AS commits,
+         (SELECT COUNT(*) FROM room_text_digest_log) AS digest_log_rows,
+         (SELECT MAX(seq) FROM room_text_digest_log) AS digest_log_max_seq`,
+    ).one();
+    return {
+      file: file ? {
+        ...file,
+        snapshot_bytes: toBase64(new Uint8Array(file.snapshot_bytes)),
+      } : null,
+      head: head ? {
+        ...head,
+        content_bytes: toBase64(new Uint8Array(head.content_bytes)),
+      } : null,
+      digest: digest ?? null,
+      updates,
+      requests,
+      fileCommits,
+      globals,
+      roomDigest: this.texts.roomDigest(),
+    };
+  }
+
+  /** Named corruptions reproduce fail-closed behavior without arbitrary SQL. */
+  private injectCorruption(kind: string, fileId: string): Record<string, unknown> {
+    if (kind === "flip-head-byte-same-length") {
+      const row = this.ctx.storage.sql.exec<{ content_bytes: ArrayBuffer }>(
+        "SELECT content_bytes FROM room_text_heads WHERE file_id = ?",
+        fileId,
+      ).toArray()[0];
+      if (!row || row.content_bytes.byteLength === 0) {
+        return { ok: false, error: "non-empty durable head required" };
+      }
+      const bytes = new Uint8Array(row.content_bytes).slice();
+      const index = bytes.findIndex((byte) => byte >= 0x20 && byte <= 0x7e);
+      if (index < 0) return { ok: false, error: "ASCII byte required" };
+      const before = bytes[index];
+      bytes[index] = before === 0x41 ? 0x42 : 0x41;
+      this.ctx.storage.sql.exec(
+        "UPDATE room_text_heads SET content_bytes = ? WHERE file_id = ?",
+        bytes.buffer,
+        fileId,
+      );
+      this.texts.clearCache();
+      return { ok: true, kind, index, before, after: bytes[index] };
+    }
+    if (kind === "delete-latest-update") {
+      const deleted = this.ctx.storage.sql.exec(
+        `DELETE FROM room_text_updates
+          WHERE file_id = ? AND revision = (
+            SELECT MAX(revision) FROM room_text_updates WHERE file_id = ?
+          )`,
+        fileId,
+        fileId,
+      ).rowsWritten;
+      this.texts.clearCache();
+      return deleted === 1
+        ? { ok: true, kind, deleted }
+        : { ok: false, error: "latest update not found", deleted };
+    }
+    return { ok: false, error: "unknown fixed corruption" };
   }
 
   /** Hibernation-API message handler for the sync socket (/ws upgrade). */
@@ -345,7 +550,7 @@ export class RoomTextProbe extends DurableObject<Env> {
   /** Real alarm wiring for the janitor; only the target read awaits storage. */
   async alarm(): Promise<void> {
     const target = await this.ctx.storage.get<{ room: string; file: string }>("janitor:target");
-    if (target) this.runJanitor(target.room, target.file, false);
+    if (target) await this.runJanitor(target.room, target.file, false);
   }
 
   /**
@@ -355,7 +560,7 @@ export class RoomTextProbe extends DurableObject<Env> {
    * visible), then advance the floor. This ordering makes a crash at any
    * point recoverable by simply firing again.
    */
-  private runJanitor(room: string, fileId: string, crashBeforeHeadFlip: boolean) {
+  private async runJanitor(room: string, fileId: string, crashBeforeHeadFlip: boolean) {
     const compacted = this.texts.compactHistory(fileId);
     if (!compacted.ok) return compacted;
     const artifact = this.texts.exportVersionArtifact(fileId);
@@ -367,6 +572,7 @@ export class RoomTextProbe extends DurableObject<Env> {
     const artifactKey = `${prefix}/${artifact.epoch}@${artifact.revision}`;
     const headKey = `${prefix}/HEAD`;
     const artifactWritten = this.r2.put(artifactKey, serializeArtifact(artifact), null) !== null;
+    await this.pauseAfterArtifactPut();
     if (crashBeforeHeadFlip) throw new InjectedCrash("injected crash between artifact PUT and HEAD flip");
 
     const currentHead = this.r2.get(headKey);
@@ -415,6 +621,21 @@ export class RoomTextProbe extends DurableObject<Env> {
           bytes: encodeRoomText(roomTextFromString(body.content)),
         }));
       }
+      if (request.method === "POST" && url.pathname === "/fault/arm") {
+        const body = await request.json<{ kind?: string }>();
+        return Response.json(this.armFaultTrigger(body.kind ?? ""));
+      }
+      if (request.method === "POST" && url.pathname === "/fault/disarm") {
+        this.disarmFaultTriggers();
+        return Response.json({ ok: true });
+      }
+      if (request.method === "GET" && url.pathname === "/fault/state") {
+        return Response.json({ ok: true, state: this.faultState(url.searchParams.get("file") ?? "") });
+      }
+      if (request.method === "POST" && url.pathname === "/fault/corrupt") {
+        const body = await request.json<{ kind?: string; fileId?: string }>();
+        return Response.json(this.injectCorruption(body.kind ?? "", body.fileId ?? ""));
+      }
       if (request.method === "POST" && url.pathname === "/push") {
         const body = await request.json<PushRoomTextInput>();
         return Response.json(this.texts.pushText(body));
@@ -451,14 +672,27 @@ export class RoomTextProbe extends DurableObject<Env> {
         return Response.json(this.texts.advanceFloorAfterFlush(fileId, Number(url.searchParams.get("revision"))));
       }
       if (request.method === "POST" && url.pathname === "/janitor/schedule") {
+        const requestedDelay = Number(url.searchParams.get("delay") ?? "25");
+        const delay = Number.isFinite(requestedDelay)
+          ? Math.max(25, Math.min(5_000, requestedDelay))
+          : 25;
         await this.ctx.storage.put("janitor:target", { room, file: fileId });
-        await this.ctx.storage.setAlarm(Date.now() + 25);
-        return Response.json({ ok: true });
+        await this.ctx.storage.setAlarm(Date.now() + delay);
+        return Response.json({ ok: true, delay });
+      }
+      if (request.method === "POST" && url.pathname === "/janitor/gate/arm") {
+        return Response.json(this.armJanitorGate());
+      }
+      if (request.method === "GET" && url.pathname === "/janitor/gate") {
+        return Response.json(this.janitorGateStatus());
+      }
+      if (request.method === "POST" && url.pathname === "/janitor/gate/release") {
+        return Response.json(this.releaseJanitorGate());
       }
       if (request.method === "POST" && url.pathname === "/janitor/fire") {
         const crash = url.searchParams.get("crash") === "before-head-flip";
         try {
-          return Response.json(this.runJanitor(room, fileId, crash));
+          return Response.json(await this.runJanitor(room, fileId, crash));
         } catch (error) {
           if (error instanceof InjectedCrash) return Response.json({ ok: false, crashed: true });
           throw error;

@@ -53,13 +53,22 @@ function run(command, args) {
 
 async function withServer(port, task) {
   const persistence = await mkdtemp(path.join(os.tmpdir(), "bashroom-room-text-probe-"));
-  const server = spawn(wrangler, [
+  const args = [
     "dev",
     "-c", "scripts/room-text-probe/wrangler.jsonc",
     "--port", String(port),
     "--persist-to", persistence,
     "--log-level", "error",
-  ], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+  ];
+  const server = spawn(wrangler, args, {
+    cwd: root,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      XDG_CONFIG_HOME: persistence,
+      WRANGLER_LOG_PATH: path.join(persistence, "wrangler.log"),
+    },
+  });
 
   try {
     await waitForReady(server, `http://127.0.0.1:${port}`);

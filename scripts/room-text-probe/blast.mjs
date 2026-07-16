@@ -108,9 +108,9 @@ assert.equal(escapedAccepted.ok, true);
 assert.deepEqual(await post("/push", escapedRequest), escapedAccepted);
 assert.equal((await json(`/open?file=${escapedFile}`)).byteLength, 262_144);
 
-// Automatic snapshots bound hibernation recovery, and clients outside the
-// bounded transformation window receive an explicit reset rather than an
-// unbounded rebase.
+// Automatic version checkpoints bound the export tail, and clients outside
+// the bounded transformation window receive the current durable head rather
+// than an unbounded rebase.
 const checkpointFile = `${fileId}-checkpoint`;
 assert.equal((await post("/create", { fileId: checkpointFile, path: "notes/checkpoint.md", content: "" })).ok, true);
 for (let revision = 0; revision < 257; revision++) {
@@ -348,7 +348,7 @@ assert.deepEqual(
   { historyFloor: flushedStats.historyFloor, updateCount: flushedStats.updateCount, belowFloorUpdates: flushedStats.belowFloorUpdates },
   { historyFloor: 768, updateCount: 2, belowFloorUpdates: 0 },
 );
-// Floor advance keeps cold replay byte-exact.
+// Advancing and pruning history leaves the durable head byte-exact.
 await post(`/evict?file=${janitorFile}`);
 assert.deepEqual(await json(`/open?file=${janitorFile}`), beforeFlush);
 
@@ -560,9 +560,9 @@ console.log(JSON.stringify({
     verdict: "one stored result returned identically",
   },
   recovery: {
-    coldTailReplay: "exact",
-    checkpointReplay: "exact",
-    verdict: "cache is disposable",
+    coldHeadOpen: "exact",
+    checkpointLeavesHead: "exact",
+    verdict: "cache is disposable; current state comes from the durable head",
   },
   rowLimit: {
     escapedInsertBytes: 262_144,
@@ -575,7 +575,7 @@ console.log(JSON.stringify({
     liveWindowUpdates: retainedStats.updateCount - retainedStats.belowFloorUpdates,
     coldHistoryUpdates: retainedStats.belowFloorUpdates,
     historyFloor: retainedStats.historyFloor,
-    verdict: "cold replay and stale transform work are bounded; below-floor rows await the flush janitor",
+    verdict: "version export and stale transform work are bounded; below-floor rows await the flush janitor",
   },
   janitor: {
     composedRuns: compacted.composedRows,
@@ -583,7 +583,7 @@ console.log(JSON.stringify({
     alarmFlush: { artifact: "1@768", headFlip: "etag CAS" },
     refire: "no-op: create-only artifact PUT, content-equal HEAD",
     crashBetweenPutAndFlip: "artifact orphaned, HEAD unmoved, next fire completed",
-    coldReplayAfterFloorAdvance: "byte-exact, artifacts chain 1@768 -> 1@772",
+    coldHeadAfterFloorAdvance: "byte-exact; artifacts chain 1@768 -> 1@772",
     verdict: "history compaction and version flush are idempotent and crash-safe",
   },
   anchors: {

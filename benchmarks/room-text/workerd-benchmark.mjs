@@ -74,18 +74,18 @@ revision = Math.max(...burst.map(({ result }) => result.revision));
 
 const beforeEvict = await json(`/open?file=${fileId}`);
 await post(`/evict?file=${fileId}`);
-const coldTailStarted = performance.now();
-const afterTailReplay = await json(`/open?file=${fileId}`);
-const coldTailMs = performance.now() - coldTailStarted;
-assert.deepEqual(afterTailReplay, beforeEvict);
+const coldHeadStarted = performance.now();
+const afterColdHead = await json(`/open?file=${fileId}`);
+const coldHeadMs = performance.now() - coldHeadStarted;
+assert.deepEqual(afterColdHead, beforeEvict);
 const statsBeforeManualCheckpoint = await json(`/inspect?file=${fileId}`);
 
 await post(`/checkpoint?file=${fileId}`);
 await post(`/evict?file=${fileId}`);
-const coldSnapshotStarted = performance.now();
-const afterSnapshot = await json(`/open?file=${fileId}`);
-const coldSnapshotMs = performance.now() - coldSnapshotStarted;
-assert.deepEqual(afterSnapshot, beforeEvict);
+const coldHeadAfterCheckpointStarted = performance.now();
+const afterCheckpoint = await json(`/open?file=${fileId}`);
+const coldHeadAfterCheckpointMs = performance.now() - coldHeadAfterCheckpointStarted;
+assert.deepEqual(afterCheckpoint, beforeEvict);
 
 console.log(JSON.stringify({
   system: "bashroom-roomtext-workerd",
@@ -104,9 +104,9 @@ console.log(JSON.stringify({
   },
   recovery: {
     revision,
-    tailUpdatesBeforeManualCheckpoint: revision - statsBeforeManualCheckpoint.snapshotRevision,
-    coldTailReplayMs: Number(coldTailMs.toFixed(3)),
-    coldSnapshotOpenMs: Number(coldSnapshotMs.toFixed(3)),
+    versionTailUpdatesBeforeManualCheckpoint: revision - statsBeforeManualCheckpoint.snapshotRevision,
+    coldHeadOpenMs: Number(coldHeadMs.toFixed(3)),
+    coldHeadAfterCheckpointMs: Number(coldHeadAfterCheckpointMs.toFixed(3)),
     exact: true,
   },
   caveat: "Durable ack includes local HTTP + DO + SQLite; no WebSocket observer fanout in this probe.",

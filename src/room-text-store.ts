@@ -97,6 +97,14 @@ type CachedText = {
   doc: Text;
 };
 
+type HeadRow = {
+  file_id: string;
+  epoch: number;
+  revision: number;
+  content_bytes: ArrayBuffer;
+  content_utf16_length: number;
+};
+
 export type CreateRoomTextInput = {
   fileId: string;
   path: string;
@@ -327,8 +335,10 @@ export function isRetryableRoomTextFailure(code: RoomTextFailure["error"]): bool
 
 /**
  * SQLite authority for collaborative text inside one room Durable Object.
- * The cache is intentionally disposable; every entry can be rebuilt from the
- * exact snapshot BLOB and contiguous canonical update tail.
+ * The cache is intentionally disposable; every entry can be rebuilt from its
+ * exact durable head BLOB. Canonical updates remain protocol history for
+ * rebasing, reconnects, idempotency, anchors, and version export — never the
+ * ordinary read path.
  */
 export class RoomTextStore {
   private readonly cache = new Map<string, CachedText>();
@@ -359,6 +369,13 @@ export class RoomTextStore {
                byte_length, recovery_tail_bytes, created_at, updated_at
              ) VALUES (?, ?, 1, 0, 0, 0, ?, ?, ?, 0, ?, ?)`,
             fileId, path, bytes, doc.length, source.byteLength, now, now,
+          );
+          this.storage.sql.exec(
+            `INSERT INTO room_text_heads (
+               file_id, epoch, revision, content_bytes,
+               content_utf16_length, updated_at
+             ) VALUES (?, 1, 0, ?, ?, ?)`,
+            fileId, bytes, doc.length, now,
           );
           this.writeDigest(fileId, path, contentHash, source.byteLength, 0, now);
         });
@@ -443,7 +460,11 @@ export class RoomTextStore {
       const nextTailBytes = row.recovery_tail_bytes + canonicalJsonBytes;
       const shouldCheckpoint = revision - row.snapshot_revision >= CHECKPOINT_EVERY_UPDATES
         || nextTailBytes >= CHECKPOINT_TAIL_BYTES;
-      const checkpointBytes = shouldCheckpoint ? encodeRoomText(applied.doc) : undefined;
+      // The durable head is the only cold-read representation. Reuse its
+      // exact bytes at checkpoint boundaries so one update never encodes the
+      // same document twice.
+      const headBytes = encodeRoomText(applied.doc);
+      const checkpointBytes = shouldCheckpoint ? headBytes : undefined;
       // Size-gated and pure: small docs hash their content string, large docs
       // reuse cached subtree digests and rehash only the dirty spine.
       const contentHash = roomTextContentDigest(applied.doc, applied.byteLength);
@@ -525,6 +546,17 @@ export class RoomTextStore {
             );
         if (updated.rowsWritten !== 1) {
           throw new RoomTextError("STORAGE_CORRUPT", "file head changed during synchronous commit");
+        }
+        const headUpdated = this.storage.sql.exec(
+          `UPDATE room_text_heads
+              SET revision = ?, content_bytes = ?, content_utf16_length = ?,
+                  updated_at = ?
+            WHERE file_id = ? AND epoch = ? AND revision = ?`,
+          revision, exactArrayBuffer(headBytes), applied.doc.length,
+          now, normalized.fileId, row.epoch, row.head_revision,
+        );
+        if (headUpdated.rowsWritten !== 1) {
+          throw new RoomTextError("STORAGE_CORRUPT", "durable head changed during synchronous commit");
         }
         if (checkpointBytes) {
           const retainedFloor = this.retentionFloor(
@@ -1115,6 +1147,17 @@ export class RoomTextStore {
       );
       CREATE INDEX IF NOT EXISTS room_text_digest_log_root_idx
         ON room_text_digest_log(root_hash);
+      CREATE TABLE IF NOT EXISTS room_text_heads (
+        file_id TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        content_bytes BLOB NOT NULL,
+        content_utf16_length INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK (epoch >= 1),
+        CHECK (revision >= 0),
+        CHECK (content_utf16_length >= 0)
+      );
     `);
     // Seed the pre-mutation root so a client that synced the empty room
     // still gets an O(changed) diff once files appear.
@@ -1154,41 +1197,25 @@ export class RoomTextStore {
       return cached;
     }
 
-    const snapshot = decodeRoomText(row.snapshot_bytes);
-    if (snapshot.length !== row.snapshot_utf16_length) {
-      throw new RoomTextError("STORAGE_CORRUPT", "snapshot UTF-16 length is inconsistent");
+    const head = this.storage.sql.exec<HeadRow>(
+      `SELECT file_id, epoch, revision, content_bytes, content_utf16_length
+         FROM room_text_heads WHERE file_id = ?`,
+      row.file_id,
+    ).toArray()[0];
+    if (!head || head.epoch !== row.epoch || head.revision !== row.head_revision
+      || head.content_bytes.byteLength !== row.byte_length) {
+      throw new RoomTextError("STORAGE_CORRUPT", "durable head does not match authoritative file metadata");
     }
-    let doc = snapshot;
-    let revision = row.snapshot_revision;
-    let byteLength = encodeRoomText(snapshot).byteLength;
-    const updates = this.updateRows(row.file_id, row.epoch, row.snapshot_revision, row.head_revision);
-    validateUpdateChain(updates, row.snapshot_revision, snapshot.length, row.head_revision);
-    for (const update of updates) {
-      const applied = applyRoomTextChange(doc, parseStoredChangeSet(update), byteLength);
-      if (applied.doc.length !== update.after_utf16_length || applied.byteDelta !== update.byte_delta
-        || applied.byteLength !== update.after_byte_length) {
-        throw new RoomTextError("STORAGE_CORRUPT", `update ${update.revision} metadata is inconsistent`);
-      }
-      doc = applied.doc;
-      byteLength = applied.byteLength;
-      revision = update.revision;
+    const doc = decodeRoomText(head.content_bytes);
+    if (doc.length !== head.content_utf16_length) {
+      throw new RoomTextError("STORAGE_CORRUPT", "durable head UTF-16 length is inconsistent");
     }
-    const replayTailBytes = updates.reduce(
-      (total, update) => total + persistedJsonEncoder.encode(update.changes_json).byteLength,
-      0,
-    );
-    if (revision !== row.head_revision || byteLength !== row.byte_length) {
-      throw new RoomTextError("STORAGE_CORRUPT", "reconstructed head does not match file metadata");
-    }
-    if (replayTailBytes !== row.recovery_tail_bytes) {
-      throw new RoomTextError("STORAGE_CORRUPT", "recovery tail byte count is inconsistent");
-    }
-    const entry = {
+    const entry: CachedText = {
       fileId: row.file_id,
       path: row.path,
       epoch: row.epoch,
-      revision,
-      byteLength,
+      revision: row.head_revision,
+      byteLength: row.byte_length,
       doc,
     };
     this.remember(entry);

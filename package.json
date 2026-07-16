@@ -19,6 +19,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --dir src",
     "test:room-text-workerd": "node scripts/room-text-probe/run.mjs",
+    "test:room-text-adversarial": "node scripts/room-text-probe/blast-adversarial.mjs",
     "webcheck": "node scripts/check-webui.mjs src/web-ui.ts /tmp/bashroom-web-ui.js && node --check /tmp/bashroom-web-ui.js && node scripts/check-collab-ui.mjs src/web-collab.ts src/index.ts",
     "smoke": "node bin/bashroom.js --help",
     "check": "npm run typecheck && npm test && npm run test:room-text-workerd && npm run webcheck && npm run smoke"

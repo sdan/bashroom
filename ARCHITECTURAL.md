@@ -279,13 +279,22 @@ described below, not a CRDT protocol.
 
 **RoomText is a measured candidate, not production authority yet.** The
 isolated implementation in `src/room-text.ts` and `src/room-text-store.ts`
-stores one room's collaborative text as exact UTF-8 snapshot BLOBs plus a
-contiguous canonical ChangeSet tail in DO SQLite. A bounded cache holds
-immutable CodeMirror `Text` trees for active files; strings exist only at
-open/export/checkpoint boundaries. Idempotent requests, revision advance,
-canonical update, and room commit persist in one synchronous transaction.
-Recovery checkpoints every 128 updates or 256 KB of tail; clients more than
-256 updates or 1 MB of update payload behind reset to the current snapshot.
+stores each file's exact current UTF-8 head BLOB separately from its bounded
+canonical ChangeSet history in DO SQLite. A cold open decodes one head row;
+it never reconstructs current state by replaying history. A bounded cache
+holds immutable CodeMirror `Text` trees for active files. Each accepted edit
+encodes the new head once, then persists that head, idempotency row, revision,
+canonical update, digest, and room commit in one synchronous transaction.
+The head and version checkpoint remain separate rows so two near-1 MB BLOBs
+cannot collide with SQLite's 2 MB row limit. This branch assumes fresh probe
+storage; it does not backfill `room_text_heads` for older candidate databases.
+Any namespace migration must populate and verify every head before routing
+reads to this schema.
+
+The canonical log exists for stale-client rebasing, delta reconnects, comment
+anchors, and version export — not materialization. Version checkpoints occur
+every 128 updates or 256 KB of tail; clients more than 256 updates or 1 MB of
+update payload behind receive the current head as full-state hydration.
 Checkpoints advance a history floor that retains 384 canonical updates or
 8 MB as the live sync window; rows below the floor persist as cold history
 for a flush janitor (probed in `scripts/room-text-probe/`, not yet mounted):
@@ -293,7 +302,11 @@ compact same-client runs strictly below the floor, export a deterministic
 version artifact plus HEAD manifest for R2 (create-only PUT, etag-CAS
 flip), then prune updates, retry pointers, and orphaned commits at one
 atomic boundary. Re-fires and crashes between PUT and flip recover by
-firing again.
+firing again. This is not yet sufficient for production: the probe reproduced
+two multi-file/async failures. A scalar alarm target drops earlier dirty files,
+and an older R2 flush can CAS `HEAD` backward after a newer flush. Cutover
+requires a durable dirty-file queue plus a monotonic `(epoch, revision)` guard
+at the HEAD flip.
 
 A size-gated digest index rides the same transactions (Experiment 2,
 NOTES.md 2026-07-15): every accepted update upserts a per-file digest row
@@ -310,6 +323,8 @@ The workerd and cross-library results are in
 until the production cutover can make it the sole authority. Dual-writing R2
 and SQLite cannot be atomic and would create split-brain. Until that cutover,
 all current R2/etag behavior documented above remains the product truth.
+`commitBatch`, rename, delete/tombstones, and whole-room listing are still
+missing, so the candidate has not yet proved atomic shell filesystem semantics.
 
 **Selective undo is local inverses remapped over remote updates.**
 `SelectiveUndoHistory` in `src/web-collab.ts` stores inverses of this

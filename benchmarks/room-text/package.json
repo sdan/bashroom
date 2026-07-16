@@ -7,6 +7,8 @@
     "bench:synthetic": "node --expose-gc --import tsx benchmark.ts",
     "bench:traces": "node --expose-gc --import tsx trace-benchmark.ts",
     "bench:workerd": "node workerd-benchmark.mjs",
+    "bench:workerd-realistic": "node realistic-workerd.mjs",
+    "bench:workerd-realistic:smoke": "ROOM_TEXT_REALISTIC_SMOKE=1 node realistic-workerd.mjs",
     "bench:liveblocks": "liveblocks dev --random-port --no-check --cmd \"node liveblocks-local.mjs\""
   },
   "dependencies": {

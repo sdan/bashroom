@@ -5,6 +5,61 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-16 — B-only durable head; realistic stress and adversarial gaps
+
+The materialization A/B and its runtime switch were deleted. RoomText now has
+one current-state representation: an exact UTF-8 head BLOB updated atomically
+with each accepted canonical revision. Checkpoints and the canonical log remain
+only for sync, anchors, idempotency, and version export; cold reads never replay
+them. Head and checkpoint stay in separate rows because each may approach the
+1 MB RoomText limit while Durable Object SQLite caps a row/BLOB at 2 MB.
+
+A read-only census of the mounted product corpus found 680 files: p50 4,051 B,
+p95 13,178 B, p99 53,917 B; 658 files were at most 16 KiB and only 6 exceeded
+64 KiB. Eighteen of nineteen rooms totaled at most 241,290 B; `longloop` was
+the outlier at 4.3 MiB.
+
+The full local-workerd profile ran the supported 679-file corpus in a measured
+19-DO count/byte topology and in a concentrated single-DO stress topology,
+each twice; fixture contents were deterministic, not copied private text.
+It accepted 10,092 fresh revisions, 204 retries, 70 cache clears, and 3.56 GB
+of logical current-head BLOB writes. All six full real editing-trace runs
+matched the pinned corpus oracle and independent foreign-edit final strings.
+Inside each 679-file DO, 256 edits to a 420 KB head plus a 50-writer stale burst
+crossed the 32-entry cache via 16 sibling sweeps: sequential p50 was
+6.90–7.24 ms, while the stale burst drained at 139–154 edits/s. An independent
+oracle proved every one of the 50 burst markers appeared exactly once and the
+prior 420 KB suffix was untouched. After process restart, 2,716 topology files
+and 10 hot documents reopened exactly; the
+pre-restart request deduped to its
+original commit and the next request advanced normally.
+
+Named SQLite aborts proved create/head/digest transactions roll back without
+fragments. Four gaps were reproduced: create misclassifies a SQLite constraint
+abort unrelated to uniqueness as `ALREADY_EXISTS`; same-length valid head
+corruption opens until explicit digest verification; one scalar alarm target drops the first
+of two dirty files; and a paused revision-1 janitor resumed after revision 2
+and CASed R2 `HEAD` backward to 1 while SQLite stayed at 2.
+
+This changes the work order:
+
+1. Before cutover, replace `janitor:target` with a durable dirty-file queue and
+   reject any R2 HEAD transition whose `(epoch, revision)` is not monotonic.
+   Narrow SQL constraint classification and decide whether cold heads validate
+   their maintained digest. Add a verified legacy-head backfill before reusing
+   any existing candidate namespace.
+2. Test an explicit dependent update chain: persist N canonical revisions and
+   request pointers in one synchronous transaction, but encode/write the final
+   head once. No timer. A 16-update backlog must produce one head publication,
+   preserve retries/interleavings, and improve 100/900 KB aggregate execution
+   by at least 25%.
+3. Hold 32 KB adaptive chunks until large actively edited files are observed.
+   They must write at most 10% of full-head bytes and keep cold open under 2x.
+4. Treat a packed room image as an export/checkout probe, not authority: it
+   fits nearly every current room but makes one tiny edit rewrite the room.
+5. If customers do not need per-file restore/history, test deleting the R2
+   artifact pipeline and retain only the bounded sync log plus operator PITR.
+
 ## 2026-07-16 — Cutover sign-off: Wave B = milestone, cutover NOT approved
 
 Human review (surya). Wave B approved as a strong experimental milestone;

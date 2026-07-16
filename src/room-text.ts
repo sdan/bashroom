@@ -69,7 +69,7 @@ export function roomTextFromString(content: string): Text {
   return Text.of(content.split("\n"));
 }
 
-/** Materialize exact UTF-8 only at snapshots and external API boundaries. */
+/** Materialize exact UTF-8 for a durable head, checkpoint, or API boundary. */
 export function encodeRoomText(doc: Text): Uint8Array {
   const content = doc.toString();
   assertUnicodeScalarString(content);
@@ -313,7 +313,7 @@ export function replayRoomText(
  *
  * The gate: documents under ROOM_TEXT_DIGEST_GATE_BYTES hash their whole
  * content (below ~32KB walking the tree costs more than hashing the string,
- * and small docs materialize snapshot bytes per revision anyway); larger
+ * and small docs materialize durable-head bytes per revision anyway); larger
  * documents hash the dirty spine only, reusing per-node digests cached by
  * the rope's immutable node identity. Both paths yield the same digest.
  */
