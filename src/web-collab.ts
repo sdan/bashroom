@@ -219,7 +219,7 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
   var tokenKey = "bashroom.token";
   var app = document.getElementById("app");
   var selectionAction = document.getElementById("selection-action");
-  var state = { token: localStorage.getItem(tokenKey) || "", file:null, comments:[], handle:"", userId:"", owner:false, editing:false, pending:null, activeComment:"", mermaid:null, ws:null, viewers:0, draftTimer:0, draftLast:0, liveTimer:0, renderSeq:0 };
+  var state = { token: localStorage.getItem(tokenKey) || "", file:null, comments:[], handle:"", userId:"", owner:false, editing:false, pending:null, activeComment:"", mermaid:null, ws:null, viewers:0, draftTimer:0, draftLast:0, liveTimer:0, renderSeq:0, align:null };
 
   function esc(value){
     return String(value == null ? "" : value).replace(/[&<>\"']/g,function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;","\\\"":"&quot;","'":"&#39;"}[c]; });
@@ -258,6 +258,73 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
     return out;
   }
   function documentText(root){ return documentTextNodes(root).map(function(node){ return node.data; }).join(""); }
+  // ── Rendered <-> source alignment ─────────────────────────────────────
+  // Comment anchors are canonical in raw Markdown SOURCE offsets: the server
+  // remaps them through source ChangeSets (DocumentCollab.remapCommentAnchors
+  // via mapRoomTextAnchors) and MCP agents post source offsets. The browser
+  // only ever sees rendered DOM text, so each render builds ONE greedy
+  // two-pointer subsequence alignment of the concatenated text nodes against
+  // the source. Markdown syntax (#, **, [, ](url), fence lines) exists only
+  // in the source and is skipped as a gap; HTML entities in the source
+  // (&lt; -> <) are decoded in place; whitespace is soft on both sides
+  // because marked inserts block-boundary newlines the source lacks. If any
+  // visible rendered character has no source origin the alignment is null
+  // and every consumer FAILS CLOSED: no comment offer, anchors surface as
+  // drift ("Text moved") — never a guessed highlight.
+  var SOFT_SPACE = /\\s/;
+  var NAMED_ENTITIES = { amp:"&", lt:"<", gt:">", quot:'"', apos:"'", nbsp:"\\u00a0", copy:"\\u00a9", reg:"\\u00ae", trade:"\\u2122", hellip:"\\u2026", mdash:"\\u2014", ndash:"\\u2013", lsquo:"\\u2018", rsquo:"\\u2019", ldquo:"\\u201c", rdquo:"\\u201d", laquo:"\\u00ab", raquo:"\\u00bb", times:"\\u00d7", middot:"\\u00b7", sect:"\\u00a7", para:"\\u00b6", deg:"\\u00b0", plusmn:"\\u00b1", bull:"\\u2022", dagger:"\\u2020", larr:"\\u2190", rarr:"\\u2192" };
+  function decodeEntityAt(text, index){
+    if (text.charCodeAt(index) !== 38) return null;
+    var match = /^&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});/.exec(text.slice(index, index + 34));
+    if (!match) return null;
+    var body = match[1], ch = null;
+    if (body.charAt(0) === "#") {
+      var code = body.charAt(1) === "x" || body.charAt(1) === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      if (code >= 32 && code <= 65535 && !(code >= 55296 && code <= 57343)) ch = String.fromCharCode(code);
+    } else if (Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, body)) ch = NAMED_ENTITIES[body];
+    if (!ch || ch.length !== 1) return null;
+    return { ch: ch, length: match[0].length };
+  }
+  function buildSourceAlignment(rendered, source){
+    rendered = String(rendered == null ? "" : rendered); source = String(source == null ? "" : source);
+    var hardIdx = [], hardStart = [], hardEnd = [], cursor = 0;
+    for (var r = 0; r < rendered.length; r++) {
+      var c = rendered.charAt(r);
+      if (SOFT_SPACE.test(c)) continue; // block-boundary newlines etc. need not line up 1:1
+      var scan = cursor, matched = false;
+      while (scan < source.length) {
+        if (source.charAt(scan) === c) { hardIdx.push(r); hardStart.push(scan); hardEnd.push(scan + 1); cursor = scan + 1; matched = true; break; }
+        var entity = decodeEntityAt(source, scan);
+        if (entity && entity.ch === c) { hardIdx.push(r); hardStart.push(scan); hardEnd.push(scan + entity.length); cursor = scan + entity.length; matched = true; break; }
+        scan++;
+      }
+      if (!matched) return null; // a visible char with no source origin: fail closed
+    }
+    return { source:source, renderedLength:rendered.length, hardIdx:hardIdx, hardStart:hardStart, hardEnd:hardEnd };
+  }
+  function lowerBound(values, limit){
+    var lo = 0, hi = values.length;
+    while (lo < hi) { var mid = (lo + hi) >> 1; if (values[mid] >= limit) hi = mid; else lo = mid + 1; }
+    return lo;
+  }
+  function renderedRangeToSource(align, start, end){
+    if (!align || !(end > start) || start < 0 || end > align.renderedLength) return null;
+    var first = lowerBound(align.hardIdx, start);
+    if (first >= align.hardIdx.length || align.hardIdx[first] >= end) return null; // whitespace-only selection
+    var last = lowerBound(align.hardIdx, end) - 1;
+    return { start:align.hardStart[first], end:align.hardEnd[last] };
+  }
+  function sourceRangeToRendered(align, start, end){
+    if (!align || !(end > start) || start < 0) return null;
+    var first = lowerBound(align.hardEnd, start + 1); // first visible char whose source extent ends past start
+    var afterLast = lowerBound(align.hardStart, end); // visible chars starting at/after end are outside
+    if (first >= afterLast) return null; // anchor covers no visible text: drift, never a guess
+    return { start:align.hardIdx[first], end:align.hardIdx[afterLast - 1] + 1 };
+  }
+  function renderedPointFromSource(align, offset){
+    var index = lowerBound(align.hardEnd, offset + 1);
+    return index < align.hardIdx.length ? align.hardIdx[index] : align.renderedLength;
+  }
   function offsetsForSelection(root, range){
     if (range.startContainer.nodeType !== Node.TEXT_NODE || range.endContainer.nodeType !== Node.TEXT_NODE) return null;
     var nodes = documentTextNodes(root), start = 0, end = 0, foundStart = false, foundEnd = false;
@@ -268,19 +335,32 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
       end += nodes[i].data.length;
     }
     if (!foundStart || !foundEnd || end <= start) return null;
-    var full = documentText(root), raw = full.slice(start,end), left = raw.length - raw.trimStart().length, quote = raw.trim();
+    // Rendered offsets are only a waypoint: the stored anchor is SOURCE
+    // offsets and the quote is the raw source slice (markers included).
+    // Require an alignment for the exact saved document — while a live
+    // draft is rendered (align.source is the draft) commenting is refused
+    // rather than anchored against the wrong document.
+    var align = state.align;
+    if (!align || !state.file || align.source !== state.file.content) return null;
+    var full = documentText(root), raw = full.slice(start,end), left = raw.length - raw.trimStart().length, trimmed = raw.trim();
+    if (!trimmed) return null;
+    var src = renderedRangeToSource(align, start+left, start+left+trimmed.length);
+    if (!src) return null;
+    var quote = align.source.slice(src.start, src.end);
     if (!quote || quote.length > 2000) return null;
-    return { anchor_start:start+left, anchor_end:start+left+quote.length, quote:quote };
+    return { anchor_start:src.start, anchor_end:src.end, quote:quote };
   }
-  function resolvedAnchor(comment, text){
-    // Stored offsets are the anchor authority: the server maps them through
-    // every accepted update (assoc -1 start / +1 end) and rewrites them via
-    // DocumentCollab.remapCommentAnchors. The quote-substring fallback was
-    // deleted — a moved or repeated quote must surface as drift ("Text
-    // moved"), never highlight a guessed occurrence at the wrong position.
+  function resolvedAnchor(comment, source, align){
+    // Stored offsets are the anchor authority IN SOURCE COORDINATES: the
+    // server maps them through every accepted update (assoc -1 start / +1
+    // end) and rewrites them via DocumentCollab.remapCommentAnchors. The
+    // quote must equal the raw source slice, then the alignment projects
+    // the range into rendered coordinates for the <mark>. There is no
+    // quote-substring fallback — a moved or repeated quote must surface as
+    // drift ("Text moved"), never highlight a guessed occurrence.
     var start = Number(comment.anchor_start), end = Number(comment.anchor_end);
-    if (end > start && text.slice(start,end) === comment.quote) return { start:start, end:end };
-    return null;
+    if (!(end > start) || source.slice(start,end) !== comment.quote) return null;
+    return sourceRangeToRendered(align, start, end);
   }
   function wrapAnchor(root, anchor, id){
     var nodes = documentTextNodes(root), cursor = 0;
@@ -299,11 +379,11 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
       if (cursor >= anchor.end) break;
     }
   }
-  function applyAnchors(){
+  function applyAnchors(source){
     var article = document.getElementById("doc"); if (!article) return;
-    var text = documentText(article);
+    var align = state.align;
     state.comments.filter(function(c){ return !c.resolved_at; }).slice().sort(function(a,b){ return b.anchor_start-a.anchor_start; }).forEach(function(comment){
-      var anchor = resolvedAnchor(comment,text); comment._anchor = anchor;
+      var anchor = resolvedAnchor(comment,source,align); comment._anchor = anchor;
       if (anchor) wrapAnchor(article,anchor,comment.id);
     });
     article.querySelectorAll("mark.comment-anchor").forEach(function(mark){ mark.onclick = function(){ activateComment(mark.dataset.commentId || ""); }; });
@@ -336,10 +416,17 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
   async function renderMarkdown(source){
     var seq = ++state.renderSeq;
     var article = document.getElementById("doc"); if (!article) return;
-    article.innerHTML = DOMPurify.sanitize(marked.parse(source || ""));
+    var text = String(source == null ? "" : source);
+    article.innerHTML = DOMPurify.sanitize(marked.parse(text));
     await enhanceDiagrams(article);
     if (seq !== state.renderSeq) return false;
-    applyAnchors();
+    // Align AFTER enhanceDiagrams on purpose: mermaid replaces code text
+    // with SVG that documentTextNodes skips, so the alignment and the
+    // anchor walker always see the same rendered text. A mermaid block is
+    // therefore a pure source-side gap; selections inside SVG were already
+    // rejected by inspectSelection.
+    state.align = buildSourceAlignment(documentText(article), text);
+    applyAnchors(text);
     return true;
   }
   function actorCursorColor(actor){
@@ -365,7 +452,12 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
   function placeRemoteCaret(article,source,caret,actor){
     if (!article) return;
     article.querySelectorAll(".remote-caret").forEach(function(node){ node.remove(); });
-    var remaining = renderedCaretOffset(source,caret), walker = document.createTreeWalker(article,NodeFilter.SHOW_TEXT);
+    var content = String(source == null ? "" : source), clamped = Math.max(0,Math.min(Number(caret) || 0,content.length));
+    // The alignment renderMarkdown just built maps the caret without a
+    // second marked.parse; the sentinel probe survives as the fallback for
+    // documents the aligner refused.
+    var remaining = state.align && state.align.source === content ? renderedPointFromSource(state.align,clamped) : renderedCaretOffset(content,clamped);
+    var walker = document.createTreeWalker(article,NodeFilter.SHOW_TEXT);
     var node = null, target = null, localOffset = 0, last = null;
     while ((node = walker.nextNode())) {
       var parent = node.parentElement;
