@@ -782,4 +782,31 @@ describe("RoomTextClient durable outbox and globally-unique request IDs", () => 
     expect(foreign.client.outboxSize()).toBe(0);
     expect(foreign.client.localText()).toBe("");
   });
+
+  it("a new edit after reload does not reuse a persisted-but-unacked request id", () => {
+    // The request-id counter is NOT persisted, so a reloaded instance restarts
+    // it at 0. Without advancing it past the restored backlog, the FIRST new
+    // edit would re-mint req-1 — the same (clientId, requestId) dedup key as
+    // the still-pending original, a self-collision the server answers with a
+    // wrong-answer dedupe hit. The nonce separates DIFFERENT instances; this
+    // guard separates a reloaded instance from its OWN restored backlog.
+    const persist = memoryPersist();
+    const first = makeHarness({ nonce: "n1", persist });
+    connect(first, "ab");
+    first.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    first.clock.advance(100);
+    expect(pushes(first).at(-1)?.[0].requestId).toBe("n1-req-1");
+
+    // Reload: fresh instance loads the pending entry, then the user keeps
+    // typing before the original acks. The new edit is a distinct logical
+    // update and must carry a distinct request id.
+    const reloaded = makeHarness({ nonce: "n1", persist });
+    expect(reloaded.client.outboxSize()).toBe(1);
+    reloaded.client.edit([{ from: 3, to: 3, insert: "Y" }]);
+    reloaded.clock.advance(100);
+
+    const ids = persist.saved!.entries.map((entry) => entry.requestId);
+    expect(ids).toEqual(["n1-req-1", "n1-req-2"]);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
 });

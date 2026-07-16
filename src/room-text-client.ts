@@ -292,6 +292,17 @@ export class RoomTextClient {
           sent: entry.sent,
           speculative: entry.speculative,
         });
+        // Advance the counter past every default-minted ID we just restored.
+        // The counter itself is NOT persisted (a fresh instance starts at 0),
+        // so without this a NEW edit typed before the pending entry acks would
+        // re-mint req-1 — the SAME (clientId, requestId) dedup key as the still-
+        // pending original, a self-collision that the server answers with a
+        // wrong-answer dedupe hit (IDEMPOTENCY_MISMATCH). The nonce separates
+        // DIFFERENT instances; this separates a reloaded instance from its own
+        // restored backlog. IDs from an injected nextRequestId don't match the
+        // default shape and are left to the host's own uniqueness guarantee.
+        const counter = this.parseDefaultRequestCounter(entry.requestId);
+        if (counter > this.requestSequence) this.requestSequence = counter;
       } catch {
         // A blob whose changesets no longer compose is corrupt; drop the rest
         // rather than resend nonsense. Sent-but-unconfirmed rows already on
@@ -299,6 +310,23 @@ export class RoomTextClient {
         break;
       }
     }
+  }
+
+  /**
+   * Extract the numeric suffix of a default-minted request ID (`req-<n>` or
+   * `<nonce>-req-<n>`) so rehydrate() can resume the counter past it. Returns 0
+   * for any ID that is not this instance's default shape — a host-injected
+   * factory's IDs, or a blob minted under a different nonce — so an unrelated
+   * shape never perturbs the counter. Pure string math: no RNG, no clock.
+   */
+  private parseDefaultRequestCounter(requestId: string): number {
+    const prefix = this.config.nonce ? `${this.config.nonce}-req-` : "req-";
+    if (!requestId.startsWith(prefix)) return 0;
+    const suffix = requestId.slice(prefix.length);
+    // Reject leading zeros / signs / non-digits: only exact `${++n}` output.
+    if (!/^[1-9][0-9]*$/.test(suffix)) return 0;
+    const n = Number(suffix);
+    return Number.isSafeInteger(n) ? n : 0;
   }
 
   /**
