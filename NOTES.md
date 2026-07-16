@@ -5,6 +5,62 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-16 — Cutover sign-off: Wave B = milestone, cutover NOT approved
+
+Human review (surya). Wave B approved as a strong experimental milestone;
+production cutover explicitly NOT approved. Four reported claims corrected
+(record these so the inflated versions never propagate):
+- "230/230 tests" was 57 distinct tests tripled by vitest walking into five
+  .claude/worktrees copies. TRUE COUNT = 57/57. Fixed: `test` script now
+  `vitest run --dir src` + vitest.config.ts scopes/excludes worktrees.
+- Client outbox is IN-MEMORY (reconnect-resilient, NOT reload-durable).
+  Calling it "durable" was wrong; localStorage persistence is spec, not built.
+- "8/9 complete" overstated Task 8: digest gives O(changed) RESPONSE but
+  O(all files) COMPUTATION per accepted update, and removals are unsupported.
+  Task 8 acceptance scope reopened.
+- Deploy: version d15ea856 (2026-07-15) IS the active version per
+  `wrangler deployments status`, but my session verification hit the domain
+  without confirming version==HEAD, so a stale-worker test is not ruled out.
+  Treat prod-parity as UNVERIFIED until version pinning is checked. (The 3
+  R2 secrets still existing is intentional rollback path, not a miss.)
+
+CUTOVER BLOCKERS (all confirmed real):
+1. Retryable-discard edit loss — room-text-client.ts:437 drops the rejected
+   head edit on RESET_REQUIRED instead of preserve-and-rehydrate. Data loss.
+2. Outbox + IDs not durable — private array (client.ts:185); default
+   request IDs restart at req-1 while dedup is room-wide on
+   (client_id,request_id) (store.ts:1084). Reload/multi-file collisions.
+3. Comment anchors use INCOMPATIBLE coordinates — browser records rendered-
+   DOM offsets (web-collab.ts:249); RoomText remaps through raw-Markdown-
+   source changes (room-text.ts:209). Headings/emphasis/links/code diverge.
+   Bigger than Task #9's MCP-offset gap: needs a rendered<->source mapping
+   decision. Comments cannot ride the new engine until resolved.
+4. Split-brain — shell still writes the writable R2 mount (index.ts:4166);
+   SQLite-authoritative + live shell writes = the split ARCHITECTURAL.md:308
+   prohibits.
+
+APPROVED ARCHITECTURE (supersedes the separate-RoomText-DO design):
+- Expand the EXISTING RoomHub into the room authority; do NOT stand up a
+  parallel room DO. Hub already has <user>:<room> identity, placement,
+  SQLite, sockets — one DO per coordination atom.
+- Fold DocumentCollab INTO that room authority: comment anchors + text
+  revisions share one consistency boundary; separate DOs = needless saga.
+- Authority moves ONCE (R2 -> hot on promote), never oscillates on
+  disconnect. DO hibernation already makes compute cold while SQLite stays
+  authoritative. (Corrects the "demote on idle" oscillation my hot/cold
+  viz implied.)
+
+REQUIRED SEQUENCE (plan of record):
+1 fix retryable-discard edit loss. 2 persisted outbox import/export +
+globally unique request IDs. 3 choose source-coordinate comments + build
+rendered<->source mapping. 4 correct vitest discovery (DONE) + reopen
+Task 8 scope. 5 mount RoomText inside RoomHub, dark. 6 authed socket/file
+binding + client identity + frame/batch limits. 7 rename/delete/tombstones
++ atomic multi-file commitBatch. 8 replace direct shell authority with
+checkout/commit. 9 one text-only canary room, no auto-demotion (safe only
+if shell writes disabled/read-only for that room). 10 parity + rollback
+verify before room-by-room expansion.
+
 ## 2026-07-16 — CS-fundamentals review; live lost-update hole found & fixed
 
 Six-lens theory audit (distributed / algorithms / queueing / information /
