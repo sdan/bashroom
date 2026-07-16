@@ -28,6 +28,22 @@ describe("room-text hot-path discipline", () => {
       expect(code).not.toMatch(/\bawait\b/);
       expect(code).not.toMatch(/\bsetTimeout\b|\bsetInterval\b/);
       expect(code).not.toMatch(/\bfetch\s*\(/);
+      // No nondeterministic RNG anywhere on the hot path — request IDs and
+      // tokens must be reproducible so the (clientId, requestId) dedupe key is
+      // stable across a reload, and rebaseUpdates must replay identically.
+      expect(code).not.toMatch(/\bMath\.random\b/);
     });
   }
+
+  // The client additionally forbids Date.now: it is host-injected clock only
+  // (config.now) so the module is fully deterministic and unit-testable
+  // without a real clock. The server store legitimately uses wall-clock
+  // (created_at columns), so this ban is client-only.
+  it("src/room-text-client.ts uses no wall-clock (Date.now)", () => {
+    const source = readFileSync("src/room-text-client.ts", "utf8");
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "");
+    expect(code).not.toMatch(/\bDate\.now\b/);
+  });
 });

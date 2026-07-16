@@ -5,9 +5,12 @@ import {
   ROOM_TEXT_CLOSE_ZOMBIE,
   ROOM_TEXT_NORMAL_BACKOFF_MS,
   RoomTextClient,
+  type RoomTextClientConfig,
   type RoomTextClientFrame,
   type RoomTextClientState,
+  type RoomTextOutboxPersist,
   type RoomTextServerFrame,
+  type SerializedOutbox,
 } from "./room-text-client";
 import { roomTextUpdateToken, type WireTextChange } from "./room-text";
 import type { PushRoomTextInput, RoomTextFailure } from "./room-text-store";
@@ -44,7 +47,9 @@ function fakeClock() {
 
 type Harness = ReturnType<typeof makeHarness>;
 
-function makeHarness() {
+type HarnessOverrides = Partial<Pick<RoomTextClientConfig, "clientId" | "nonce" | "persist">>;
+
+function makeHarness(overrides: HarnessOverrides = {}) {
   const clock = fakeClock();
   const log = {
     opened: 0,
@@ -59,10 +64,12 @@ function makeHarness() {
     incompatible: [] as number[],
   };
   const client = new RoomTextClient({
-    clientId: "c1",
+    clientId: overrides.clientId ?? "c1",
     fileId: "f1",
     schedule: clock.schedule,
     now: clock.now,
+    ...(overrides.nonce !== undefined ? { nonce: overrides.nonce } : {}),
+    ...(overrides.persist ? { persist: overrides.persist } : {}),
     effects: {
       openSocket: () => log.opened++,
       sendFrame: (frame) => log.frames.push(frame),
@@ -77,6 +84,23 @@ function makeHarness() {
     },
   });
   return { clock, log, client };
+}
+
+// A synchronous in-memory stand-in for a host's localStorage-backed store.
+function memoryPersist(seed: SerializedOutbox | null = null): RoomTextOutboxPersist & {
+  saved: SerializedOutbox | null;
+  saves: number;
+} {
+  const store = {
+    saved: seed,
+    saves: 0,
+    load: () => store.saved,
+    save: (outbox: SerializedOutbox) => {
+      store.saved = outbox;
+      store.saves++;
+    },
+  };
+  return store;
 }
 
 function lastConnect(h: Harness) {
@@ -637,5 +661,125 @@ describe("RoomTextClient compose buffer and outbox", () => {
     // Revision 5 without 4 cannot chain: declare desync and reconnect.
     h.client.handleFrame(broadcast(5, "other", "r5", [{ from: 0, to: 0, insert: "!" }]));
     expect(h.client.state()).toBe("backoff");
+  });
+});
+
+describe("RoomTextClient durable outbox and globally-unique request IDs", () => {
+  it("rehydrates a persisted outbox and resends it on connect with the ORIGINAL token", () => {
+    // First instance: type an edit, send it, then the tab dies before the ack.
+    const persist = memoryPersist();
+    const first = makeHarness({ nonce: "n1", persist });
+    connect(first, "ab");
+    first.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    first.clock.advance(100);
+    const [sent] = pushes(first)[0];
+    expect(persist.saved?.entries).toHaveLength(1);
+    expect(persist.saved?.entries[0]).toMatchObject({
+      requestId: sent.requestId,
+      speculative: true,
+      changes: [{ from: 1, to: 1, insert: "X" }],
+    });
+
+    // Second instance (tab reload): SAME clientId + nonce, fresh in-memory
+    // state, loads the persisted blob. The unacked entry is back with its
+    // original token before a byte crosses the wire.
+    const reloaded = makeHarness({ nonce: "n1", persist });
+    expect(reloaded.client.outboxSize()).toBe(1);
+    expect(reloaded.client.revision()).toBe(0);
+    expect(reloaded.client.localText()).toBe("aXb");
+
+    // Connect: a delta hydration confirming only a foreign edit. The rehydrated
+    // entry rebases over it and resends under its ORIGINAL request id.
+    reloaded.client.start();
+    reloaded.client.handleSocketOpen();
+    reloaded.client.handleFrame({
+      type: "hydration",
+      connectRequestId: lastConnect(reloaded).connectRequestId,
+      fileId: "f1",
+      hydration: "delta",
+      epoch: 1,
+      headRevision: 1,
+      updates: [{
+        revision: 1,
+        parentRevision: 0,
+        clientId: "other",
+        requestId: "r1",
+        changes: [{ from: 0, to: 0, insert: "!" }],
+      }],
+    });
+    const resent = pushes(reloaded).at(-1);
+    expect(resent).toHaveLength(1);
+    expect(resent?.[0]).toMatchObject({
+      clientId: "c1",
+      requestId: sent.requestId, // ORIGINAL token survives the reload
+      baseRevision: 1,
+      changes: [{ from: 2, to: 2, insert: "X" }], // rebased over the foreign edit
+    });
+    expect(reloaded.client.localText()).toBe("!aXb");
+  });
+
+  it("mints non-colliding request IDs for two instances sharing a clientId but not a nonce", () => {
+    // The server dedup space is (clientId, requestId), room-wide. Two live
+    // instances of the same clientId must never mint the same requestId or one
+    // would get a wrong-answer dedupe hit against the other's committed row.
+    const a = makeHarness({ clientId: "shared", nonce: "A" });
+    const b = makeHarness({ clientId: "shared", nonce: "B" });
+    connect(a, "ab");
+    connect(b, "ab");
+
+    const idsA: string[] = [];
+    const idsB: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      a.client.edit([{ from: 0, to: 0, insert: "a" }]);
+      a.clock.advance(100);
+      b.client.edit([{ from: 0, to: 0, insert: "b" }]);
+      b.clock.advance(100);
+      // Ack the head so the next speculative entry becomes the head and sends.
+      const lastA = pushes(a).at(-1)?.[0];
+      const lastB = pushes(b).at(-1)?.[0];
+      if (lastA) idsA.push(lastA.requestId);
+      if (lastB) idsB.push(lastB.requestId);
+      if (lastA) a.client.handleFrame(broadcast(i + 1, "shared", lastA.requestId, [{ from: 0, to: 0, insert: "a" }]));
+      if (lastB) b.client.handleFrame(broadcast(i + 1, "shared", lastB.requestId, [{ from: 0, to: 0, insert: "b" }]));
+    }
+    expect(new Set([...idsA, ...idsB]).size).toBe(idsA.length + idsB.length);
+    expect(idsA.every((id) => id.startsWith("A-"))).toBe(true);
+    expect(idsB.every((id) => id.startsWith("B-"))).toBe(true);
+    // The counters restart at 1 per instance — the nonce, not the counter,
+    // carries global uniqueness, which is exactly what survives a reload.
+    expect(idsA[0]).toBe("A-req-1");
+    expect(idsB[0]).toBe("B-req-1");
+  });
+
+  it("behaves exactly as today with no persist store injected (in-memory only)", () => {
+    const h = makeHarness(); // no nonce, no persist
+    connect(h, "ab");
+    h.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    h.clock.advance(100);
+    const [sent] = pushes(h)[0];
+    // Legacy in-memory IDs are unchanged (bare req-N counter).
+    expect(sent.requestId).toBe("req-1");
+    expect(sent).toMatchObject({ clientId: "c1", baseRevision: 0, changes: [{ from: 1, to: 1, insert: "X" }] });
+    // A fresh instance without persist starts empty — no cross-instance state.
+    const fresh = makeHarness();
+    expect(fresh.client.outboxSize()).toBe(0);
+    expect(fresh.client.revision()).toBe(0);
+    expect(fresh.client.localText()).toBe("");
+  });
+
+  it("ignores a persisted blob for a different clientId or fileId", () => {
+    // Build a real blob from one client, then feed it to a mismatched one.
+    const source = memoryPersist();
+    const seeded = makeHarness({ clientId: "c1", nonce: "n1", persist: source });
+    connect(seeded, "ab");
+    seeded.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    seeded.clock.advance(100);
+    const blob = source.saved as SerializedOutbox;
+    expect(blob.entries).toHaveLength(1);
+
+    // A client with a different clientId must not adopt the foreign outbox.
+    const foreign = makeHarness({ clientId: "c2", nonce: "n2", persist: memoryPersist(blob) });
+    expect(foreign.client.outboxSize()).toBe(0);
+    expect(foreign.client.localText()).toBe("");
   });
 });
