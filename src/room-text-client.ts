@@ -444,9 +444,25 @@ export class RoomTextClient {
       this.config.effects.onDiscard?.({ requestId: entry.requestId, code: frame.code, retryable: frame.retryable });
       return;
     }
-    // A discarded speculative entry invalidates the chain built on top of
-    // it: later entries and the draft assumed its text existed. Speculative
-    // entries are always contiguous at the tail, so one splice takes them.
+    if (frame.retryable) {
+      // RETRYABLE (EPOCH_MISMATCH / RESET_REQUIRED / FUTURE_REVISION): the edit
+      // is NOT invalid — our sync state is stale. The server never stored an
+      // idempotency row for it, so a resubmit against the fresh head can still
+      // land. Keep the whole speculative tail (and the draft) in place; a
+      // retryable failure must never lose an edit. forceResync drives a fresh
+      // hydration, and the reconnect path rebases the surviving speculative
+      // chain over the new confirmed head (integrateCommitted -> rebaseUpdates)
+      // and resubmits it with its ORIGINAL request tokens (resendOutbox), so
+      // server idempotency dedupes if the update actually raced to commit. The
+      // in-flight `sent` markers die with the socket; resendOutbox clears them.
+      this.recoverRetryableDiscard(frame.code);
+      return;
+    }
+    // A NON-retryable discarded speculative entry invalidates the chain built
+    // on top of it: later entries and the draft assumed its text existed. The
+    // server says this edit is permanently invalid, so drop it and the tail.
+    // Speculative entries are always contiguous at the tail, so one splice
+    // takes them.
     const removed = this.outbox.splice(index);
     const orphaned: WireTextChange[] = [];
     for (const later of removed.slice(1)) orphaned.push(...changeSetToWire(later.changes));
@@ -457,6 +473,22 @@ export class RoomTextClient {
     }
     this.config.effects.onDiscard?.({ requestId: entry.requestId, code: frame.code, retryable: frame.retryable });
     if (orphaned.length) this.config.effects.onLocalChangesOrphaned?.(orphaned);
+  }
+
+  /**
+   * Drive built-in recovery for a RETRYABLE speculative discard: preserve the
+   * rejected head, its speculative tail, and the draft, then force a fresh
+   * hydration. Recovery is entirely reuse — the standard reconnect path already
+   * rebases the surviving speculative chain over the new confirmed head and
+   * resubmits it with original request tokens through the single-in-flight push
+   * pipeline. This routine only keeps the pending work alive and kicks the
+   * resync; it changes no outbox contents, so the speculative-chain contiguity
+   * invariant is untouched. The rejected transmission's `sent` marker is stale
+   * (its socket is being torn down); resendOutbox clears speculative `sent`
+   * before replay, so we leave it for that path to normalize.
+   */
+  private recoverRetryableDiscard(code: RoomTextFailure["error"]): void {
+    this.forceResync(`retryable discard (${code}) — re-hydrating to rebase and resubmit`);
   }
 
   /**

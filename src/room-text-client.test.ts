@@ -456,6 +456,178 @@ describe("RoomTextClient compose buffer and outbox", () => {
     expect(h.client.localText()).toBe("ab");
   });
 
+  it("recovers a RETRYABLE discard: preserves the edit, re-hydrates, rebases, resubmits with the ORIGINAL token", () => {
+    const h = makeHarness();
+    connect(h, "ab");
+    h.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    h.clock.advance(100);
+    const [head] = pushes(h)[0];
+    const headReqId = head.requestId;
+    // The server rejects the in-flight head as RESET_REQUIRED (retryable):
+    // stale sync state, NOT an invalid edit. The client must not lose it.
+    h.client.handleFrame({
+      type: "discard",
+      updateToken: roomTextUpdateToken("c1", headReqId),
+      code: "RESET_REQUIRED",
+      retryable: true,
+    });
+    // No onDiscard fires and nothing is orphaned — the client drives recovery
+    // itself instead of handing the edit to the host.
+    expect(h.log.discards).toEqual([]);
+    expect(h.log.orphaned).toEqual([]);
+    // The rejected edit survives in the outbox; the client forced a resync.
+    expect(h.client.outboxSize()).toBe(1);
+    expect(h.client.state()).toBe("backoff");
+    // Reconnect fires on the NORMAL ladder, and the injected delta re-hydrates
+    // the client at a fresh head (a foreign update landed at revision 1).
+    h.clock.advance(250);
+    h.client.handleSocketOpen();
+    expect(lastConnect(h)).toMatchObject({ epoch: 1, lastRevision: 0 });
+    h.client.handleFrame({
+      type: "hydration",
+      connectRequestId: lastConnect(h).connectRequestId,
+      fileId: "f1",
+      hydration: "delta",
+      epoch: 1,
+      headRevision: 1,
+      updates: [{
+        revision: 1,
+        parentRevision: 0,
+        clientId: "other",
+        requestId: "r1",
+        changes: [{ from: 0, to: 0, insert: "!" }],
+      }],
+    });
+    expect(h.client.state()).toBe("connected");
+    // The preserved edit is rebased over the new confirmed head and resubmitted
+    // through the single-in-flight pipeline, carrying its ORIGINAL request token
+    // so the server's idempotency window can dedupe it.
+    const resent = pushes(h).at(-1);
+    expect(resent).toHaveLength(1);
+    expect(resent?.[0]).toMatchObject({
+      requestId: headReqId, // ORIGINAL token drives idempotency dedupe
+      baseRevision: 1, // rebased onto the fresh confirmed revision
+      changes: [{ from: 2, to: 2, insert: "X" }], // X carried past the foreign "!"
+    });
+    // The edit lands: nothing was lost on a retryable failure.
+    expect(h.client.localText()).toBe("!aXb");
+  });
+
+  it("recovers the orphaned speculative TAIL and the draft on a RETRYABLE discard", () => {
+    const h = makeHarness();
+    connect(h, "ab");
+    h.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    h.clock.advance(100);
+    const [head] = pushes(h)[0];
+    const headReqId = head.requestId;
+    // A second edit flushes into the speculative TAIL (held back — single
+    // in-flight), and a third edit is still buffering as the unflushed DRAFT.
+    h.client.edit([{ from: 2, to: 2, insert: "Y" }]);
+    h.clock.advance(100);
+    expect(h.client.outboxSize()).toBe(2);
+    h.client.edit([{ from: 3, to: 3, insert: "Z" }]);
+    expect(h.client.localText()).toBe("aXYZb");
+    // Retryable discard of the head: the tail and draft assumed the head's
+    // text, but on a retryable failure NONE of them may be lost.
+    h.client.handleFrame({
+      type: "discard",
+      updateToken: roomTextUpdateToken("c1", headReqId),
+      code: "EPOCH_MISMATCH",
+      retryable: true,
+    });
+    expect(h.log.discards).toEqual([]);
+    expect(h.log.orphaned).toEqual([]);
+    // Head + tail both survive; the draft is still buffered (flush is pending).
+    expect(h.client.outboxSize()).toBe(2);
+    expect(h.client.state()).toBe("backoff");
+    // Re-hydrate on reconnect at the same head (server had no new canonical
+    // updates — the reset was window pressure, not a foreign edit).
+    h.clock.advance(250);
+    h.client.handleSocketOpen();
+    h.client.handleFrame({
+      type: "hydration",
+      connectRequestId: lastConnect(h).connectRequestId,
+      fileId: "f1",
+      hydration: "delta",
+      epoch: 1,
+      headRevision: 0,
+      updates: [],
+    });
+    expect(h.client.state()).toBe("connected");
+    // Head resubmits with its ORIGINAL token; the tail waits behind it.
+    const resent = pushes(h).at(-1);
+    expect(resent).toHaveLength(1);
+    expect(resent?.[0]).toMatchObject({ requestId: headReqId, baseRevision: 0 });
+    // Nothing was orphaned; the full local composition (head + tail + draft)
+    // is intact end to end.
+    expect(h.log.orphaned).toEqual([]);
+    expect(h.client.localText()).toBe("aXYZb");
+    // The head's echo confirms it and releases the tail behind it.
+    h.client.handleFrame(broadcast(1, "c1", headReqId, [{ from: 1, to: 1, insert: "X" }]));
+    const afterEcho = pushes(h).at(-1);
+    expect(afterEcho?.[0]).toMatchObject({ changes: [{ from: 2, to: 2, insert: "Y" }] });
+    expect(h.client.localText()).toBe("aXYZb");
+  });
+
+  it("still DROPS and reports a NON-retryable discard (permanently invalid edit)", () => {
+    const h = makeHarness();
+    connect(h, "ab");
+    h.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    h.clock.advance(100);
+    const [first] = pushes(h)[0];
+    const opensBefore = h.log.opened;
+    h.client.handleFrame({
+      type: "discard",
+      updateToken: roomTextUpdateToken("c1", first.requestId),
+      code: "INVALID_CHANGE",
+      retryable: false,
+    });
+    // Permanently invalid: dropped and reported to the host, no recovery.
+    expect(h.log.discards).toEqual([{ requestId: first.requestId, code: "INVALID_CHANGE", retryable: false }]);
+    expect(h.client.outboxSize()).toBe(0);
+    expect(h.client.state()).toBe("connected"); // no forced resync
+    expect(h.log.opened).toBe(opensBefore); // no reconnect
+    expect(h.client.localText()).toBe("ab");
+  });
+
+  it("resubmits a recovered retryable edit with the ORIGINAL token so the idempotency window dedupes", () => {
+    const h = makeHarness();
+    connect(h, "ab");
+    h.client.edit([{ from: 1, to: 1, insert: "X" }]);
+    h.clock.advance(100);
+    const [head] = pushes(h)[0];
+    const headReqId = head.requestId;
+    h.client.handleFrame({
+      type: "discard",
+      updateToken: roomTextUpdateToken("c1", headReqId),
+      code: "RESET_REQUIRED",
+      retryable: true,
+    });
+    h.clock.advance(250);
+    h.client.handleSocketOpen();
+    h.client.handleFrame({
+      type: "hydration",
+      connectRequestId: lastConnect(h).connectRequestId,
+      fileId: "f1",
+      hydration: "delta",
+      epoch: 1,
+      headRevision: 0,
+      updates: [],
+    });
+    const resent = pushes(h).at(-1);
+    // The resubmit carries the ORIGINAL (clientId, requestId): the server keys
+    // its idempotency row on exactly this pair, so a raced commit dedupes
+    // instead of double-applying. The token echoed on commit matches too.
+    expect(resent?.[0]?.clientId).toBe("c1");
+    expect(resent?.[0]?.requestId).toBe(headReqId);
+    // Driving that idempotent commit through: the server replies with the
+    // canonical echo under the ORIGINAL token, which acks and clears the entry.
+    h.client.handleFrame(broadcast(1, "c1", headReqId, [{ from: 1, to: 1, insert: "X" }]));
+    expect(h.log.acks).toEqual([{ requestId: headReqId, revision: 1 }]);
+    expect(h.client.outboxSize()).toBe(0);
+    expect(h.client.localText()).toBe("aXb");
+  });
+
   it("ignores duplicate broadcasts and resyncs on a revision gap", () => {
     const h = makeHarness();
     connect(h, "ab", 3);
