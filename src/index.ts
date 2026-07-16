@@ -3184,7 +3184,13 @@ async function mcpSharedComment(
   const access = await authorizeSharedDocumentToken(env, token, ip, slug);
   if (!access.ok) return { ok: false, error: access.error };
   const quote = input.quote.trim();
-  const anchorStart = input.anchorStart ?? 0;
+  // Anchors are raw source offsets and the stored quote is trimmed, so a
+  // whitespace-padded quote must shift its anchor past the trimmed lead —
+  // otherwise an agent honoring the documented slice contract
+  // (quote === content.slice(anchor_start, …)) drifts spuriously.
+  const anchorStart = input.anchorStart == null
+    ? 0
+    : input.anchorStart + (input.quote.length - input.quote.trimStart().length);
   const stub = await documentCollab(env, access.ownerUserId, access.room, access.path);
   const added = await stub.addComment({
     authorUserId: access.actorUserId,
