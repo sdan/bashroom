@@ -457,11 +457,13 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
     // second marked.parse; the sentinel probe survives as the fallback for
     // documents the aligner refused.
     var remaining = state.align && state.align.source === content ? renderedPointFromSource(state.align,clamped) : renderedCaretOffset(content,clamped);
-    var walker = document.createTreeWalker(article,NodeFilter.SHOW_TEXT);
-    var node = null, target = null, localOffset = 0, last = null;
-    while ((node = walker.nextNode())) {
-      var parent = node.parentElement;
-      if (!parent || parent.closest("svg,.remote-caret,script,style")) continue;
+    // Walk the SAME filtered node set the alignment was built over —
+    // renderedPointFromSource offsets are documentTextNodes coordinates, so
+    // an ad-hoc walker with a different filter (raw <button> HTML in the
+    // document, say) would place the caret in the wrong spot.
+    var nodes = documentTextNodes(article), target = null, localOffset = 0, last = null;
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
       last = node;
       if (remaining <= node.data.length) { target = node; localOffset = remaining; break; }
       remaining -= node.data.length;

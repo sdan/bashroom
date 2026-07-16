@@ -189,6 +189,9 @@ describe("webCollaborativeShareHtml", () => {
     expect(html).toContain('renderLiveDraft(message.content || "",message.caret,message.actor || "Someone")');
     expect(html).toContain('className = "remote-caret"');
     expect(html).toContain('className = "remote-caret-label"');
+    // Caret offsets come from the alignment, which lives in documentTextNodes
+    // coordinates — the placement walk must use the same filtered node set.
+    expect(html).toContain("var nodes = documentTextNodes(article), target = null");
   });
 
   it("anchors comments by server-mapped SOURCE offsets only — no quote-substring fallback", () => {
