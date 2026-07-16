@@ -1,0 +1,190 @@
+{
+  "lane": "trigram-postings",
+  "base": "49693f3",
+  "hypothesis": "trigram postings cut literal-substring search p95 by >=5x on a realistic corpus, at <2ms p50 per-write maintenance",
+  "decisionRule": "supports iff rare-term p95 speedup >= 5x AND maintenance p50 < 2ms AND index overhead < 3x corpus size",
+  "corpus": {
+    "files": 200,
+    "bytes": 10328646,
+    "seed": 1337
+  },
+  "runs": {
+    "run1": {
+      "clockQuantizationMs": 1,
+      "index": {
+        "postingRows": 286129,
+        "distinctTrigrams": 4173,
+        "corpusBytes": 10328646,
+        "indexBytes": 4653056,
+        "overheadRatio": 0.4505000945912949,
+        "bytesPerPostingRow": 16.262091574080223
+      },
+      "buildTotalMs": 14353.671541000002,
+      "buildPerFileInDoMs": {
+        "n": 200,
+        "p50": 26,
+        "p95": 115,
+        "mean": 38.735,
+        "max": 278
+      },
+      "queries": {
+        "rare": {
+          "matches": 3,
+          "candidates": 3,
+          "scanInDoP95Ms": 21,
+          "postingsInDoP95Ms": 1,
+          "scanBatchedMeanMs": 10.65,
+          "postingsBatchedMeanMs": 0.215,
+          "speedupBatchedMean": 49.53488372093023,
+          "speedupClientP95Raw": 3.6105541403143513
+        },
+        "common": {
+          "matches": 176,
+          "candidates": 200,
+          "scanInDoP95Ms": 16,
+          "postingsInDoP95Ms": 12,
+          "scanBatchedMeanMs": 6.8,
+          "postingsBatchedMeanMs": 11.285,
+          "speedupBatchedMean": 0.6025697828976517,
+          "speedupClientP95Raw": 1.6472842214578853
+        },
+        "nohit": {
+          "matches": 0,
+          "candidates": 0,
+          "scanInDoP95Ms": 10,
+          "postingsInDoP95Ms": 1,
+          "scanBatchedMeanMs": 10.7,
+          "postingsBatchedMeanMs": 0.25,
+          "speedupBatchedMean": 42.8,
+          "speedupClientP95Raw": 1.5881607198603327
+        },
+        "regex-prefix": {
+          "matches": 20,
+          "candidates": 20,
+          "scanInDoP95Ms": 33,
+          "postingsInDoP95Ms": 2,
+          "scanBatchedMeanMs": 12.4,
+          "postingsBatchedMeanMs": 1.07,
+          "speedupBatchedMean": 11.588785046728972,
+          "speedupClientP95Raw": 6.960113094845567
+        }
+      },
+      "maintenance": {
+        "edits": 300,
+        "batchedMeanMs": 0.6333333333333333,
+        "clientAdjustedP50Ms": 1.5985000000014224,
+        "clientRawP50Ms": 4.2019580000014685,
+        "inDoP95QuantizedMs": 2,
+        "touchedTrigramsP50": 24
+      },
+      "noopClientP50Ms": 2.603458000000046
+    },
+    "run2": {
+      "clockQuantizationMs": 1,
+      "index": {
+        "postingRows": 286129,
+        "distinctTrigrams": 4173,
+        "corpusBytes": 10328646,
+        "indexBytes": 4653056,
+        "overheadRatio": 0.4505000945912949,
+        "bytesPerPostingRow": 16.262091574080223
+      },
+      "buildTotalMs": 8610.643,
+      "buildPerFileInDoMs": {
+        "n": 200,
+        "p50": 25,
+        "p95": 54,
+        "mean": 28.56,
+        "max": 227
+      },
+      "queries": {
+        "rare": {
+          "matches": 3,
+          "candidates": 3,
+          "scanInDoP95Ms": 23,
+          "postingsInDoP95Ms": 1,
+          "scanBatchedMeanMs": 11.5,
+          "postingsBatchedMeanMs": 0.185,
+          "speedupBatchedMean": 62.16216216216216,
+          "speedupClientP95Raw": 6.47724272409117
+        },
+        "common": {
+          "matches": 176,
+          "candidates": 200,
+          "scanInDoP95Ms": 13,
+          "postingsInDoP95Ms": 48,
+          "scanBatchedMeanMs": 12.25,
+          "postingsBatchedMeanMs": 10.615,
+          "speedupBatchedMean": 1.1540273198304287,
+          "speedupClientP95Raw": 0.4270716167525634
+        },
+        "nohit": {
+          "matches": 0,
+          "candidates": 0,
+          "scanInDoP95Ms": 10,
+          "postingsInDoP95Ms": 1,
+          "scanBatchedMeanMs": 5.15,
+          "postingsBatchedMeanMs": 0.055,
+          "speedupBatchedMean": 93.63636363636364,
+          "speedupClientP95Raw": 12.601644536789783
+        },
+        "regex-prefix": {
+          "matches": 20,
+          "candidates": 20,
+          "scanInDoP95Ms": 13,
+          "postingsInDoP95Ms": 2,
+          "scanBatchedMeanMs": 22.05,
+          "postingsBatchedMeanMs": 1.29,
+          "speedupBatchedMean": 17.093023255813954,
+          "speedupClientP95Raw": 2.498312148093335
+        }
+      },
+      "maintenance": {
+        "edits": 300,
+        "batchedMeanMs": 0.20666666666666667,
+        "clientAdjustedP50Ms": 1.0462090000028184,
+        "clientRawP50Ms": 3.16383400000268,
+        "inDoP95QuantizedMs": 1,
+        "touchedTrigramsP50": 24
+      },
+      "noopClientP50Ms": 2.1176249999998618
+    }
+  },
+  "legs": {
+    "rareSpeedupP95": {
+      "frame": "DO-internal (per prompt method); quantization-conservative bound + batched mean",
+      "run1": {
+        "boundAtLeast": 10.5,
+        "batchedMean": 49.53488372093023,
+        "clientRawP95": 3.6105541403143513
+      },
+      "run2": {
+        "boundAtLeast": 11.5,
+        "batchedMean": 62.16216216216216,
+        "clientRawP95": 6.47724272409117
+      },
+      "threshold": 5,
+      "pass": true,
+      "disclosure": "raw client-HTTP-frame p95 ratio straddled 5x across runs (3.6x run1, 6.5x run2); transport jitter on a ~0.2ms op"
+    },
+    "maintenanceP50Ms": {
+      "run1": {
+        "batchedMean": 0.6333333333333333,
+        "clientAdjustedP50": 1.5985000000014224
+      },
+      "run2": {
+        "batchedMean": 0.20666666666666667,
+        "clientAdjustedP50": 1.0462090000028184
+      },
+      "threshold": 2,
+      "pass": true
+    },
+    "indexOverheadRatio": {
+      "value": 0.4505000945912949,
+      "threshold": 3,
+      "pass": true,
+      "caveat": "synthetic low-diversity vocabulary; real-markdown estimates 1.8-5x depending on file-size mix (small files exceed 3x)"
+    }
+  },
+  "verdict": "supports"
+}

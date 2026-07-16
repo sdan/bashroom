@@ -1,0 +1,62 @@
+{
+  "lane": "r2-flush-guard",
+  "base_commit": "49693f3",
+  "commits": {
+    "instrumentation": "cd0763f",
+    "guard": "5da380e"
+  },
+  "hypothesis": {
+    "guard_eliminates_regression": true,
+    "guard_does_not_fix_scalar_dirty_target": true
+  },
+  "verdict": "supports",
+  "decision_rule": "supports iff pre-fix repro shows the regression, post-fix shows ZERO regressions across both runs, and the dirty-set claim is resolved either way with a concrete schedule",
+  "decision_rule_outcome": "pass",
+  "deterministic_regression_schedule": {
+    "prefix": { "head_before_release": "1@2", "head_after_release": "1@1", "sqlite_head_revision": 2, "regressed": true, "older_fire_head_flip": "flipped" },
+    "postfix_run1": { "head_before_release": "1@2", "head_after_release": "1@2", "sqlite_head_revision": 2, "regressed": false, "older_fire_head_flip": "stale-skip" },
+    "postfix_run2": { "head_before_release": "1@2", "head_after_release": "1@2", "sqlite_head_revision": 2, "regressed": false, "older_fire_head_flip": "stale-skip" }
+  },
+  "randomized": {
+    "prefix": {
+      "seed": 101, "schedules": 1000, "stages": 3018,
+      "paused_fires": 1358, "paused_crash_fires": 447, "immediate_fires": 771, "immediate_crash_fires": 442,
+      "head_transitions": 2790, "regressions": 517, "regression_schedules": 458,
+      "stale_skips": 0, "cas_lost": 0, "terminal_mismatches": 0, "elapsed_ms": 36952
+    },
+    "postfix_run1": {
+      "seed": 201, "schedules": 1000, "stages": 2962,
+      "paused_fires": 1330, "paused_crash_fires": 464, "immediate_fires": 739, "immediate_crash_fires": 429,
+      "head_transitions": 1819, "regressions": 0, "regression_schedules": 0,
+      "stale_skips": 552, "cas_lost": 0, "terminal_mismatches": 0, "elapsed_ms": 65922
+    },
+    "postfix_run2": {
+      "seed": 202, "schedules": 1000, "stages": 3015,
+      "paused_fires": 1425, "paused_crash_fires": 418, "immediate_fires": 722, "immediate_crash_fires": 450,
+      "head_transitions": 1871, "regressions": 0, "regression_schedules": 0,
+      "stale_skips": 584, "cas_lost": 0, "terminal_mismatches": 0, "elapsed_ms": 60489
+    }
+  },
+  "dirty_set_claim": {
+    "schedule": "3 files dirty (push+checkpoint each), 3x POST /janitor/schedule delay=300ms (scalar janitor:target overwritten twice), one alarm fire, 750ms settle",
+    "with_guard_in_place": { "flushed": ["dirty-c"], "dropped": ["dirty-a", "dirty-b"], "manual_fire_recovers_dropped_file": true },
+    "resolution": "guard does NOT fix it; dropped files never reach the publication site; durable dirty-set still required"
+  },
+  "adversarial_probe_postfix": {
+    "ordering_schedule": "PASS older async janitor stale-skips instead of CASing R2 HEAD backward",
+    "remaining_reproduced_gaps": [
+      "scalar janitor target drops an earlier dirty file",
+      "create masks a non-uniqueness SQLite abort as ALREADY_EXISTS (pre-existing, unrelated)",
+      "same-length head corruption opens without digest validation (pre-existing, unrelated)"
+    ]
+  },
+  "unit_tests": { "total": 87, "passed": 87, "new_guard_tests": 5, "discipline_test": "green (store stays synchronous)" },
+  "repro_command": "SCHEDULES=1000 SEED=201 node scripts/room-text-probe/blast-flush-guard.mjs",
+  "prefix_baseline_replay": "git checkout cd0763f && SCHEDULES=1000 SEED=101 ALLOW_REGRESSIONS=1 node scripts/room-text-probe/blast-flush-guard.mjs",
+  "ports": { "assigned_range": "8860-8869", "harness_defaults": [8860, 8861] },
+  "raw_runs": [
+    "benchmarks/room-text/experiments/r2-flush-guard-prefix-run.json",
+    "benchmarks/room-text/experiments/r2-flush-guard-postfix-run1.json",
+    "benchmarks/room-text/experiments/r2-flush-guard-postfix-run2.json"
+  ]
+}

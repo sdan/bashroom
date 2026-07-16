@@ -1,0 +1,319 @@
+{
+  "probe": "RoomText flush-guard: monotonic R2 publication under adversarial flush interleavings",
+  "seed": 101,
+  "schedules": 1000,
+  "elapsedMs": 36952,
+  "deterministicRegression": {
+    "beforeReleaseRevision": 2,
+    "afterReleaseRevision": 1,
+    "sqliteHeadRevision": 2,
+    "olderFireResult": {
+      "ok": true,
+      "revision": 1,
+      "artifactKey": "rooms/guard-det-s101/.history/det/1@1",
+      "artifactWritten": true,
+      "headFlip": "flipped",
+      "compacted": {
+        "mode": "soft",
+        "composedRows": 0
+      },
+      "advanced": {
+        "historyFloor": 2,
+        "prunedUpdates": 0
+      }
+    },
+    "regressed": true
+  },
+  "dirtySetDrop": {
+    "files": [
+      "dirty-a",
+      "dirty-b",
+      "dirty-c"
+    ],
+    "flushed": [
+      "dirty-c"
+    ],
+    "dropped": [
+      "dirty-a",
+      "dirty-b"
+    ],
+    "manualRecovery": {
+      "fileId": "dirty-a",
+      "ok": true,
+      "revision": 1
+    }
+  },
+  "randomized": {
+    "stats": {
+      "schedules": 1000,
+      "stages": 3018,
+      "pausedFires": 1358,
+      "pausedCrashFires": 447,
+      "immediateFires": 771,
+      "immediateCrashFires": 442,
+      "headTransitions": 2790,
+      "casLost": 0,
+      "staleSkips": 0,
+      "flipped": 2129,
+      "alreadyVisible": 0,
+      "regressions": 517,
+      "regressionSchedules": 458,
+      "terminalMismatches": 0
+    },
+    "regressionExamples": [
+      {
+        "schedule": 1,
+        "seed": 101,
+        "plan": [
+          {
+            "stage": 0,
+            "revision": 1,
+            "mode": "paused"
+          },
+          {
+            "stage": 1,
+            "revision": 2,
+            "mode": "immediate"
+          },
+          {
+            "stage": 2,
+            "revision": 3,
+            "mode": "paused-crash"
+          }
+        ],
+        "releaseOrder": [
+          {
+            "id": "g1-0",
+            "revision": 1,
+            "crash": false
+          },
+          {
+            "id": "g1-2",
+            "revision": 3,
+            "crash": true
+          }
+        ],
+        "regressions": [
+          {
+            "index": 1,
+            "kind": "regression",
+            "previous": {
+              "epoch": 1,
+              "revision": 2
+            },
+            "current": {
+              "epoch": 1,
+              "revision": 1
+            }
+          }
+        ]
+      },
+      {
+        "schedule": 4,
+        "seed": 101,
+        "plan": [
+          {
+            "stage": 0,
+            "revision": 1,
+            "mode": "paused"
+          },
+          {
+            "stage": 1,
+            "revision": 2,
+            "mode": "paused"
+          },
+          {
+            "stage": 2,
+            "revision": 3,
+            "mode": "immediate"
+          }
+        ],
+        "releaseOrder": [
+          {
+            "id": "g4-1",
+            "revision": 2,
+            "crash": false
+          },
+          {
+            "id": "g4-0",
+            "revision": 1,
+            "crash": false
+          }
+        ],
+        "regressions": [
+          {
+            "index": 1,
+            "kind": "regression",
+            "previous": {
+              "epoch": 1,
+              "revision": 3
+            },
+            "current": {
+              "epoch": 1,
+              "revision": 2
+            }
+          },
+          {
+            "index": 2,
+            "kind": "regression",
+            "previous": {
+              "epoch": 1,
+              "revision": 2
+            },
+            "current": {
+              "epoch": 1,
+              "revision": 1
+            }
+          }
+        ]
+      },
+      {
+        "schedule": 6,
+        "seed": 101,
+        "plan": [
+          {
+            "stage": 0,
+            "revision": 1,
+            "mode": "paused"
+          },
+          {
+            "stage": 1,
+            "revision": 2,
+            "mode": "paused"
+          },
+          {
+            "stage": 2,
+            "revision": 3,
+            "mode": "immediate-crash"
+          }
+        ],
+        "releaseOrder": [
+          {
+            "id": "g6-1",
+            "revision": 2,
+            "crash": false
+          },
+          {
+            "id": "g6-0",
+            "revision": 1,
+            "crash": false
+          }
+        ],
+        "regressions": [
+          {
+            "index": 1,
+            "kind": "regression",
+            "previous": {
+              "epoch": 1,
+              "revision": 2
+            },
+            "current": {
+              "epoch": 1,
+              "revision": 1
+            }
+          }
+        ]
+      },
+      {
+        "schedule": 7,
+        "seed": 101,
+        "plan": [
+          {
+            "stage": 0,
+            "revision": 1,
+            "mode": "immediate-crash"
+          },
+          {
+            "stage": 1,
+            "revision": 2,
+            "mode": "immediate"
+          },
+          {
+            "stage": 2,
+            "revision": 3,
+            "mode": "paused"
+          },
+          {
+            "stage": 3,
+            "revision": 4,
+            "mode": "paused"
+          }
+        ],
+        "releaseOrder": [
+          {
+            "id": "g7-3",
+            "revision": 4,
+            "crash": false
+          },
+          {
+            "id": "g7-2",
+            "revision": 3,
+            "crash": false
+          }
+        ],
+        "regressions": [
+          {
+            "index": 2,
+            "kind": "regression",
+            "previous": {
+              "epoch": 1,
+              "revision": 4
+            },
+            "current": {
+              "epoch": 1,
+              "revision": 3
+            }
+          }
+        ]
+      },
+      {
+        "schedule": 8,
+        "seed": 101,
+        "plan": [
+          {
+            "stage": 0,
+            "revision": 1,
+            "mode": "paused"
+          },
+          {
+            "stage": 1,
+            "revision": 2,
+            "mode": "immediate"
+          },
+          {
+            "stage": 2,
+            "revision": 3,
+            "mode": "paused"
+          }
+        ],
+        "releaseOrder": [
+          {
+            "id": "g8-2",
+            "revision": 3,
+            "crash": false
+          },
+          {
+            "id": "g8-0",
+            "revision": 1,
+            "crash": false
+          }
+        ],
+        "regressions": [
+          {
+            "index": 2,
+            "kind": "regression",
+            "previous": {
+              "epoch": 1,
+              "revision": 3
+            },
+            "current": {
+              "epoch": 1,
+              "revision": 1
+            }
+          }
+        ]
+      }
+    ],
+    "mismatchExamples": []
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "probe": "RoomText flush-guard: monotonic R2 publication under adversarial flush interleavings",
+  "seed": 201,
+  "schedules": 1000,
+  "elapsedMs": 65922,
+  "deterministicRegression": {
+    "beforeReleaseRevision": 2,
+    "afterReleaseRevision": 2,
+    "sqliteHeadRevision": 2,
+    "olderFireResult": {
+      "ok": true,
+      "revision": 1,
+      "artifactKey": "rooms/guard-det-s201/.history/det/1@1",
+      "artifactWritten": true,
+      "headFlip": "stale-skip",
+      "compacted": {
+        "mode": "soft",
+        "composedRows": 0
+      },
+      "advanced": {
+        "historyFloor": 2,
+        "prunedUpdates": 0
+      }
+    },
+    "regressed": false
+  },
+  "dirtySetDrop": {
+    "files": [
+      "dirty-a",
+      "dirty-b",
+      "dirty-c"
+    ],
+    "flushed": [
+      "dirty-c"
+    ],
+    "dropped": [
+      "dirty-a",
+      "dirty-b"
+    ],
+    "manualRecovery": {
+      "fileId": "dirty-a",
+      "ok": true,
+      "revision": 1
+    }
+  },
+  "randomized": {
+    "stats": {
+      "schedules": 1000,
+      "stages": 2962,
+      "pausedFires": 1330,
+      "pausedCrashFires": 464,
+      "immediateFires": 739,
+      "immediateCrashFires": 429,
+      "headTransitions": 1819,
+      "casLost": 0,
+      "staleSkips": 552,
+      "flipped": 1517,
+      "alreadyVisible": 0,
+      "regressions": 0,
+      "regressionSchedules": 0,
+      "terminalMismatches": 0
+    },
+    "regressionExamples": [],
+    "mismatchExamples": []
+  }
+}

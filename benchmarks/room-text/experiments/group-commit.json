@@ -1,0 +1,67 @@
+{
+  "lane": "group-commit",
+  "baseCommit": "49693f3",
+  "date": "2026-07-17",
+  "hypothesis": "Committing N canonical revisions while encoding+writing the materialized head ONCE per batch cuts head-write amplification ~Nx for bursty multi-writer load, with single-push latency unchanged (within +/-10%).",
+  "decisionRule": "supports iff amplification reduction >= 3x at batch>=4 AND batch=1 latency within +/-10% of baseline AND all convergence oracles pass",
+  "verdict": "supports",
+  "config": {
+    "headBytes": 420652,
+    "revisionsPerArm": 256,
+    "batchSizes": [1, 4, 16, 64],
+    "headlineInvocations": 2,
+    "passesPerInvocation": 2,
+    "runtime": "workerd via wrangler dev, Node v24.3.0, macOS (contended laptop)",
+    "ports": "8850-8859 (harness 8853/8854)"
+  },
+  "amplification": {
+    "groundTruth": "roomTextStoreWriteStats monotonic head-blob byte counters, delta per arm",
+    "identicalInAllFourPasses": true,
+    "arms": {
+      "baseline": { "headWrites": 256, "headBytes": 107686912, "bytesPerRevision": 420652 },
+      "batch-1": { "headWrites": 256, "headBytes": 107686912, "bytesPerRevision": 420652 },
+      "batch-4": { "headWrites": 64, "headBytes": 26921728, "bytesPerRevision": 105163, "reduction": 4.0 },
+      "batch-16": { "headWrites": 16, "headBytes": 6730432, "bytesPerRevision": 26290.75, "reduction": 16.0 },
+      "batch-64": { "headWrites": 4, "headBytes": 1682608, "bytesPerRevision": 6572.69, "reduction": 64.0 }
+    },
+    "snapshotBlobWritesPerArm": 2
+  },
+  "latencyP50Ms": {
+    "passes": [
+      { "pass": "A0", "baselinePush": 5.637, "batch1": 5.154, "batch1Ratio": 0.914, "batch4Commit": 6.211, "batch16Commit": 10.034, "batch64Commit": 31.178 },
+      { "pass": "A1", "baselinePush": 4.859, "batch1": 5.018, "batch1Ratio": 1.033, "batch4Commit": 5.834, "batch16Commit": 10.476, "batch64Commit": 32.865 },
+      { "pass": "B0", "baselinePush": 5.411, "batch1": 5.653, "batch1Ratio": 1.045, "batch4Commit": 6.127, "batch16Commit": 10.666, "batch64Commit": 28.342 },
+      { "pass": "B1", "baselinePush": 5.041, "batch1": 5.208, "batch1Ratio": 1.033, "batch4Commit": 7.915, "batch16Commit": 10.469, "batch64Commit": 29.664 }
+    ],
+    "batch1RatioBound": [0.9, 1.1],
+    "allWithinBound": true
+  },
+  "throughputRevisionsPerSecond": {
+    "baseline": [164.3, 195.6, 172.8, 187.2],
+    "batch-4": [603.8, 609.1, 615.8, 446.6],
+    "batch-16": [1452.9, 1481.1, 1354.0, 1242.8],
+    "batch-64": [1584.0, 1840.0, 2038.1, 2046.5]
+  },
+  "oracles": {
+    "crossArmByteExactFinalHeads": true,
+    "digestSelfVerification": true,
+    "staleWriterBatchVsSequentialConverged": true,
+    "perPushFailureIsolation": { "results": ["ok", "ok", "FUTURE_REVISION", "ok", "ok"], "committed": 4 },
+    "crashInjectionAllOrNothing": { "batchRolledBackAtomically": true, "retriedAfterDisarm": true },
+    "unitTests": "82/82 incl. sync-discipline",
+    "workerdBlastSuites": "pass (blast + blast-ws through the WS batch seam)",
+    "adversarialSuite": "pass (6 PASS, 4 pre-existing REPRODUCED GAP entries unrelated to push path)",
+    "networkRetriesDuringHeadlines": 0
+  },
+  "semanticChange": "Crash atomicity widens from per-push to per-batch (all-or-nothing on invariant failure, proven by SQLite-trigger crash injection). Per-push rejections still fail independently. Checkpoint snapshot lands at the batch-final revision instead of the mid-batch crossing revision.",
+  "decisionRuleOutcome": {
+    "ampReductionAtBatch4OrMore": { "required": ">=3x", "measured": [4.0, 16.0, 64.0], "passed": true },
+    "batch1LatencyWithin10pct": { "required": "0.9-1.1", "measured": [0.914, 1.033, 1.045, 1.033], "passed": true },
+    "convergenceOracles": { "passed": true }
+  },
+  "reproCommand": "node benchmarks/room-text/group-commit.mjs",
+  "rawResults": [
+    "benchmarks/room-text/experiments/group-commit-raw-invocation-a.json",
+    "benchmarks/room-text/experiments/group-commit-raw-invocation-b.json"
+  ]
+}

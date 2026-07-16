@@ -1,0 +1,212 @@
+{
+  "experiment": "catchup-cursor",
+  "date": "2026-07-16T15:26:38.924Z",
+  "node": "v24.3.0",
+  "edits": 1000,
+  "catchupReps": 200,
+  "fidelity": {
+    "createPushOpenDiffReplay": "pass"
+  },
+  "tiers": [
+    {
+      "n": 1000,
+      "merkleDepth": 2,
+      "merkleRebuildMs": 96.9,
+      "maintenance": {
+        "A": {
+          "p50Us": 3859.6,
+          "p95Us": 7912.7,
+          "meanUs": 4575.3,
+          "samples": 1000
+        },
+        "B": {
+          "p50Us": 11.5,
+          "p95Us": 22.7,
+          "meanUs": 16,
+          "samples": 1000
+        },
+        "C": {
+          "p50Us": 79.6,
+          "p95Us": 205,
+          "meanUs": 102.3,
+          "samples": 1000
+        }
+      },
+      "catchup": {
+        "k1": {
+          "A": {
+            "p50Us": 4238.3,
+            "p95Us": 7536.9,
+            "meanUs": 4621.3,
+            "samples": 200
+          },
+          "B": {
+            "p50Us": 3.1,
+            "p95Us": 8.6,
+            "meanUs": 4.4,
+            "samples": 200
+          },
+          "C": {
+            "p50Us": 3.8,
+            "p95Us": 4.7,
+            "meanUs": 6.4,
+            "samples": 200
+          }
+        },
+        "k10": {
+          "A": {
+            "p50Us": 4047.4,
+            "p95Us": 9362.2,
+            "meanUs": 5486.7,
+            "samples": 200
+          },
+          "B": {
+            "p50Us": 13.8,
+            "p95Us": 17.7,
+            "meanUs": 15.1,
+            "samples": 200
+          },
+          "C": {
+            "p50Us": 4.4,
+            "p95Us": 30.4,
+            "meanUs": 8.3,
+            "samples": 200
+          }
+        },
+        "k100": {
+          "A": {
+            "p50Us": 4347,
+            "p95Us": 27671.4,
+            "meanUs": 8814.1,
+            "samples": 200
+          },
+          "B": {
+            "p50Us": 131.7,
+            "p95Us": 203.8,
+            "meanUs": 146.9,
+            "samples": 200
+          },
+          "C": {
+            "p50Us": 23,
+            "p95Us": 61.9,
+            "meanUs": 30.6,
+            "samples": 200
+          }
+        }
+      },
+      "deletion": {
+        "B": {
+          "tombstonesReturned": 10,
+          "pass": true,
+          "recreateAfterDelete": "pass"
+        },
+        "A": {
+          "rootMoved": true,
+          "baseKnown": true,
+          "changed": 0,
+          "added": 0,
+          "removed": 0,
+          "structurallyBlind": true
+        },
+        "C": {
+          "removedReturned": 10,
+          "pass": true
+        }
+      }
+    },
+    {
+      "n": 10000,
+      "merkleDepth": 2,
+      "merkleRebuildMs": 1404.6,
+      "maintenance": {
+        "A": {
+          "p50Us": 36447.3,
+          "p95Us": 69707.1,
+          "meanUs": 44075.9,
+          "samples": 1000
+        },
+        "B": {
+          "p50Us": 10.7,
+          "p95Us": 16.4,
+          "meanUs": 11.9,
+          "samples": 1000
+        },
+        "C": {
+          "p50Us": 97.7,
+          "p95Us": 143.4,
+          "meanUs": 105,
+          "samples": 1000
+        }
+      },
+      "catchup": {
+        "k1": {
+          "A": {
+            "p50Us": 35043.2,
+            "p95Us": 45349.6,
+            "meanUs": 37476,
+            "samples": 200
+          },
+          "B": {
+            "p50Us": 2.6,
+            "p95Us": 6.1,
+            "meanUs": 3.3,
+            "samples": 200
+          },
+          "C": {
+            "p50Us": 4.6,
+            "p95Us": 5.1,
+            "meanUs": 4.9,
+            "samples": 200
+          }
+        },
+        "k10": {
+          "A": {
+            "p50Us": 52189.8,
+            "p95Us": 119016.3,
+            "meanUs": 61674.2,
+            "samples": 200
+          },
+          "B": {
+            "p50Us": 14.5,
+            "p95Us": 28.4,
+            "meanUs": 16.7,
+            "samples": 200
+          },
+          "C": {
+            "p50Us": 12.5,
+            "p95Us": 36,
+            "meanUs": 18,
+            "samples": 200
+          }
+        },
+        "k100": {
+          "A": {
+            "p50Us": 38849.8,
+            "p95Us": 61335.4,
+            "meanUs": 43102.5,
+            "samples": 200
+          },
+          "B": {
+            "p50Us": 124.6,
+            "p95Us": 229.5,
+            "meanUs": 141.4,
+            "samples": 200
+          },
+          "C": {
+            "p50Us": 78.8,
+            "p95Us": 83.8,
+            "meanUs": 79.7,
+            "samples": 200
+          }
+        }
+      }
+    }
+  ],
+  "decision": {
+    "maintenanceB_over_A_p50": 0.0002935745583349109,
+    "maintenanceRulePass": true,
+    "catchupA_over_B_k10_p50": 3599.296551724138,
+    "catchupRulePass": true,
+    "merkleGate_maintenanceA_p50_gt_1ms": true
+  }
+}

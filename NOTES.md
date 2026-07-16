@@ -5,6 +5,77 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-17 — CS-structures lab: 6 pre-registered experiments, 6 independent audits, all verified
+
+Swarm (13 agents): each lane isolated in its own worktree + port range with a
+pre-registered decision rule; each audited by a verifier that re-ran the repro
+COLD and attacked the methodology. Results files: benchmarks/room-text/experiments/.
+Base: 49693f3 (current-head B store). All six verdicts = supports, all audits
+verified; the honest caveats are recorded below because two headline framings
+were softer than claimed.
+
+SETTLED EMPIRICALLY:
+- FTS5-trigram EXISTS in workerd DO SQLite (availability was undocumented).
+  Rare-substring p95 ~50-160x faster than LIKE scan (robust p50 ratio; the
+  84-122x headline is tail-of-16-samples fragile per audit). Index 1.78x
+  corpus bytes. Hazards: MATCH <3 chars silently returns 0 rows (route short
+  queries to LIKE); sqlite_version() and R*Tree blocked by authorizer —
+  capability-detect by try/catch, never version-gate.
+- Sequence-cursor oplog CRUSHES the flat root digest: maintenance 10.5us vs
+  34,000us/edit at 10k files (the flat rehash in pushText is a measured
+  SCALING CLIFF: ~5x the whole 7ms write budget at 10k files), catch-up k=10
+  ~2,700-3,600x faster, tombstones work (deletions today are UNREPRESENTABLE:
+  DiffDigestResult.removed hardcoded []). 32-way Merkle: rule technically
+  triggered (C beat B on catchup k=100, ~80us vs ~123us) but loses 9x on
+  maintenance + ~1s rebuild-on-wake at 10k — not justified; margin recorded.
+- Group commit (N revisions, ONE head write at batch end, one SQLite txn
+  inside the gate): amplification cut exactly 4x/16x/64x at batch 4/16/64,
+  byte-identical final heads (sha-verified), batch=1 latency within +-10%.
+  Semantic change: batch is all-or-nothing (documented). GRADUATE.
+- R2 monotonic (epoch,revision) publication guard: pre-fix the paused-flush
+  regression hit 458/1000 random schedules (and a regressed file that goes
+  quiet serves stale from R2 indefinitely); post-fix 0/2000. CONFIRMED
+  separately: scalar janitor:target still drops 2/3 dirty files even with
+  the guard — durable dirty-set required. GRADUATE guard + build dirty-set.
+- Deletion torture: 0 oracle violations across 2x2047 schedules (seeds 4811/
+  9127) — B store convergence survives 50-90% deletes under 50 writers,
+  crash-in-compaction, wipe cycles; mid-surrogate deletes rejected cleanly.
+- Trigram postings (manual): DO-internal ~40-60x mean speedup BUT the
+  audit's central finding stands: under the harness's own coded client-frame
+  rule, 2 of 3 runs FAIL the 5x bar (transport floor dominates). With FTS5
+  available, manual postings are moot anyway.
+
+NEW BUGS FOUND BY THE LAB:
+1. Digest scaling cliff (above) — makes cursor-oplog adoption urgent; task
+   #8 re-scoped from "incremental root" to "replace root with oplog".
+2. Anchor resurrection via replacement: an anchor fully covered by a pure
+   deletion collapses fail-closed (start==end, 7/7 correct), but covered by
+   a REPLACEMENT it re-attaches to the inserted text (assoc -1/+1 maps
+   [6,11) through [5,12)->'##' to [5,7]). Needs covered-by-replacement
+   collapse if "never resurrects" is the contract.
+3. Tiny-head/huge-artifact: after 900KB->200B shrink, the version artifact
+   for the 200B head is ~1MB (composed history dominates). Compaction after
+   drastic shrink should re-baseline.
+
+AUDIT META (worth keeping): two lanes' PASS framings were post-hoc-flavored
+(fts5 roundtrip-vs-per-query view; postings client-vs-DO frame where the
+coded rule said FAIL). Both experimenters disclosed the pilot data and both
+verifiers judged the underlying conclusion sound — but pre-registration
+must pin the measurement FRAME, not just the threshold. Carry into the
+blog's methods section.
+
+RESEARCH (prior-art agent): lead publishable angle = "You don't need a
+Merkle tree if you own the sequencer" — the pincer: git (a Merkle DAG!)
+refuses Merkle diffing for fetch because shared ancestry makes frontier
+negotiation cheaper; Dynamo/Cassandra use Merkle precisely because replicas
+are symmetric with no shared order. A DO room owns the sequencer, so oplog
+wins — and our numbers are the evidence section. Supporting angles: the DO
+input gate as a free group-commit scheduler (vs Postgres commit_delay
+machinery); head-per-write as degenerate LSM (Figma's WAL+checkpoint as
+prior practice); object stores don't order flushes (monotonic guard, not
+retries); filter-then-verify substring search (Cox/Cursor: index needs
+recall only). Full map in the workflow output.
+
 ## 2026-07-16 — B-only durable head; realistic stress and adversarial gaps
 
 The materialization A/B and its runtime switch were deleted. RoomText now has

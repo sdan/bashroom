@@ -1,0 +1,547 @@
+{
+  "experiment": "catchup-cursor",
+  "lane": "catchup-cursor",
+  "baseCommit": "49693f3",
+  "hypothesis": "room_changes cursor oplog gives O(changes-since-cursor) catch-up with natural tombstones at per-edit maintenance cost no worse than the flat-root rehash; a persistent Merkle tree is not yet justified",
+  "decisionRule": {
+    "adoptOplog": "maintenance(B) <= 1.2x maintenance(A) AND catchup(B,k=10,N=10k) >= 10x faster than diffDigest",
+    "merkle": "justified only if maintenance(A) > 1ms/edit at N=10k AND C beats both on some measured axis"
+  },
+  "verdict": "supports",
+  "decisionOutcome": {
+    "adoptOplog": {
+      "pass": true,
+      "maintenanceB_over_A_p50_at10k": [
+        0.0002935745583349109,
+        0.0003058210859269874
+      ],
+      "catchupA_over_B_k10_at10k": [
+        3599.296551724138,
+        2704.953488372093
+      ]
+    },
+    "merkle": {
+      "preconditionA_gt_1ms_at10k": true,
+      "beatsBothOnAnAxis": "catch-up k=100 (~1.5x vs B) and marginally k=10",
+      "adopted": false,
+      "losingMargins": {
+        "maintenanceVsB": "9.1x slower (96-98us vs 10.5-10.7us p50 at N=10k)",
+        "rebuildOnWakeMs10k": [
+          1404.6,
+          919.9
+        ],
+        "note": "in-memory only; measured diff omits network rounds"
+      }
+    }
+  },
+  "runs": [
+    {
+      "experiment": "catchup-cursor",
+      "date": "2026-07-16T15:26:38.924Z",
+      "node": "v24.3.0",
+      "edits": 1000,
+      "catchupReps": 200,
+      "fidelity": {
+        "createPushOpenDiffReplay": "pass"
+      },
+      "tiers": [
+        {
+          "n": 1000,
+          "merkleDepth": 2,
+          "merkleRebuildMs": 96.9,
+          "maintenance": {
+            "A": {
+              "p50Us": 3859.6,
+              "p95Us": 7912.7,
+              "meanUs": 4575.3,
+              "samples": 1000
+            },
+            "B": {
+              "p50Us": 11.5,
+              "p95Us": 22.7,
+              "meanUs": 16,
+              "samples": 1000
+            },
+            "C": {
+              "p50Us": 79.6,
+              "p95Us": 205,
+              "meanUs": 102.3,
+              "samples": 1000
+            }
+          },
+          "catchup": {
+            "k1": {
+              "A": {
+                "p50Us": 4238.3,
+                "p95Us": 7536.9,
+                "meanUs": 4621.3,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 3.1,
+                "p95Us": 8.6,
+                "meanUs": 4.4,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 3.8,
+                "p95Us": 4.7,
+                "meanUs": 6.4,
+                "samples": 200
+              }
+            },
+            "k10": {
+              "A": {
+                "p50Us": 4047.4,
+                "p95Us": 9362.2,
+                "meanUs": 5486.7,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 13.8,
+                "p95Us": 17.7,
+                "meanUs": 15.1,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 4.4,
+                "p95Us": 30.4,
+                "meanUs": 8.3,
+                "samples": 200
+              }
+            },
+            "k100": {
+              "A": {
+                "p50Us": 4347,
+                "p95Us": 27671.4,
+                "meanUs": 8814.1,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 131.7,
+                "p95Us": 203.8,
+                "meanUs": 146.9,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 23,
+                "p95Us": 61.9,
+                "meanUs": 30.6,
+                "samples": 200
+              }
+            }
+          },
+          "deletion": {
+            "B": {
+              "tombstonesReturned": 10,
+              "pass": true,
+              "recreateAfterDelete": "pass"
+            },
+            "A": {
+              "rootMoved": true,
+              "baseKnown": true,
+              "changed": 0,
+              "added": 0,
+              "removed": 0,
+              "structurallyBlind": true
+            },
+            "C": {
+              "removedReturned": 10,
+              "pass": true
+            }
+          }
+        },
+        {
+          "n": 10000,
+          "merkleDepth": 2,
+          "merkleRebuildMs": 1404.6,
+          "maintenance": {
+            "A": {
+              "p50Us": 36447.3,
+              "p95Us": 69707.1,
+              "meanUs": 44075.9,
+              "samples": 1000
+            },
+            "B": {
+              "p50Us": 10.7,
+              "p95Us": 16.4,
+              "meanUs": 11.9,
+              "samples": 1000
+            },
+            "C": {
+              "p50Us": 97.7,
+              "p95Us": 143.4,
+              "meanUs": 105,
+              "samples": 1000
+            }
+          },
+          "catchup": {
+            "k1": {
+              "A": {
+                "p50Us": 35043.2,
+                "p95Us": 45349.6,
+                "meanUs": 37476,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 2.6,
+                "p95Us": 6.1,
+                "meanUs": 3.3,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 4.6,
+                "p95Us": 5.1,
+                "meanUs": 4.9,
+                "samples": 200
+              }
+            },
+            "k10": {
+              "A": {
+                "p50Us": 52189.8,
+                "p95Us": 119016.3,
+                "meanUs": 61674.2,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 14.5,
+                "p95Us": 28.4,
+                "meanUs": 16.7,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 12.5,
+                "p95Us": 36,
+                "meanUs": 18,
+                "samples": 200
+              }
+            },
+            "k100": {
+              "A": {
+                "p50Us": 38849.8,
+                "p95Us": 61335.4,
+                "meanUs": 43102.5,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 124.6,
+                "p95Us": 229.5,
+                "meanUs": 141.4,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 78.8,
+                "p95Us": 83.8,
+                "meanUs": 79.7,
+                "samples": 200
+              }
+            }
+          }
+        }
+      ],
+      "decision": {
+        "maintenanceB_over_A_p50": 0.0002935745583349109,
+        "maintenanceRulePass": true,
+        "catchupA_over_B_k10_p50": 3599.296551724138,
+        "catchupRulePass": true,
+        "merkleGate_maintenanceA_p50_gt_1ms": true
+      }
+    },
+    {
+      "experiment": "catchup-cursor",
+      "date": "2026-07-16T15:28:55.838Z",
+      "node": "v24.3.0",
+      "edits": 1000,
+      "catchupReps": 200,
+      "fidelity": {
+        "createPushOpenDiffReplay": "pass"
+      },
+      "tiers": [
+        {
+          "n": 1000,
+          "merkleDepth": 2,
+          "merkleRebuildMs": 77.7,
+          "maintenance": {
+            "A": {
+              "p50Us": 3306,
+              "p95Us": 4203.1,
+              "meanUs": 3450.6,
+              "samples": 1000
+            },
+            "B": {
+              "p50Us": 10.5,
+              "p95Us": 12.5,
+              "meanUs": 11.3,
+              "samples": 1000
+            },
+            "C": {
+              "p50Us": 74.9,
+              "p95Us": 86.5,
+              "meanUs": 77.3,
+              "samples": 1000
+            }
+          },
+          "catchup": {
+            "k1": {
+              "A": {
+                "p50Us": 3258,
+                "p95Us": 3775.7,
+                "meanUs": 3320,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 2.8,
+                "p95Us": 5.2,
+                "meanUs": 3.4,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 3.8,
+                "p95Us": 4.8,
+                "meanUs": 4.1,
+                "samples": 200
+              }
+            },
+            "k10": {
+              "A": {
+                "p50Us": 3321.7,
+                "p95Us": 5258.6,
+                "meanUs": 3619.5,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 12.8,
+                "p95Us": 16.3,
+                "meanUs": 14.5,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 4.2,
+                "p95Us": 4.7,
+                "meanUs": 4.5,
+                "samples": 200
+              }
+            },
+            "k100": {
+              "A": {
+                "p50Us": 3287.3,
+                "p95Us": 3770.5,
+                "meanUs": 3343.7,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 115.7,
+                "p95Us": 155,
+                "meanUs": 121,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 20.8,
+                "p95Us": 22.5,
+                "meanUs": 21.3,
+                "samples": 200
+              }
+            }
+          },
+          "deletion": {
+            "B": {
+              "tombstonesReturned": 10,
+              "pass": true,
+              "recreateAfterDelete": "pass"
+            },
+            "A": {
+              "rootMoved": true,
+              "baseKnown": true,
+              "changed": 0,
+              "added": 0,
+              "removed": 0,
+              "structurallyBlind": true
+            },
+            "C": {
+              "removedReturned": 10,
+              "pass": true
+            }
+          }
+        },
+        {
+          "n": 10000,
+          "merkleDepth": 2,
+          "merkleRebuildMs": 919.9,
+          "maintenance": {
+            "A": {
+              "p50Us": 34333.8,
+              "p95Us": 52928.5,
+              "meanUs": 39571.4,
+              "samples": 1000
+            },
+            "B": {
+              "p50Us": 10.5,
+              "p95Us": 18.5,
+              "meanUs": 12.4,
+              "samples": 1000
+            },
+            "C": {
+              "p50Us": 96,
+              "p95Us": 112,
+              "meanUs": 99.4,
+              "samples": 1000
+            }
+          },
+          "catchup": {
+            "k1": {
+              "A": {
+                "p50Us": 34144,
+                "p95Us": 42597.5,
+                "meanUs": 35324.3,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 2.6,
+                "p95Us": 2.8,
+                "meanUs": 2.7,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 4.5,
+                "p95Us": 4.7,
+                "meanUs": 4.6,
+                "samples": 200
+              }
+            },
+            "k10": {
+              "A": {
+                "p50Us": 34893.9,
+                "p95Us": 58360.2,
+                "meanUs": 38632.5,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 12.9,
+                "p95Us": 14.4,
+                "meanUs": 13.2,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 11.4,
+                "p95Us": 13.2,
+                "meanUs": 19.7,
+                "samples": 200
+              }
+            },
+            "k100": {
+              "A": {
+                "p50Us": 34145.5,
+                "p95Us": 45392.5,
+                "meanUs": 36734.1,
+                "samples": 200
+              },
+              "B": {
+                "p50Us": 120.1,
+                "p95Us": 153.4,
+                "meanUs": 124.7,
+                "samples": 200
+              },
+              "C": {
+                "p50Us": 79.9,
+                "p95Us": 103.1,
+                "meanUs": 85.8,
+                "samples": 200
+              }
+            }
+          }
+        }
+      ],
+      "decision": {
+        "maintenanceB_over_A_p50": 0.0003058210859269874,
+        "maintenanceRulePass": true,
+        "catchupA_over_B_k10_p50": 2704.953488372093,
+        "catchupRulePass": true,
+        "merkleGate_maintenanceA_p50_gt_1ms": true
+      }
+    }
+  ],
+  "workerdSpotCheck": [
+    {
+      "experiment": "catchup-cursor-workerd",
+      "date": "2026-07-16T15:26:30.892Z",
+      "n": 1000,
+      "k": 10,
+      "noopP50Ms": 2.08,
+      "maintenance": {
+        "A": {
+          "perOpP50Us": 3111.8,
+          "rounds": 16,
+          "opsPerRound": 64
+        },
+        "B": {
+          "perOpP50Us": 12.3,
+          "rounds": 16,
+          "opsPerRound": 4096
+        },
+        "C": {
+          "perOpP50Us": 32.5,
+          "rounds": 16,
+          "opsPerRound": 4096
+        }
+      },
+      "catchup": {
+        "A": {
+          "perCallP50Us": 2643.7,
+          "rounds": 16,
+          "repeatPerRound": 32
+        },
+        "B": {
+          "perCallP50Us": 20.5,
+          "rounds": 16,
+          "repeatPerRound": 2048
+        },
+        "C": {
+          "perCallP50Us": 2.8,
+          "rounds": 16,
+          "repeatPerRound": 2048
+        }
+      }
+    },
+    {
+      "experiment": "catchup-cursor-workerd",
+      "date": "2026-07-16T15:28:56.875Z",
+      "n": 1000,
+      "k": 10,
+      "noopP50Ms": 2.36,
+      "maintenance": {
+        "A": {
+          "perOpP50Us": 2544.4,
+          "rounds": 16,
+          "opsPerRound": 64
+        },
+        "B": {
+          "perOpP50Us": 11.8,
+          "rounds": 16,
+          "opsPerRound": 4096
+        },
+        "C": {
+          "perOpP50Us": 28.3,
+          "rounds": 16,
+          "opsPerRound": 4096
+        }
+      },
+      "catchup": {
+        "A": {
+          "perCallP50Us": 2659.2,
+          "rounds": 16,
+          "repeatPerRound": 32
+        },
+        "B": {
+          "perCallP50Us": 21.8,
+          "rounds": 16,
+          "repeatPerRound": 2048
+        },
+        "C": {
+          "perCallP50Us": 2.7,
+          "rounds": 16,
+          "repeatPerRound": 2048
+        }
+      }
+    }
+  ]
+}

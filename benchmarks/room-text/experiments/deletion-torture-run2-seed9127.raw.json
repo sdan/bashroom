@@ -1,0 +1,470 @@
+{
+  "probe": "RoomText B-store deletion torture",
+  "seed": 9127,
+  "startedAt": "2026-07-16T15:30:46.192Z",
+  "elapsedMs": 16072,
+  "schedules": 2047,
+  "scheduleBreakdown": {
+    "A-delete": 758,
+    "A-marker": 342,
+    "A-idempotent-replay": 110,
+    "B-delete-all": 6,
+    "B-stale-marker": 6,
+    "B-stale-swallowed-delete": 6,
+    "B-retype": 15,
+    "C-deletion-with-anchors": 1,
+    "C-replacement-anchor": 1,
+    "D-invalid-boundary": 4,
+    "D-valid-boundary": 4,
+    "E-crash-mid-deletion": 2,
+    "E-compact-prep-deletion": 780,
+    "E-crash-mid-compaction": 1,
+    "F-grow-insert": 8,
+    "F-drastic-deletion": 2,
+    "F-janitor-crash": 1
+  },
+  "oracleViolations": [],
+  "findings": [
+    {
+      "name": "C: anchor fully covered by a REPLACEMENT re-attaches to the new inserted text (start assoc -1 / end assoc +1 spans the insertion) instead of collapsing fail-closed. Pure deletions collapse correctly; replacement is the resurrection-shaped gap."
+    },
+    {
+      "name": "F: a 900KB->200B shrink leaves a 200B snapshot with a 922KB composed_changes_json — the version artifact for a tiny head still carries the full grow-era insert history (soft compaction skips small docs entirely, so nothing bounds a tiny head's history payload until the floor advances)."
+    }
+  ],
+  "phases": {
+    "stormA": {
+      "rounds": 22,
+      "writersPerRound": 50,
+      "acceptedDeletions": 755,
+      "acceptedMarkers": 342,
+      "rejectedMidPairBoundaries": 3,
+      "noopCommitsFromSwallowedDeletions": 194,
+      "refills": 17,
+      "finalRevision": 1115,
+      "finalBytes": 82948,
+      "pushP50Ms": 144.2,
+      "pushP95Ms": 332.34,
+      "meanEditsPerSecond": 221,
+      "roundStats": [
+        {
+          "round": 0,
+          "pDelete": 0.854,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 168699,
+          "elapsedMs": 226.4,
+          "editsPerSecond": 221
+        },
+        {
+          "round": 1,
+          "pDelete": 0.877,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 22979,
+          "elapsedMs": 208.1,
+          "editsPerSecond": 240
+        },
+        {
+          "round": 2,
+          "pDelete": 0.854,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 42873,
+          "elapsedMs": 192.5,
+          "editsPerSecond": 260
+        },
+        {
+          "round": 3,
+          "pDelete": 0.818,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 47583,
+          "elapsedMs": 283.8,
+          "editsPerSecond": 176
+        },
+        {
+          "round": 4,
+          "pDelete": 0.551,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 114547,
+          "elapsedMs": 246.1,
+          "editsPerSecond": 203
+        },
+        {
+          "round": 5,
+          "pDelete": 0.612,
+          "accepted": 49,
+          "rejectedMidPair": 1,
+          "bytes": 55080,
+          "elapsedMs": 204.2,
+          "editsPerSecond": 240
+        },
+        {
+          "round": 6,
+          "pDelete": 0.525,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 44445,
+          "elapsedMs": 139.9,
+          "editsPerSecond": 357
+        },
+        {
+          "round": 7,
+          "pDelete": 0.664,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 44621,
+          "elapsedMs": 144.9,
+          "editsPerSecond": 345
+        },
+        {
+          "round": 8,
+          "pDelete": 0.827,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 48847,
+          "elapsedMs": 128,
+          "editsPerSecond": 391
+        },
+        {
+          "round": 9,
+          "pDelete": 0.52,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 102113,
+          "elapsedMs": 308.8,
+          "editsPerSecond": 162
+        },
+        {
+          "round": 10,
+          "pDelete": 0.605,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 178854,
+          "elapsedMs": 347.4,
+          "editsPerSecond": 144
+        },
+        {
+          "round": 11,
+          "pDelete": 0.682,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 75211,
+          "elapsedMs": 208.4,
+          "editsPerSecond": 240
+        },
+        {
+          "round": 12,
+          "pDelete": 0.626,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 96439,
+          "elapsedMs": 189.7,
+          "editsPerSecond": 264
+        },
+        {
+          "round": 13,
+          "pDelete": 0.689,
+          "accepted": 49,
+          "rejectedMidPair": 1,
+          "bytes": 52636,
+          "elapsedMs": 334.9,
+          "editsPerSecond": 146
+        },
+        {
+          "round": 14,
+          "pDelete": 0.714,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 56875,
+          "elapsedMs": 134.8,
+          "editsPerSecond": 371
+        },
+        {
+          "round": 15,
+          "pDelete": 0.501,
+          "accepted": 49,
+          "rejectedMidPair": 1,
+          "bytes": 141584,
+          "elapsedMs": 153.8,
+          "editsPerSecond": 319
+        },
+        {
+          "round": 16,
+          "pDelete": 0.644,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 152255,
+          "elapsedMs": 337.2,
+          "editsPerSecond": 148
+        },
+        {
+          "round": 17,
+          "pDelete": 0.795,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 127076,
+          "elapsedMs": 286,
+          "editsPerSecond": 175
+        },
+        {
+          "round": 18,
+          "pDelete": 0.723,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 180623,
+          "elapsedMs": 184.5,
+          "editsPerSecond": 271
+        },
+        {
+          "round": 19,
+          "pDelete": 0.526,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 72546,
+          "elapsedMs": 151.6,
+          "editsPerSecond": 330
+        },
+        {
+          "round": 20,
+          "pDelete": 0.669,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 158940,
+          "elapsedMs": 376,
+          "editsPerSecond": 133
+        },
+        {
+          "round": 21,
+          "pDelete": 0.504,
+          "accepted": 50,
+          "rejectedMidPair": 0,
+          "bytes": 82937,
+          "elapsedMs": 170.1,
+          "editsPerSecond": 294
+        }
+      ]
+    },
+    "wipeB": {
+      "cycles": 6,
+      "noopCommitsFromSwallowedDeletes": 6,
+      "detail": [
+        {
+          "cycle": 0,
+          "finalBytes": 355483,
+          "revision": 6
+        },
+        {
+          "cycle": 1,
+          "finalBytes": 223026,
+          "revision": 11
+        },
+        {
+          "cycle": 2,
+          "finalBytes": 367798,
+          "revision": 17
+        },
+        {
+          "cycle": 3,
+          "finalBytes": 208957,
+          "revision": 22
+        },
+        {
+          "cycle": 4,
+          "finalBytes": 249992,
+          "revision": 27
+        },
+        {
+          "cycle": 5,
+          "finalBytes": 352262,
+          "revision": 33
+        }
+      ]
+    },
+    "anchorsC": {
+      "pureDeletionCases": [
+        {
+          "case": "inside",
+          "mapped": [
+            10,
+            10
+          ],
+          "expect": [
+            10,
+            10
+          ]
+        },
+        {
+          "case": "exact",
+          "mapped": [
+            10,
+            10
+          ],
+          "expect": [
+            10,
+            10
+          ]
+        },
+        {
+          "case": "spanning",
+          "mapped": [
+            8,
+            12
+          ],
+          "expect": [
+            8,
+            12
+          ]
+        },
+        {
+          "case": "abut-left",
+          "mapped": [
+            5,
+            10
+          ],
+          "expect": [
+            5,
+            10
+          ]
+        },
+        {
+          "case": "abut-right",
+          "mapped": [
+            10,
+            15
+          ],
+          "expect": [
+            10,
+            15
+          ]
+        },
+        {
+          "case": "straddle-left",
+          "mapped": [
+            8,
+            10
+          ],
+          "expect": [
+            8,
+            10
+          ]
+        },
+        {
+          "case": "straddle-right",
+          "mapped": [
+            10,
+            14
+          ],
+          "expect": [
+            10,
+            14
+          ]
+        }
+      ],
+      "replacement": {
+        "mapped": [
+          5,
+          7
+        ],
+        "coversInsertedText": true,
+        "collapsed": false
+      },
+      "resolvedUntouched": [
+        11,
+        14
+      ],
+      "clamped": [
+        30,
+        30
+      ]
+    },
+    "utf8D": {
+      "cases": [
+        {
+          "label": "deletion ending mid-emoji (to splits 👍)",
+          "outcome": "clean-rejection",
+          "code": "INVALID_CHANGE"
+        },
+        {
+          "label": "deletion starting mid-emoji (from splits 👍)",
+          "outcome": "clean-rejection",
+          "code": "INVALID_CHANGE"
+        },
+        {
+          "label": "insert at a mid-surrogate position",
+          "outcome": "clean-rejection",
+          "code": "INVALID_CHANGE"
+        },
+        {
+          "label": "lone high surrogate in inserted text",
+          "outcome": "clean-rejection",
+          "code": "INVALID_UNICODE"
+        },
+        {
+          "label": "delete the whole 👍 (4 UTF-8 bytes)",
+          "outcome": "accepted",
+          "byteDelta": -4
+        },
+        {
+          "label": "delete the CJK char (3 UTF-8 bytes)",
+          "outcome": "accepted",
+          "byteDelta": -3
+        },
+        {
+          "label": "delete ONLY the combining accent (scalar-legal grapheme split)",
+          "outcome": "accepted",
+          "byteDelta": -2
+        },
+        {
+          "label": "delete half the ZWJ family (grapheme break, scalar-legal)",
+          "outcome": "accepted",
+          "byteDelta": -7
+        }
+      ]
+    },
+    "crashesE": {
+      "midDeletionCrashes": {
+        "kinds": 2,
+        "rolledBackExactly": true,
+        "retryRevision": 1
+      },
+      "midCompactionCrash": {
+        "prepPushes": 780,
+        "belowFloorRowsAtCrash": 384,
+        "finalDocBytes": 43923,
+        "composedRows": 48,
+        "secondCompactMode": "idle",
+        "rolledBackExactly": true
+      }
+    },
+    "shrinkF": {
+      "shrunkenBytes": 200,
+      "pullAfterShrink": "delta-exact (6 updates)",
+      "compactionAfterShrink": {
+        "mode": "soft",
+        "belowFloorUpdates": 0
+      },
+      "artifact": {
+        "revision": 6,
+        "snapshotBytes": 200,
+        "composedChangesJsonBytes": 944349
+      },
+      "janitorRecovery": {
+        "crashInjected": true,
+        "refireHeadFlip": "flipped",
+        "historyFloorAfter": 6,
+        "prunedUpdates": 5,
+        "updateRowsRemaining": 1
+      },
+      "regrownBytes": 914152
+    },
+    "restartR": {
+      "filesVerified": 7,
+      "exactFiles": 7,
+      "roomRootStable": true
+    }
+  },
+  "verdictForThisRun": "zero-violations"
+}

@@ -1,0 +1,41 @@
+{
+  "experiment": "catchup-cursor-workerd",
+  "date": "2026-07-16T15:28:56.875Z",
+  "n": 1000,
+  "k": 10,
+  "noopP50Ms": 2.36,
+  "maintenance": {
+    "A": {
+      "perOpP50Us": 2544.4,
+      "rounds": 16,
+      "opsPerRound": 64
+    },
+    "B": {
+      "perOpP50Us": 11.8,
+      "rounds": 16,
+      "opsPerRound": 4096
+    },
+    "C": {
+      "perOpP50Us": 28.3,
+      "rounds": 16,
+      "opsPerRound": 4096
+    }
+  },
+  "catchup": {
+    "A": {
+      "perCallP50Us": 2659.2,
+      "rounds": 16,
+      "repeatPerRound": 32
+    },
+    "B": {
+      "perCallP50Us": 21.8,
+      "rounds": 16,
+      "repeatPerRound": 2048
+    },
+    "C": {
+      "perCallP50Us": 2.7,
+      "rounds": 16,
+      "repeatPerRound": 2048
+    }
+  }
+}

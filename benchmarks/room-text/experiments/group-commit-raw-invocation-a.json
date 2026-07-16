@@ -1,0 +1,377 @@
+{
+  "benchmark": "RoomText group-commit (deferred head write) lab",
+  "startedAt": "2026-07-16T15:47:37.327Z",
+  "runtime": "Node v24.3.0; workerd via Wrangler",
+  "config": {
+    "port": 8853,
+    "revisions": 256,
+    "runs": 2,
+    "headBytes": 420652,
+    "batchSizes": [
+      1,
+      4,
+      16,
+      64
+    ]
+  },
+  "runs": [
+    {
+      "run": 0,
+      "arms": [
+        {
+          "arm": "baseline",
+          "batchSize": 1,
+          "revisions": 256,
+          "requests": 256,
+          "wallMs": 1557.855,
+          "revisionsPerSecond": 164.329,
+          "headBlobWrites": 256,
+          "headBlobBytes": 107686912,
+          "headBytesPerRevision": 420652,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 256,
+            "totalMs": 1555.421,
+            "meanMs": 6.076,
+            "p50Ms": 5.637,
+            "p95Ms": 8.98,
+            "p99Ms": 11.634,
+            "maxMs": 15.57
+          },
+          "perRevisionMs": 6.085,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        },
+        {
+          "arm": "batch-1",
+          "batchSize": 1,
+          "revisions": 256,
+          "requests": 256,
+          "wallMs": 1419.404,
+          "revisionsPerSecond": 180.357,
+          "headBlobWrites": 256,
+          "headBlobBytes": 107686912,
+          "headBytesPerRevision": 420652,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 256,
+            "totalMs": 1416.607,
+            "meanMs": 5.534,
+            "p50Ms": 5.154,
+            "p95Ms": 7.644,
+            "p99Ms": 11.265,
+            "maxMs": 23.8
+          },
+          "perRevisionMs": 5.545,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        },
+        {
+          "arm": "batch-4",
+          "batchSize": 4,
+          "revisions": 256,
+          "requests": 64,
+          "wallMs": 423.972,
+          "revisionsPerSecond": 603.813,
+          "headBlobWrites": 64,
+          "headBlobBytes": 26921728,
+          "headBytesPerRevision": 105163,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 64,
+            "totalMs": 423.001,
+            "meanMs": 6.609,
+            "p50Ms": 6.211,
+            "p95Ms": 10.07,
+            "p99Ms": 12.617,
+            "maxMs": 12.617
+          },
+          "perRevisionMs": 1.656,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        },
+        {
+          "arm": "batch-16",
+          "batchSize": 16,
+          "revisions": 256,
+          "requests": 16,
+          "wallMs": 176.194,
+          "revisionsPerSecond": 1452.945,
+          "headBlobWrites": 16,
+          "headBlobBytes": 6730432,
+          "headBytesPerRevision": 26290.75,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 16,
+            "totalMs": 175.693,
+            "meanMs": 10.981,
+            "p50Ms": 10.034,
+            "p95Ms": 16.69,
+            "p99Ms": 16.69,
+            "maxMs": 16.69
+          },
+          "perRevisionMs": 0.688,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        },
+        {
+          "arm": "batch-64",
+          "batchSize": 64,
+          "revisions": 256,
+          "requests": 4,
+          "wallMs": 161.621,
+          "revisionsPerSecond": 1583.956,
+          "headBlobWrites": 4,
+          "headBlobBytes": 1682608,
+          "headBytesPerRevision": 6572.688,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 4,
+            "totalMs": 160.611,
+            "meanMs": 40.153,
+            "p50Ms": 31.178,
+            "p95Ms": 57.471,
+            "p99Ms": 57.471,
+            "maxMs": 57.471
+          },
+          "perRevisionMs": 0.631,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        }
+      ],
+      "baselineHeadBytesPerRevision": 420652,
+      "baselinePushP50Ms": 5.637,
+      "batch1PushP50Ms": 5.154,
+      "batchSummary": {
+        "batch-1": {
+          "amplificationReduction": 1,
+          "headBytesPerRevision": 420652,
+          "batchCommitP50Ms": 5.154,
+          "perRevisionMs": 5.545
+        },
+        "batch-4": {
+          "amplificationReduction": 4,
+          "headBytesPerRevision": 105163,
+          "batchCommitP50Ms": 6.211,
+          "perRevisionMs": 1.656
+        },
+        "batch-16": {
+          "amplificationReduction": 16,
+          "headBytesPerRevision": 26290.75,
+          "batchCommitP50Ms": 10.034,
+          "perRevisionMs": 0.688
+        },
+        "batch-64": {
+          "amplificationReduction": 64,
+          "headBytesPerRevision": 6572.688,
+          "batchCommitP50Ms": 31.178,
+          "perRevisionMs": 0.631
+        }
+      }
+    },
+    {
+      "run": 1,
+      "arms": [
+        {
+          "arm": "baseline",
+          "batchSize": 1,
+          "revisions": 256,
+          "requests": 256,
+          "wallMs": 1308.921,
+          "revisionsPerSecond": 195.581,
+          "headBlobWrites": 256,
+          "headBlobBytes": 107686912,
+          "headBytesPerRevision": 420652,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 256,
+            "totalMs": 1307.076,
+            "meanMs": 5.106,
+            "p50Ms": 4.859,
+            "p95Ms": 6.805,
+            "p99Ms": 9.314,
+            "maxMs": 10.357
+          },
+          "perRevisionMs": 5.113,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        },
+        {
+          "arm": "batch-1",
+          "batchSize": 1,
+          "revisions": 256,
+          "requests": 256,
+          "wallMs": 1395.833,
+          "revisionsPerSecond": 183.403,
+          "headBlobWrites": 256,
+          "headBlobBytes": 107686912,
+          "headBytesPerRevision": 420652,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 256,
+            "totalMs": 1393.119,
+            "meanMs": 5.442,
+            "p50Ms": 5.018,
+            "p95Ms": 7.489,
+            "p99Ms": 11.141,
+            "maxMs": 32.086
+          },
+          "perRevisionMs": 5.452,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        },
+        {
+          "arm": "batch-4",
+          "batchSize": 4,
+          "revisions": 256,
+          "requests": 64,
+          "wallMs": 420.302,
+          "revisionsPerSecond": 609.086,
+          "headBlobWrites": 64,
+          "headBlobBytes": 26921728,
+          "headBytesPerRevision": 105163,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 64,
+            "totalMs": 419.376,
+            "meanMs": 6.553,
+            "p50Ms": 5.834,
+            "p95Ms": 9.778,
+            "p99Ms": 23.137,
+            "maxMs": 23.137
+          },
+          "perRevisionMs": 1.642,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        },
+        {
+          "arm": "batch-16",
+          "batchSize": 16,
+          "revisions": 256,
+          "requests": 16,
+          "wallMs": 172.846,
+          "revisionsPerSecond": 1481.09,
+          "headBlobWrites": 16,
+          "headBlobBytes": 6730432,
+          "headBytesPerRevision": 26290.75,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 16,
+            "totalMs": 172.324,
+            "meanMs": 10.77,
+            "p50Ms": 10.476,
+            "p95Ms": 16.003,
+            "p99Ms": 16.003,
+            "maxMs": 16.003
+          },
+          "perRevisionMs": 0.675,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        },
+        {
+          "arm": "batch-64",
+          "batchSize": 64,
+          "revisions": 256,
+          "requests": 4,
+          "wallMs": 139.128,
+          "revisionsPerSecond": 1840.036,
+          "headBlobWrites": 4,
+          "headBlobBytes": 1682608,
+          "headBytesPerRevision": 6572.688,
+          "snapshotBlobWrites": 2,
+          "snapshotBlobBytes": 841304,
+          "requestLatency": {
+            "samples": 4,
+            "totalMs": 138.724,
+            "meanMs": 34.681,
+            "p50Ms": 32.865,
+            "p95Ms": 39.716,
+            "p99Ms": 39.716,
+            "maxMs": 39.716
+          },
+          "perRevisionMs": 0.543,
+          "finalContentSha256": "41ab487c038e33d0b873b8c2ed8142dd046f5b5a754a27d465c7591d4e01ab0b"
+        }
+      ],
+      "baselineHeadBytesPerRevision": 420652,
+      "baselinePushP50Ms": 4.859,
+      "batch1PushP50Ms": 5.018,
+      "batchSummary": {
+        "batch-1": {
+          "amplificationReduction": 1,
+          "headBytesPerRevision": 420652,
+          "batchCommitP50Ms": 5.018,
+          "perRevisionMs": 5.452
+        },
+        "batch-4": {
+          "amplificationReduction": 4,
+          "headBytesPerRevision": 105163,
+          "batchCommitP50Ms": 5.834,
+          "perRevisionMs": 1.642
+        },
+        "batch-16": {
+          "amplificationReduction": 16,
+          "headBytesPerRevision": 26290.75,
+          "batchCommitP50Ms": 10.476,
+          "perRevisionMs": 0.675
+        },
+        "batch-64": {
+          "amplificationReduction": 64,
+          "headBytesPerRevision": 6572.688,
+          "batchCommitP50Ms": 32.865,
+          "perRevisionMs": 0.543
+        }
+      }
+    }
+  ],
+  "oracles": {
+    "staleWriter": {
+      "staleWriters": 16,
+      "converged": true,
+      "revision": 16
+    },
+    "failureIsolation": {
+      "results": [
+        "ok",
+        "ok",
+        "FUTURE_REVISION",
+        "ok",
+        "ok"
+      ],
+      "finalRevision": 4,
+      "isolated": true
+    },
+    "crashInjection": {
+      "batchRolledBackAtomically": true,
+      "retriedAfterDisarm": true,
+      "finalRevision": 9
+    }
+  },
+  "decisions": [
+    {
+      "run": 0,
+      "amplificationReduction": {
+        "batch-4": 4,
+        "batch-16": 16,
+        "batch-64": 64
+      },
+      "ampRulePassed": true,
+      "batch1LatencyRatio": 0.914,
+      "latencyRulePassed": true
+    },
+    {
+      "run": 1,
+      "amplificationReduction": {
+        "batch-4": 4,
+        "batch-16": 16,
+        "batch-64": 64
+      },
+      "ampRulePassed": true,
+      "batch1LatencyRatio": 1.033,
+      "latencyRulePassed": true
+    }
+  ],
+  "oraclesPassed": true,
+  "networkRetries": 0,
+  "semanticChange": "Crash atomicity widens from per-push to per-batch: an invariant failure mid-batch rolls back every push in the batch (proven by crashInjection). Per-push REJECTIONS still fail independently (proven by failureIsolation)."
+}
