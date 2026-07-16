@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   RoomTextStore,
+  decideRoomTextPublication,
   isRetryableRoomTextFailure,
   type PushRoomTextInput,
   type RoomTextVersionArtifact,
@@ -575,16 +576,31 @@ export class RoomTextProbe extends DurableObject<Env> {
     await this.pauseAfterArtifactPut();
     if (crashBeforeHeadFlip) throw new InjectedCrash("injected crash between artifact PUT and HEAD flip");
 
+    // Monotonic publication guard, decided at WRITE time against the exact
+    // HEAD body just read — never at flush-schedule time. The manifest's
+    // (epoch, revision) was minted by the store's synchronous commit order,
+    // so "stale" here means a strictly newer publication is already visible
+    // and this (paused / reordered / re-fired) flush must not CAS backward.
     const currentHead = this.r2.get(headKey);
-    let headFlip: "flipped" | "already-visible";
-    if (currentHead && janitorDecoder.decode(currentHead.bytes) === manifest.manifestJson) {
-      headFlip = "already-visible";
-    } else {
+    const decision = decideRoomTextPublication(
+      currentHead ? janitorDecoder.decode(currentHead.bytes) : null,
+      { epoch: manifest.epoch, revision: manifest.revision },
+    );
+    if (decision === "unreadable") return { ok: false as const, error: "HEAD_UNREADABLE" };
+    let headFlip: "flipped" | "already-visible" | "stale-skip";
+    if (decision === "publish") {
+      // The etag CAS pairs the write with the read the decision was made on:
+      // if any other flush moved HEAD in between, this PUT loses instead of
+      // clobbering. A lost CAS means re-observe on the next fire.
       const flipped = this.r2.put(headKey, janitorEncoder.encode(manifest.manifestJson), currentHead ? currentHead.etag : null);
-      // A lost CAS means another writer flipped concurrently; the next fire
-      // reconciles against whatever HEAD it observes.
       if (!flipped) return { ok: false as const, error: "HEAD_CAS_LOST" };
       headFlip = "flipped";
+    } else {
+      // stale-skip still advances the floor below: this flush's artifact is
+      // durable (create-only PUT above) and HEAD points at a strictly newer
+      // chain entry that covers it, so pruning local history <= our revision
+      // stays safe (and is usually a no-op — the newer flush advanced past).
+      headFlip = decision === "stale" ? "stale-skip" : "already-visible";
     }
 
     const advanced = this.texts.advanceFloorAfterFlush(fileId, artifact.revision);

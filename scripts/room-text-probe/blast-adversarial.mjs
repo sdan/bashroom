@@ -415,7 +415,8 @@ try {
 
   // Emulate real R2 latency by yielding after the older artifact PUT. While
   // that request is suspended, commit and publish a newer checkpoint. The
-  // older request currently CASes HEAD backward after it resumes.
+  // monotonic publication guard must make the resumed older request skip
+  // ("stale-skip") instead of CASing HEAD backward over the newer publish.
   const orderingFile = "janitor-head-order";
   assert.equal((await post("/create", {
     fileId: orderingFile,
@@ -426,7 +427,7 @@ try {
     orderingFile, 0, "janitor-client", "revision-1", [{ from: 1, to: 1, insert: "b" }],
   ))).revision, 1);
   assert.equal((await post(`/checkpoint?file=${orderingFile}`)).revision, 1);
-  assert.deepEqual(await post("/janitor/gate/arm"), { ok: true, state: "armed" });
+  assert.deepEqual(await post("/janitor/gate/arm"), { ok: true, id: "default", state: "armed" });
   const olderFire = post(`/janitor/fire?file=${orderingFile}`);
   await waitFor(async () => (await get("/janitor/gate")).state === "paused", "older janitor never paused");
 
@@ -440,19 +441,23 @@ try {
   const beforeReleaseObjects = (await get("/janitor/r2")).objects;
   assert.equal(manifestAt(beforeReleaseObjects, orderingHeadKey).revision, 2);
 
-  assert.deepEqual(await post("/janitor/gate/release"), { ok: true, state: "released" });
+  assert.deepEqual(await post("/janitor/gate/release"), { ok: true, id: "default", state: "released" });
   const olderResult = await olderFire;
-  assert.equal(olderResult.revision, 1);
+  assert.deepEqual(
+    { ok: olderResult.ok, revision: olderResult.revision, headFlip: olderResult.headFlip },
+    { ok: true, revision: 1, headFlip: "stale-skip" },
+  );
   const afterReleaseObjects = (await get("/janitor/r2")).objects;
-  const regressed = manifestAt(afterReleaseObjects, orderingHeadKey);
-  assert.equal(regressed.revision, 1);
+  const afterRelease = manifestAt(afterReleaseObjects, orderingHeadKey);
+  assert.equal(afterRelease.revision, 2);
   assert.deepEqual(
     { revision: (await get(`/open?file=${orderingFile}`)).revision, content: (await get(`/open?file=${orderingFile}`)).content },
     { revision: 2, content: "abc" },
   );
-  reproduced("older async janitor CAS regresses R2 HEAD after newer publish", {
+  pass("older async janitor stale-skips instead of CASing R2 HEAD backward", {
     beforeRelease: 2,
-    afterRelease: regressed.revision,
+    afterRelease: afterRelease.revision,
+    olderFire: olderResult.headFlip,
     sqliteHead: 2,
   });
 

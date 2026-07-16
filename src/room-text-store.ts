@@ -255,6 +255,15 @@ export type RoomTextHeadManifest =
     }
   | RoomTextFailure;
 
+/** The (epoch, revision) identity of one R2 publication (HEAD manifest). */
+export type RoomTextPublication = { epoch: number; revision: number };
+
+export type RoomTextPublicationDecision =
+  | "publish" // candidate is strictly newer — write, paired with an etag CAS
+  | "already-visible" // identical (epoch, revision) is published — no write
+  | "stale" // a strictly newer publication is visible — never write
+  | "unreadable"; // current HEAD does not parse — fail closed, never write
+
 export type AdvanceFloorResult =
   | {
       ok: true;
@@ -331,6 +340,55 @@ export type RoomTextFailure = {
  */
 export function isRetryableRoomTextFailure(code: RoomTextFailure["error"]): boolean {
   return code === "EPOCH_MISMATCH" || code === "RESET_REQUIRED" || code === "FUTURE_REVISION";
+}
+
+/**
+ * Fail-closed parse of a HEAD manifest's publication identity. Anything that
+ * is not a JSON object carrying a valid (epoch >= 1, revision >= 0) integer
+ * pair is null — an unreadable marker must block publication, not permit it.
+ */
+export function parseRoomTextPublication(manifestJson: string): RoomTextPublication | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(manifestJson);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const { epoch, revision } = parsed as { epoch?: unknown; revision?: unknown };
+  if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1) return null;
+  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) return null;
+  return { epoch, revision };
+}
+
+/**
+ * Monotonic publication guard for the R2 HEAD flip — the fix for the
+ * adversarial-probe regression where an older flush, resumed after an
+ * arbitrary pause, CASed HEAD backward over a newer publication.
+ *
+ * (epoch, revision) is minted by the store's synchronous single-threaded
+ * SQLite commits, so comparing the pair lexicographically IS comparing store
+ * commit order — regardless of which async flush reaches R2 first, fires
+ * twice, or resumes after a crash. The host makes this check atomic with the
+ * write by reading HEAD ONCE, deciding against exactly that body, and
+ * pairing "publish" with an etag CAS on that same read (create-only when
+ * HEAD was absent). A lost CAS means another flush moved HEAD between the
+ * read and the write: re-observe and re-decide — never blind-retry the PUT.
+ * "stale" and "already-visible" perform no write; skipping is what makes an
+ * arbitrarily delayed, reordered, or re-fired flush harmless.
+ */
+export function decideRoomTextPublication(
+  currentManifestJson: string | null,
+  candidate: RoomTextPublication,
+): RoomTextPublicationDecision {
+  if (currentManifestJson === null) return "publish";
+  const current = parseRoomTextPublication(currentManifestJson);
+  if (!current) return "unreadable";
+  if (candidate.epoch !== current.epoch) {
+    return candidate.epoch > current.epoch ? "publish" : "stale";
+  }
+  if (candidate.revision === current.revision) return "already-visible";
+  return candidate.revision > current.revision ? "publish" : "stale";
 }
 
 /**
@@ -921,7 +979,7 @@ export class RoomTextStore {
 
   /**
    * After the host has durably PUT the artifact for `revision` and flipped
-   * HEAD, drop the local history it covers. The floor may not pass the
+   * (or monotonically skipped) HEAD, drop the local history it covers. The floor may not pass the
    * recovery snapshot (cold replay needs the snapshot-to-head tail), and a
    * revision at or below the current floor is a completed flush — no-op, so
    * alarm re-fires are safe.
