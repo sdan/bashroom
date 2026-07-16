@@ -131,6 +131,58 @@ export type RoomTextClientEffects = {
   onIncompatible?(serverProtocol: number, message?: string): void;
 };
 
+/**
+ * The serialized form of one outbox entry. `changes` is the wire changeset
+ * (against `baseRevision`), so rehydration reconstructs the ChangeSet with the
+ * SAME changeSetFromWire the live path uses — no ChangeSet.toJSON coupling.
+ */
+export type SerializedOutboxEntry = {
+  requestId: string;
+  token: string;
+  baseRevision: number;
+  changes: WireTextChange[];
+  /**
+   * Document length `changes` was authored against (ChangeSet.length). Stored
+   * so rehydration reconstructs each entry independently — a replay-only entry
+   * is never re-applied to the live doc, so its base is not derivable from the
+   * confirmed doc + speculative chain the way a live entry's is.
+   */
+  changeBaseLength: number;
+  sent: { epoch: number; baseRevision: number; changes: WireTextChange[] } | null;
+  speculative: boolean;
+};
+
+/**
+ * A durable snapshot of the client's unacked work: the confirmed anchor the
+ * speculative chain bases on, plus every outbox entry (tokens, request IDs,
+ * wire changesets, sent payloads, speculative flags). The draft buffer is
+ * deliberately excluded — it is sub-100ms in-flight keystrokes, not yet a
+ * logical update, and reload latency dwarfs the compose window.
+ */
+export type SerializedOutbox = {
+  version: 1;
+  clientId: string;
+  fileId: string;
+  epoch: number;
+  confirmedRevision: number;
+  confirmedDoc: string;
+  entries: SerializedOutboxEntry[];
+};
+
+/**
+ * Optional host-injected durable store for the outbox. The client saves the
+ * full outbox on every mutation and loads it once at construction, so an
+ * unacked update survives a tab reload and replays with its ORIGINAL token —
+ * the server's idempotency row answers with the original commit rather than
+ * double-applying. Absent this, the outbox is purely in-memory (today's
+ * behavior). Calls are synchronous host effects (e.g. localStorage) so the
+ * module stays inside the room-text*.ts async/timer-free discipline.
+ */
+export type RoomTextOutboxPersist = {
+  load(): SerializedOutbox | null;
+  save(outbox: SerializedOutbox): void;
+};
+
 export type RoomTextClientConfig = {
   clientId: string;
   fileId: string;
@@ -139,6 +191,23 @@ export type RoomTextClientConfig = {
   now?(): number;
   /** Must be unique per logical update for this clientId (durable dedupe key). */
   nextRequestId?(): string;
+  /**
+   * Per-instance nonce folded into default request IDs. REQUIRED for durable
+   * safety when nextRequestId is not supplied: the server dedup space is
+   * (clientId, requestId) — room-wide, across files and epochs (see
+   * room-text-store.ts room_text_requests PRIMARY KEY). A persisted clientId
+   * with a fresh instance's counter restarting at req-1 would collide with a
+   * different logical update's row and get an IDEMPOTENCY_MISMATCH (a
+   * wrong-answer dedupe hit); two live instances of the same clientId collide
+   * the same way. A unique nonce per instance moves each instance into its own
+   * corner of that dedup space. The module never mints the nonce itself —
+   * Math.random/Date.now would break determinism and the discipline test — so
+   * the host must supply it. Omitted only in legacy in-memory usage where the
+   * counter never restarts within a page lifetime.
+   */
+  nonce?: string;
+  /** Durable outbox store; absent means in-memory only (today's behavior). */
+  persist?: RoomTextOutboxPersist;
   effects: RoomTextClientEffects;
 };
 
@@ -193,7 +262,70 @@ export class RoomTextClient {
   private cancelZombie: (() => void) | null = null;
   private cancelDraftFlush: (() => void) | null = null;
 
-  constructor(private readonly config: RoomTextClientConfig) {}
+  constructor(private readonly config: RoomTextClientConfig) {
+    this.rehydrate();
+  }
+
+  /**
+   * Restore a persisted outbox at construction so unacked work survives a tab
+   * reload. The snapshot must be for THIS (clientId, fileId) — a mismatch is a
+   * stale or foreign blob and is ignored rather than mis-applied. Entries come
+   * back with their original tokens/request IDs; the next successful hydration
+   * rebases the speculative chain and resendOutbox() puts it back on the wire.
+   */
+  private rehydrate(): void {
+    const saved = this.config.persist?.load();
+    if (!saved || saved.version !== 1) return;
+    if (saved.clientId !== this.config.clientId || saved.fileId !== this.config.fileId) return;
+    this.epoch = saved.epoch;
+    this.confirmedRevision = saved.confirmedRevision;
+    this.confirmed = roomTextFromString(saved.confirmedDoc);
+    for (const entry of saved.entries) {
+      try {
+        this.outbox.push({
+          requestId: entry.requestId,
+          token: entry.token,
+          baseRevision: entry.baseRevision,
+          // Reconstruct against the exact base length the changeset was authored
+          // against — stored per entry, so ordering/composition is irrelevant.
+          changes: changeSetFromWire(entry.changes, entry.changeBaseLength),
+          sent: entry.sent,
+          speculative: entry.speculative,
+        });
+      } catch {
+        // A blob whose changesets no longer compose is corrupt; drop the rest
+        // rather than resend nonsense. Sent-but-unconfirmed rows already on
+        // the server will re-broadcast on the next hydration delta.
+        break;
+      }
+    }
+  }
+
+  /**
+   * Snapshot the outbox to the durable store. Called after every mutation of
+   * the outbox / confirmed state so a reload never loses an unacked update.
+   * No-op when no persist store is injected (in-memory-only clients).
+   */
+  private persistOutbox(): void {
+    if (!this.config.persist) return;
+    this.config.persist.save({
+      version: 1,
+      clientId: this.config.clientId,
+      fileId: this.config.fileId,
+      epoch: this.epoch,
+      confirmedRevision: this.confirmedRevision,
+      confirmedDoc: this.confirmed.toString(),
+      entries: this.outbox.map((entry) => ({
+        requestId: entry.requestId,
+        token: entry.token,
+        baseRevision: entry.baseRevision,
+        changes: changeSetToWire(entry.changes),
+        changeBaseLength: entry.changes.length,
+        sent: entry.sent,
+        speculative: entry.speculative,
+      })),
+    });
+  }
 
   state(): RoomTextClientState {
     return this.clientState;
@@ -310,9 +442,7 @@ export class RoomTextClient {
       this.draft = null;
       return;
     }
-    const requestId = this.config.nextRequestId
-      ? this.config.nextRequestId()
-      : `req-${++this.requestSequence}`;
+    const requestId = this.mintRequestId();
     const entry: OutboxEntry = {
       requestId,
       token: roomTextUpdateToken(this.config.clientId, requestId),
@@ -323,7 +453,22 @@ export class RoomTextClient {
     };
     this.draft = null;
     this.outbox.push(entry);
+    this.persistOutbox();
     this.sendNext();
+  }
+
+  /**
+   * Mint a request ID. Prefer an injected factory; otherwise fold the injected
+   * per-instance nonce into a monotonic counter. The nonce is what keeps the
+   * ID globally unique in the room-wide (clientId, requestId) dedup space (see
+   * config.nonce): without it, a reloaded or second instance restarts req-1
+   * and collides. The counter alone is NOT durable — a fresh instance resets
+   * it — which is exactly why the nonce, not the counter, carries uniqueness.
+   */
+  private mintRequestId(): string {
+    if (this.config.nextRequestId) return this.config.nextRequestId();
+    const n = ++this.requestSequence;
+    return this.config.nonce ? `${this.config.nonce}-req-${n}` : `req-${n}`;
   }
 
   private handleHydration(frame: Extract<RoomTextServerFrame, { type: "hydration" }>): void {
@@ -371,6 +516,7 @@ export class RoomTextClient {
     }
     this.confirmed = roomTextFromString(frame.doc);
     this.confirmedRevision = frame.headRevision;
+    this.persistOutbox();
     this.config.effects.onSnapshot?.({ doc: frame.doc, epoch: frame.epoch, revision: frame.headRevision });
     if (orphaned.length) this.config.effects.onLocalChangesOrphaned?.(orphaned);
   }
@@ -427,6 +573,7 @@ export class RoomTextClient {
     // Replay of an already-stored commit: the snapshot that reset us already
     // contains its text, so the entry just leaves the outbox.
     this.outbox.splice(index, 1);
+    this.persistOutbox();
     this.config.effects.onAck?.({
       requestId: entry.requestId,
       revision: frame.revision,
@@ -441,6 +588,7 @@ export class RoomTextClient {
     if (!entry.speculative) {
       // Replay-only entry: the server's window closed before it could answer.
       this.outbox.splice(index, 1);
+      this.persistOutbox();
       this.config.effects.onDiscard?.({ requestId: entry.requestId, code: frame.code, retryable: frame.retryable });
       return;
     }
@@ -471,6 +619,7 @@ export class RoomTextClient {
       this.draft = null;
       this.clearDraftFlush();
     }
+    this.persistOutbox();
     this.config.effects.onDiscard?.({ requestId: entry.requestId, code: frame.code, retryable: frame.retryable });
     if (orphaned.length) this.config.effects.onLocalChangesOrphaned?.(orphaned);
   }
@@ -559,6 +708,7 @@ export class RoomTextClient {
       chainBase++;
     }
     if (this.draft) this.draft = byToken.get(draftToken(this.config.clientId)) ?? this.draft;
+    this.persistOutbox();
     return true;
   }
 
@@ -582,6 +732,9 @@ export class RoomTextClient {
     }
     const head = this.nextUnsent();
     if (head) pushes.push(this.markSent(head));
+    // Cleared speculative `sent` flags and the head's rebuilt `sent` payload
+    // are durable transmission state: persist the whole outbox once here.
+    this.persistOutbox();
     if (pushes.length) this.config.effects.sendFrame({ type: "push", pushes });
   }
 
@@ -600,7 +753,9 @@ export class RoomTextClient {
     if (this.clientState !== "connected") return;
     const head = this.nextUnsent();
     if (!head) return;
-    this.config.effects.sendFrame({ type: "push", pushes: [this.markSent(head)] });
+    const push = this.markSent(head); // records the durable `sent` payload
+    this.persistOutbox();
+    this.config.effects.sendFrame({ type: "push", pushes: [push] });
   }
 
   /** The speculative chain's head, only while nothing of the chain is in flight. */
@@ -709,7 +864,11 @@ export class RoomTextClient {
   }
 
   private now(): number {
-    return this.config.now ? this.config.now() : Date.now();
+    // Host-injected clock only. The ping `at` field is diagnostic and the
+    // zombie verdict keys on frame ARRIVAL, not this value, so an absent clock
+    // falls back to 0 rather than Date.now() — the module stays deterministic
+    // and Date.now-free (see room-text hot-path discipline test).
+    return this.config.now ? this.config.now() : 0;
   }
 
   private enter(state: RoomTextClientState): void {
