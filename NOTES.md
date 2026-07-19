@@ -5,6 +5,60 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-19 — A/B retraction, Linear mapping, plan of record: freeze-and-instrument
+
+Three things landed together and set the plan of record.
+
+**RETRACTION: the 2026-07-16 cutover A/B is not valid evidence against the
+shipped client.** An outside review caught it and every claim verified. The
+harness (benchmarks/room-text/ab-cutover.mjs:82-87) modeled the human's
+conflict behavior as load-theirs (buffer = reply.content — everything since
+the last acked save counted lost) at AUTOSAVE_MS=700. But the shipped client
+since a8d515e (2026-07-15 — one day BEFORE the A/B ran) preserves the draft
+on 412 and shows a conflict bar with both choices (src/web-ui.ts:1300-1304)
+at a 1500ms autosave (src/web-ui.ts:1279). "A lost 7-9 keystrokes, B lost 0"
+compared RoomText against the previous client generation. The real cost of a
+production conflict is a forced manual resolution where one side must be
+hand-merged — nonzero, but NOT lost keystrokes, and unmeasured. The 8.4x
+observer-latency result used constants that also no longer match; treat the
+whole entry as historical. Method lesson (same family as the 230/230 and the
+lab's frame-switch findings): evidence is valid only against the REAL shipped
+baseline, re-verified at run time — not constants captured when the harness
+was written.
+
+**Linear sync-engine mapping (12-agent swarm, 3 articles, 57 concept
+mappings, 55 CONFIRMED by cold verifiers).** Conclusion: bashroom is
+Linear-before-its-sync-engine on the LIVE path (central authority, per-file
+CAS-with-compare, explicit conflicts, shoulder-tap pokes via RoomHub, no
+client replica) PLUS Linear's full sync engine already built but DORMANT
+(RoomText: persisted transaction queue, per-file lastSyncId-style revision
+cursor, delta-vs-snapshot bootstrap decision, rebase-instead-of-CRDT). The
+one pillar deliberately inverted: no local-first client database anywhere —
+every writer is online by definition (agents + web), so the DO input gate
+can be the sequencer and text merge is deterministic rebase, which Linear's
+offline clients structurally cannot have. Linear's own history (years on
+LWW because measured conflicts were rare; merge machinery added only where
+product demand proved it) is the precedent for the plan below.
+
+**PLAN OF RECORD — freeze-and-instrument (supersedes "cutover steps 5-10
+next"):**
+1. FREEZE RoomText investment: no cutover steps 5-10, no graduations (#8,
+   #13, #14 blocked) until conflict data exists. Do NOT delete the engine:
+   its value is the living verification harness (discipline tests, blast
+   suites, 6 audited experiments); "git preserves it" loses exactly that.
+2. INSTRUMENT the live path: count web 412 conflicts, MCP/shared CAS
+   failures, and shell-vs-web same-file collision windows, per room per day.
+3. PRE-REGISTER the promote/freeze thresholds BEFORE reading the data (the
+   lab's own lesson: pin the frame first), then let 2-4 weeks of metrics
+   decide: real concurrent-edit conflicts → promote via the existing 10-step
+   sequence; near-zero → engine stays frozen, revisit quarterly.
+Corrections absorbed: the 2026-07-16 "outbox is in-memory" ledger line is
+now stale — task #11 shipped config.persist; the outbox IS reload-durable in
+this tree (verifier-confirmed). Open product calls (user's): draft relay
+frames stream up to 256KB full-document buffers through RoomHub
+(src/index.ts:184) powering live share-page viewing — keep, shrink to
+diffs, or drop; and whether collaborative editing stays on the roadmap.
+
 ## 2026-07-17 — CS-structures lab: 6 pre-registered experiments, 6 independent audits, all verified
 
 Swarm (13 agents): each lane isolated in its own worktree + port range with a
@@ -141,6 +195,9 @@ production cutover explicitly NOT approved. Four reported claims corrected
   `vitest run --dir src` + vitest.config.ts scopes/excludes worktrees.
 - Client outbox is IN-MEMORY (reconnect-resilient, NOT reload-durable).
   Calling it "durable" was wrong; localStorage persistence is spec, not built.
+  [UPDATE 2026-07-17: built — task #11 added config.persist serialization on
+  every outbox mutation + constructor rehydration with ORIGINAL request
+  tokens. Reload-durable in this tree; the line above records the 07-16 state.]
 - "8/9 complete" overstated Task 8: digest gives O(changed) RESPONSE but
   O(all files) COMPUTATION per accepted update, and removals are unsupported.
   Task 8 acceptance scope reopened.
@@ -243,6 +300,10 @@ cannot be observed behind a real network, and ours stays small and speaks
 filesystem" now has a predicted-then-measured null result behind it.
 
 ## 2026-07-16 — Cutover A/B: the deciding experiment (rule PASSED)
+
+**[RETRACTED as cutover evidence 2026-07-19 — see that entry. Path A modeled
+the pre-a8d515e client (700ms autosave, conflict = load-theirs); the client
+shipped 2026-07-15 preserves the draft on 412 at 1500ms. Kept for the record.]**
 
 The scenario that breaks production (agent whole-file write while a human
 types, 60 keystrokes, agent at #30) run on both paths with identical 25ms
