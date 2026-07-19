@@ -325,6 +325,19 @@ export type AdvanceFloorResult =
     }
   | RoomTextFailure;
 
+/**
+ * One durable dirty-set entry: a head mutation the flush janitor has not yet
+ * published. The SET (one row per file) replaces the lab's scalar
+ * "latest-dirty" pointer, which dropped every sibling file marked in the
+ * same window.
+ */
+export type RoomTextDirtyEntry = {
+  fileId: string;
+  epoch: number;
+  revision: number;
+  markedAt: number;
+};
+
 /** One file's digest index entry, as reported to hosts. */
 export type RoomTextFileDigest = {
   fileId: string;
@@ -490,6 +503,7 @@ export class RoomTextStore {
           snapshotBlobWrites++;
           snapshotBlobBytes += source.byteLength;
           this.writeDigest(fileId, path, contentHash, source.byteLength, 0, now);
+          this.markDirty(fileId, 1, 0);
         });
       } catch (error) {
         if (isSqlConstraint(error)) return { ok: false, error: "ALREADY_EXISTS" };
@@ -706,6 +720,7 @@ export class RoomTextStore {
         // Fresh accept only (replays returned above): the digest index and
         // root log move in the same transaction as the update they describe.
         this.writeDigest(normalized.fileId, row.path, contentHash, applied.byteLength, revision, now);
+        this.markDirty(normalized.fileId, row.epoch, revision);
       });
 
       // Storage is authoritative. Only publish the new immutable cache root
@@ -959,6 +974,7 @@ export class RoomTextStore {
       normalized.fileId, row.epoch, normalized.baseRevision, revision, now,
     );
     this.writeDigest(normalized.fileId, row.path, staged.contentHash, applied.byteLength, revision, now);
+    this.markDirty(normalized.fileId, row.epoch, revision);
     deferred.set(normalized.fileId, {
       fileId: normalized.fileId,
       path: row.path,
@@ -1381,6 +1397,49 @@ export class RoomTextStore {
     }
   }
 
+  /**
+   * Oldest-marked dirty files, up to `limit`. The dirty set is the flush
+   * janitor's durable work queue: rows are upserted inside the SAME
+   * synchronous transaction as the head mutation they describe (createText /
+   * pushText / pushTextBatch), so a crash can never lose a mark and no file
+   * can shadow another's pending flush.
+   */
+  dirtyFiles(limit: number): RoomTextDirtyEntry[] {
+    const capped = Number.isSafeInteger(limit) && limit > 0 ? limit : 1;
+    return this.storage.sql.exec<{ file_id: string; epoch: number; revision: number; marked_at: number }>(
+      `SELECT file_id, epoch, revision, marked_at
+         FROM room_text_dirty
+        ORDER BY marked_at ASC
+        LIMIT ?`,
+      capped,
+    ).toArray().map((row) => ({
+      fileId: row.file_id,
+      epoch: row.epoch,
+      revision: row.revision,
+      markedAt: row.marked_at,
+    }));
+  }
+
+  /**
+   * Retire a dirty mark ONLY up to the published revision: a mark minted by
+   * a newer head mutation (row revision > publishedRevision) must survive a
+   * flush of the older state, or an edit landing mid-flush would silently
+   * never publish. Returns the number of rows cleared (0 or 1).
+   */
+  clearDirty(fileIdInput: string, publishedRevision: number): number {
+    let fileId: string;
+    try {
+      fileId = validateKey(fileIdInput, "fileId");
+    } catch {
+      return 0;
+    }
+    if (!Number.isSafeInteger(publishedRevision) || publishedRevision < 0) return 0;
+    return this.storage.sql.exec(
+      "DELETE FROM room_text_dirty WHERE file_id = ? AND revision <= ?",
+      fileId, publishedRevision,
+    ).rowsWritten;
+  }
+
   /** The maintained digest row for one file; never recomputed on read. */
   digestOf(fileIdInput: string): FileDigestResult {
     try {
@@ -1575,6 +1634,14 @@ export class RoomTextStore {
         CHECK (epoch >= 1),
         CHECK (revision >= 0),
         CHECK (content_utf16_length >= 0)
+      );
+      CREATE TABLE IF NOT EXISTS room_text_dirty (
+        file_id TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        marked_at INTEGER NOT NULL,
+        CHECK (epoch >= 1),
+        CHECK (revision >= 0)
       );
     `);
     // Seed the pre-mutation root so a client that synced the empty room
@@ -1805,6 +1872,29 @@ export class RoomTextStore {
       `DELETE FROM room_text_digest_log
         WHERE seq NOT IN (SELECT seq FROM room_text_digest_log ORDER BY seq DESC LIMIT ?)`,
       MAX_DIGEST_LOG_ROOTS,
+    );
+  }
+
+  /**
+   * Upsert the durable dirty mark for one accepted head mutation. Runs inside
+   * the caller's transactionSync (createText / pushText / pushOneDeferred),
+   * always AFTER writeDigest so marked_at can reuse the digest-log sequence
+   * this same transaction just minted — a monotonic, wall-clock-free ordering
+   * (no Date.now on this path). A re-mark keeps its original marked_at so the
+   * janitor drains FIFO-fairly, while epoch/revision advance to the newest
+   * unpublished state.
+   */
+  private markDirty(fileId: string, epoch: number, revision: number): void {
+    const markedAt = this.storage.sql.exec<{ seq: number | null }>(
+      "SELECT MAX(seq) AS seq FROM room_text_digest_log",
+    ).one().seq ?? 0;
+    this.storage.sql.exec(
+      `INSERT INTO room_text_dirty (file_id, epoch, revision, marked_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(file_id) DO UPDATE SET
+         epoch = excluded.epoch,
+         revision = excluded.revision`,
+      fileId, epoch, revision, markedAt,
     );
   }
 
