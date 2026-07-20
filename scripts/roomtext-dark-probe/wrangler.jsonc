@@ -1,0 +1,20 @@
+// Dark-mount validation probe: binds the REAL RoomHub class (imported from
+// src/index.ts) with a local R2 simulation, so the RoomText mount + shadow
+// janitor run in real workerd. Local validation only — never deployed.
+{
+  "name": "bashroom-roomtext-dark-probe",
+  "main": "worker.ts",
+  "compatibility_date": "2026-04-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "ROOM_HUBS", "class_name": "RoomHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RoomHub"] }],
+  "r2_buckets": [{ "binding": "ROOMS_R2", "bucket_name": "bashroom-dark-probe" }],
+  // src/index.ts bundles SKILL.md (Text) and og.png (Data); the probe must
+  // carry the same import rules or bundling the re-export fails.
+  "rules": [
+    { "type": "Text", "globs": ["**/*.md"], "fallthrough": true },
+    { "type": "Data", "globs": ["**/*.png"], "fallthrough": true }
+  ]
+}
