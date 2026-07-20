@@ -1440,6 +1440,26 @@ export class RoomTextStore {
     ).rowsWritten;
   }
 
+  /**
+   * Send a failing file to the BACK of the drain FIFO. Without this, a
+   * window of persistently-failing rows (oldest marked_at first) would
+   * monopolize every drain and starve the files behind them.
+   */
+  deferDirty(fileIdInput: string): void {
+    let fileId: string;
+    try {
+      fileId = validateKey(fileIdInput, "fileId");
+    } catch {
+      return;
+    }
+    this.storage.sql.exec(
+      `UPDATE room_text_dirty
+          SET marked_at = (SELECT COALESCE(MAX(marked_at), 0) + 1 FROM room_text_dirty)
+        WHERE file_id = ?`,
+      fileId,
+    );
+  }
+
   /** The maintained digest row for one file; never recomputed on read. */
   digestOf(fileIdInput: string): FileDigestResult {
     try {

@@ -81,6 +81,13 @@ export default {
         }
         return json({ ok: true, room, files });
       }
+      if (url.pathname === "/shadow-head") {
+        const object = await env.ROOMS_R2.get(
+          `roomtext-shadow/users/${USER}/${room}/.history/${url.searchParams.get("path") || ""}/HEAD`,
+        );
+        if (!object) return json({ ok: false, error: "no_shadow_head" }, 404);
+        return json({ ok: true, manifest: JSON.parse(await object.text()) });
+      }
       if (url.pathname === "/r2-list") {
         const listed = await env.ROOMS_R2.list({ prefix: url.searchParams.get("prefix") || "", limit: 500 });
         return json({ ok: true, keys: listed.objects.map((o) => ({ key: o.key, etag: o.etag })) });

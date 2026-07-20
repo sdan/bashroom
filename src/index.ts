@@ -2343,7 +2343,9 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       if (file.is_binary) return json({ ok: false, error: "binary_unsupported" }, 422);
       const stub = env.ROOM_HUBS.get(env.ROOM_HUBS.idFromName(`${userId}:${room}`));
       const promoted = await stub.rtPromote({ userId, room, path, content: file.content, sourceEtag: file.etag || "" });
-      return json(promoted, promoted.ok ? 200 : 409);
+      // 409 is reserved for the idempotent-conflict case; validation
+      // failures (bad path, oversized) are the caller's 422 to fix.
+      return json(promoted, promoted.ok ? 200 : promoted.error === "ALREADY_EXISTS" ? 409 : 422);
     }
     if (url.pathname === "/web/api/roomtext/parity" && request.method === "GET") {
       const token = bearerToken(request);

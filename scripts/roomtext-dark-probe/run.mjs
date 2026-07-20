@@ -8,7 +8,10 @@ import WebSocket from "ws";
 
 const PORT = Number(process.env.PORT) || 8865;
 const BASE = `http://127.0.0.1:${PORT}`;
-const ROOM = "dark";
+// Fresh room per run: wrangler dev persists local DO + R2 state across
+// boots, so a fixed room name would find files already promoted/edited.
+// A unique room gives every run an empty DO and empty R2 prefix.
+const ROOM = `dark-${process.pid}-${Date.now().toString(36)}`;
 const results = { phases: [], failures: [] };
 
 function phase(name, ok, detail) {
@@ -75,7 +78,8 @@ try {
     const r = await post("/seed", { room: ROOM, path: f.path, content: f.content });
     seededEtags.set(f.path, r.etag);
   }
-  const before = await get("/r2-list?prefix=users/");
+  const usersPrefix = `users/darkuser/${ROOM}/`;
+  const before = await get(`/r2-list?prefix=${usersPrefix}`);
   phase("seed: 4 production-shaped keys", before.keys.length === FILES.length, { keys: before.keys.length });
 
   // B. promote each file; re-promote must be refused, not clobbered
@@ -96,8 +100,8 @@ try {
 
   // D. flush: shadow keys appear; production keys byte-for-byte untouched
   const flush1 = await post("/flush", { room: ROOM });
-  const shadow = await get("/r2-list?prefix=roomtext-shadow/");
-  const afterSeed = await get("/r2-list?prefix=users/");
+  const shadow = await get(`/r2-list?prefix=roomtext-shadow/users/darkuser/${ROOM}/`);
+  const afterSeed = await get(`/r2-list?prefix=${usersPrefix}`);
   const etagsUntouched = afterSeed.keys.length === FILES.length && afterSeed.keys.every((k) => [...seededEtags.values()].includes(k.etag));
   phase("flush: publishes to shadow prefix", shadow.keys.length >= FILES.length * 2, { shadowKeys: shadow.keys.length, flush: flush1.flushed });
   phase("flush: production users/ keys untouched", etagsUntouched, { keys: afterSeed.keys.length });
@@ -143,16 +147,46 @@ try {
 
   editor.ws.close(); watcher.ws.close(); viewer.ws.close();
 
+  // E2. prefix-scoped EDIT socket (edit-role share): can write inside its
+  // prefix, must be fenced out of the rest of the room — the write-side
+  // fence the adversarial review found missing. No prior connect needed for
+  // a push, so this is exactly the capability-escape attack.
+  const eve = wsClient("viewer=eve&readonly=0&prefix=notes");
+  await eve.open();
+  await eve.next((f) => f.type === "hello");
+  eve.send({ type: "push", pushes: [{ protocol: 1, fileId: "index.md", epoch: hydA.epoch, baseRevision: ack.revision, clientId: "eve", requestId: "e1", changes: [{ from: 0, to: 0, insert: "ESCAPED" }] }] });
+  const fenced = await eve.next((f) => f.type === "discard");
+  phase("prefix fence: out-of-prefix push refused (no oracle)", fenced.code === "NOT_FOUND" && fenced.retryable === false, fenced);
+  eve.send({ type: "push", pushes: [{ protocol: 1, fileId: "notes/crlf.md", epoch: 1, baseRevision: 0, clientId: "eve", requestId: "e2", changes: [{ from: 0, to: 0, insert: "in-prefix: " }] }] });
+  const inPrefix = await eve.next((f) => f.type === "ack");
+  phase("prefix fence: in-prefix push commits", inPrefix.status === "commit" && inPrefix.revision === 1, inPrefix);
+  eve.ws.close();
+
   // F. flush after edit: hot diverges from source (expected in dark mode),
   // production keys STILL untouched, shadow HEAD advances
   await post("/flush", { room: ROOM });
   const parity2 = await get(`/parity?room=${ROOM}`);
   const indexRow = parity2.files.find((f) => f.path === "index.md");
-  const othersStillMatch = parity2.files.filter((f) => f.path !== "index.md").every((f) => f.match);
+  // index.md (alice) and notes/crlf.md (eve) were both edited; the other
+  // two were never touched and must still match their R2 source exactly.
+  const editedPaths = new Set(["index.md", "notes/crlf.md"]);
+  const untouchedStillMatch = parity2.files.filter((f) => !editedPaths.has(f.path)).every((f) => f.match);
   phase("after edit: hot head diverged, source etag unmoved (dark)", indexRow && !indexRow.match && !indexRow.etag_moved && indexRow.revision === ack.revision, { revision: indexRow?.revision });
-  phase("after edit: untouched files still 100% match", othersStillMatch, {});
-  const finalUsers = await get("/r2-list?prefix=users/");
-  phase("final: production keys byte-for-byte untouched", finalUsers.keys.every((k) => [...seededEtags.values()].includes(k.etag)), {});
+  phase("after edit: untouched files still 100% match", untouchedStillMatch, {});
+  const finalUsers = await get(`/r2-list?prefix=${usersPrefix}`);
+  phase("final: production keys byte-for-byte untouched", finalUsers.keys.length === FILES.length && finalUsers.keys.every((k) => [...seededEtags.values()].includes(k.etag)), { keys: finalUsers.keys.length });
+
+  // G. the janitor RETIRES its work — the phase that would have caught the
+  // infinite-loop bug: after a full drain, the shadow HEAD must sit at the
+  // edited head revision, the dirty set must be EMPTY, and a further flush
+  // must be a no-op. (Pre-fix: artifact exported at snapshot_revision 0,
+  // clearDirty(0) retired nothing, alarm re-fired every 2s forever.)
+  const head = await get(`/shadow-head?room=${ROOM}&path=index.md`);
+  phase("janitor: shadow HEAD advanced to edited revision", head.ok && head.manifest.revision === ack.revision, head.manifest);
+  const drain2 = await post("/flush", { room: ROOM });
+  phase("janitor: dirty set fully retired (no loop)", drain2.remaining === 0 && drain2.results.length === 0, drain2);
+  const parity3 = await get(`/parity?room=${ROOM}`);
+  phase("janitor: no file left dirty after drain", parity3.files.every((f) => f.dirty === false), parity3.files.map((f) => ({ path: f.path, dirty: f.dirty })));
 
   console.log("\n=== SUMMARY ===");
   console.log(JSON.stringify({ passed: results.phases.filter((p) => p.ok).length, failed: results.failures.length, failures: results.failures }, null, 2));

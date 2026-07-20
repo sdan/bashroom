@@ -11,6 +11,7 @@
 // waking the DO — the JSON ping MUST wake us and be answered here, because
 // that wake is the client's intentional liveness probe of the engine.
 import {
+  ROOM_TEXT_PROTOCOL,
   RoomTextStore,
   decideRoomTextPublication,
   isRetryableRoomTextFailure,
@@ -32,6 +33,9 @@ import type {
 // are deliberately unbounded (snapshot hydration carries up to ~1MB of
 // document); the hub's guard is inbound-only.
 export const ROOM_TEXT_INBOUND_FRAME_MAX_CHARS = 1_200_000;
+
+/** Max pushes handled per inbound frame; the real client sends one. */
+export const ROOM_TEXT_MAX_PUSHES_PER_FRAME = 64;
 
 const ROOM_TEXT_FRAME_TYPES: ReadonlySet<string> = new Set(["connect", "push", "ping"]);
 
@@ -87,7 +91,11 @@ export class RoomHubText {
       return;
     }
     if (frame.type === "push") {
-      const pushes = Array.isArray(frame.pushes) ? frame.pushes : [];
+      // Cap the batch: without it a single 1.2MB frame of ~600k minimal
+      // elements would cost one reply frame per element (~60x outbound
+      // amplification), reachable even from a view-slug socket via the
+      // readonly-rejection loop. The real client sends one push at a time.
+      const pushes = Array.isArray(frame.pushes) ? frame.pushes.slice(0, ROOM_TEXT_MAX_PUSHES_PER_FRAME) : [];
       if (pushes.length > 0 && this.handlePushes(ws, pushes)) {
         // Fresh commits marked files dirty; make sure a flush is scheduled.
         // Arming is idempotent (no-op when an alarm is already pending).
@@ -125,7 +133,7 @@ export class RoomHubText {
         this.send(ws, {
           type: "incompatible",
           connectRequestId,
-          serverProtocol: 1,
+          serverProtocol: ROOM_TEXT_PROTOCOL,
           ...(result.message ? { message: result.message } : {}),
         });
         return;
@@ -188,6 +196,15 @@ export class RoomHubText {
     for (const push of pushes) {
       const token = tokenFor(push);
       const before = texts.openText(push ? String(push.fileId ?? "") : "");
+      // Prefix fence on the WRITE side, symmetric with the connect fence: a
+      // push needs no prior connect, so without this an edit-role share
+      // scoped to docs/ could commit to any promoted file in the room by
+      // guessing its path (adversarial-review finding). Same NOT_FOUND as
+      // the read fence — no existence oracle either way.
+      if (before.ok && !this.pathVisible(before.path, String(attachment.prefix || ""))) {
+        this.send(ws, { type: "discard", updateToken: token, code: "NOT_FOUND", retryable: false });
+        continue;
+      }
       const headBefore = before.ok ? before.revision : -1;
       const result = texts.pushText(push);
       if (!result.ok) {
@@ -336,14 +353,34 @@ export class RoomHubText {
     const texts = this.texts();
     const entries = texts.dirtyFiles(limit);
     const results: RoomTextJanitorFileResult[] = [];
-    for (const entry of entries) results.push(await this.flushOne(meta, entry.fileId));
+    for (const entry of entries) {
+      const result = await this.flushOne(meta, entry.fileId);
+      // A failing file goes to the BACK of the FIFO so 8 poison rows can
+      // never monopolize the drain window and starve siblings.
+      if (!result.ok) texts.deferDirty(entry.fileId);
+      results.push(result);
+    }
     const remaining = texts.dirtyFiles(1).length;
-    if (remaining > 0) await this.armJanitor();
+    if (remaining > 0) {
+      // Backoff when the whole window failed: a persistent per-file error
+      // (HEAD_UNREADABLE, CAS storms) must not burn an alarm + 2 R2 ops
+      // every 2s indefinitely.
+      const allFailed = results.length > 0 && results.every((r) => !r.ok);
+      await this.armJanitor(allFailed ? 30_000 : 2_000);
+    }
     return { ok: true, flushed: results.filter((r) => r.ok).length, remaining, results };
   }
 
   private async flushOne(meta: { userId: string; room: string }, fileId: string): Promise<RoomTextJanitorFileResult> {
     const texts = this.texts();
+    // Checkpoint FIRST: exportVersionArtifact publishes at snapshot_revision,
+    // but pushes only checkpoint every 128 updates / 256KB of tail — without
+    // this, an ordinary edit leaves the artifact at an older revision, the
+    // dirty mark (minted at HEAD revision) never clears, and the alarm
+    // re-fires at a fixed 2s forever republishing the same stale state
+    // (found by adversarial review, reproduced against the real store).
+    const checkpointed = texts.checkpointText(fileId);
+    if (!checkpointed.ok) return { fileId, ok: false, error: checkpointed.error };
     const compacted = texts.compactHistory(fileId);
     if (!compacted.ok) return { fileId, ok: false, error: compacted.error };
     const artifact = texts.exportVersionArtifact(fileId);
