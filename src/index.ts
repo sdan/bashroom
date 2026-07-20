@@ -19,6 +19,13 @@ import { webDeviceHtml, webDeviceResultHtml } from "./web-device";
 import { decodeWriteContent, isSafeOAuthRedirectUri, type WriteEncoding } from "./security";
 import { DocumentCollab, parseShareRole, type ShareRole } from "./document-collab";
 import { webCollaborativeShareHtml } from "./web-collab";
+import {
+  RoomHubText,
+  ROOM_TEXT_INBOUND_FRAME_MAX_CHARS,
+  isRoomTextClientFrameType,
+  type RoomTextPromoteInput,
+} from "./room-hub-text";
+import type { RoomTextClientFrame } from "./room-text-client";
 
 export { ContainerProxy } from "@cloudflare/sandbox";
 export { DocumentCollab };
@@ -80,6 +87,11 @@ const ANON_ANIMALS = [
 ];
 
 export class RoomHub extends DurableObject<Env> {
+  // RoomText engine host — DARK: created lazily on the first RoomText frame
+  // or RPC, so presence-only rooms never pay for the engine's tables, and
+  // sockets that never speak RoomText see byte-identical hub behavior.
+  private rtHost: RoomHubText | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -166,9 +178,18 @@ export class RoomHub extends DurableObject<Env> {
   // oversized frames are dropped. (Keepalive pings are answered by the
   // auto-response pair without reaching this handler.)
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
-    if (typeof message !== "string" || message.length > 300_000) return;
+    // RoomText frames get a dedicated (larger) inbound bound BEFORE the
+    // generic 300k drop: JSON escaping of a legal 262KB insert can exceed
+    // 300k, and a silent drop would wedge the client outbox in permanent
+    // retry. Non-RoomText traffic keeps the original 300k rule exactly.
+    if (typeof message !== "string" || message.length > ROOM_TEXT_INBOUND_FRAME_MAX_CHARS) return;
     let frame: { type?: string; path?: unknown; caret?: unknown; content?: unknown };
     try { frame = JSON.parse(message); } catch (_) { return; }
+    if (frame && isRoomTextClientFrameType(frame.type)) {
+      await this.rt().handleFrame(ws, frame as unknown as RoomTextClientFrame);
+      return;
+    }
+    if (message.length > 300_000) return;
     if (!frame || frame.type !== "draft" || typeof frame.path !== "string") return;
     const attachment = (ws.deserializeAttachment() || {}) as { viewer?: string; since?: number; lastDraft?: number; prefix?: string; readonly?: boolean };
     if (attachment.readonly) return; // share viewers watch; they don't write
@@ -240,6 +261,28 @@ export class RoomHub extends DurableObject<Env> {
   private broadcastViewers(exclude?: WebSocket): void {
     const viewers = this.ctx.getWebSockets().filter((ws) => ws !== exclude).length;
     this.broadcast({ type: "viewers", viewers, roster: this.roster(exclude) }, exclude);
+  }
+
+  // ─── RoomText dark mount ────────────────────────────────────────────────
+  private rt(): RoomHubText {
+    if (!this.rtHost) {
+      this.rtHost = new RoomHubText(this.ctx, this.env.ROOMS_R2, (path, prefix) => this.pathVisible(path, prefix));
+    }
+    return this.rtHost;
+  }
+
+  // RPC from the Worker's authenticated /web/api/roomtext/* routes (write-
+  // scope room membership checked Worker-side; the hub trusts its caller,
+  // same contract as hubPoke). None of these are reachable from a socket.
+  async rtPromote(input: RoomTextPromoteInput) { return this.rt().promote(input); }
+  async rtParity() { return this.rt().parity(); }
+  async rtFlush() { return this.rt().janitorDrain(); }
+
+  // RoomHub's first alarm — the shadow flush janitor. Idle-stopping by
+  // construction: it only ever re-arms while dirty rows remain, so a quiet
+  // room returns to the timer-free hibernation profile the header describes.
+  async alarm(): Promise<void> {
+    await this.rt().janitorDrain();
   }
 }
 
@@ -2275,6 +2318,82 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     // ─── Public shares ────────────────────────────────────────────────────
     // POST mints (or returns the existing) share link for a page or
     // directory prefix; GET lists the caller's shares; DELETE revokes one.
+    // ─── RoomText dark-mount validation surface ─────────────────────────
+    // Promote copies an R2 file into the room's hot store (shadow — R2 stays
+    // the production authority; the janitor publishes only to
+    // roomtext-shadow/ keys). Parity returns the hot heads' hashes so the
+    // caller can byte-compare against R2. Flush forces a janitor drain so
+    // validation is deterministic. All three require write-scope room
+    // membership — this is an operator surface, inert unless called.
+    if (url.pathname === "/web/api/roomtext/promote" && request.method === "POST") {
+      const token = bearerToken(request);
+      const input = await readJson(request);
+      const room = parseOptionalWiki(String(input.room || ""));
+      const path = String(input.path || "");
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      if (!path) return json({ ok: false, error: "path_required" }, 400);
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.roomtext.promote", includeRooms: true });
+      if (account.ok === false) return json({ ok: false, error: account.error || "unauthorized" }, 401);
+      const userId = String(account.user_id || "");
+      const membership = (account.rooms || []).find((row) => row.room === room);
+      if (!userId || !membership) return json({ ok: false, error: "forbidden" }, 403);
+      if (!membership.scopes.includes("write")) return json({ ok: false, error: "read_only" }, 403);
+      const file = await r2File(env, userId, room, path);
+      if (!file) return json({ ok: false, error: "not_found" }, 404);
+      if (file.is_binary) return json({ ok: false, error: "binary_unsupported" }, 422);
+      const stub = env.ROOM_HUBS.get(env.ROOM_HUBS.idFromName(`${userId}:${room}`));
+      const promoted = await stub.rtPromote({ userId, room, path, content: file.content, sourceEtag: file.etag || "" });
+      return json(promoted, promoted.ok ? 200 : 409);
+    }
+    if (url.pathname === "/web/api/roomtext/parity" && request.method === "GET") {
+      const token = bearerToken(request);
+      const room = parseOptionalWiki(String(url.searchParams.get("room") || ""));
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.roomtext.parity", includeRooms: true });
+      if (account.ok === false) return json({ ok: false, error: account.error || "unauthorized" }, 401);
+      const userId = String(account.user_id || "");
+      const membership = (account.rooms || []).find((row) => row.room === room);
+      if (!userId || !membership) return json({ ok: false, error: "forbidden" }, 403);
+      if (!membership.scopes.includes("write")) return json({ ok: false, error: "read_only" }, 403);
+      const stub = env.ROOM_HUBS.get(env.ROOM_HUBS.idFromName(`${userId}:${room}`));
+      const report = await stub.rtParity();
+      // The R2 side of the comparison, computed here so the response says
+      // MATCH/MISMATCH outright instead of handing the caller two hashes.
+      const encoder = new TextEncoder();
+      const files = [];
+      for (const row of report.files) {
+        if (!row.ok) { files.push(row); continue; }
+        const current = await r2File(env, userId, room, row.path);
+        let r2Sha = "";
+        if (current && !current.is_binary) {
+          const digest = await crypto.subtle.digest("SHA-256", encoder.encode(current.content));
+          r2Sha = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+        }
+        files.push({
+          ...row,
+          r2_sha256: r2Sha,
+          r2_etag: current ? current.etag : null,
+          match: Boolean(r2Sha) && r2Sha === row.sha256,
+          etag_moved: Boolean(current && current.etag !== row.sourceEtag),
+        });
+      }
+      return json({ ok: true, room, files });
+    }
+    if (url.pathname === "/web/api/roomtext/flush" && request.method === "POST") {
+      const token = bearerToken(request);
+      const input = await readJson(request);
+      const room = parseOptionalWiki(String(input.room || ""));
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      const account = await authorizeAccount(env, token, clientIp(request), { route: "web.roomtext.flush", includeRooms: true });
+      if (account.ok === false) return json({ ok: false, error: account.error || "unauthorized" }, 401);
+      const userId = String(account.user_id || "");
+      const membership = (account.rooms || []).find((row) => row.room === room);
+      if (!userId || !membership) return json({ ok: false, error: "forbidden" }, 403);
+      if (!membership.scopes.includes("write")) return json({ ok: false, error: "read_only" }, 403);
+      const stub = env.ROOM_HUBS.get(env.ROOM_HUBS.idFromName(`${userId}:${room}`));
+      return json(await stub.rtFlush());
+    }
+
     if (url.pathname === "/web/api/share" && request.method === "POST") {
       const input = await readJson(request);
       const room = parseOptionalWiki(String(input.room || ""));
