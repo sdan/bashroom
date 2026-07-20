@@ -5,6 +5,48 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-20 — Dark mount lands: RoomText inside RoomHub, 16/16 in real workerd
+
+User decision (2026-07-19) superseded the freeze: port + migrate + validate.
+Landed, in order, all local (nothing pushed, nothing deployed, R2 remains
+production authority):
+
+- 7289a5b / bf70ab8 — graduated the lab's monotonic publication guard and
+  group-commit into the store (cold three-way review: CLEAN; the batch's
+  deferred head finalize shares its transactionSync, so the janitor can
+  never publish an intermediate in-batch revision). Gate 87/87.
+- aff54c2 — durable dirty-set (room_text_dirty upserted in the SAME
+  transaction as every head mutation; clearDirty keeps marks newer than the
+  published revision). Closes the lab's scalar-target bug that dropped 2/3
+  dirty files. 94/94.
+- 9b21c46 — the mount: RoomHubText host module inside the existing RoomHub
+  DO (no new DO class, no migration — additive SQL in an existing
+  new_sqlite_classes class). Dark constraints enforced by shape: pushes
+  accepted only from readonly===false sockets; hydration/updates ride the
+  hub's prefix-visibility fence; RoomText frames get a 1.2M inbound bound
+  ahead of the generic 300k drop (JSON escaping of a legal 262KB insert
+  exceeds 300k — a silent drop would wedge the outbox); JSON {type:"ping"}
+  answered at app level, distinct from the raw-string auto-response
+  keepalive; roomTextShadowKey bakes in the roomtext-shadow/ literal so a
+  production users/ key is structurally unreachable from janitor writes (R2
+  keys are flat — hostile ../ cannot escape; tested). RoomHub's first
+  alarm: idle-stopping shadow janitor running the lab pipeline (compact ->
+  create-only artifact via If-None-Match Headers form -> publication
+  decision -> HEAD etag-CAS -> advance floor -> clearDirty at published
+  revision). Operator routes /web/api/roomtext/{promote,parity,flush},
+  write-scope membership required. 99/99.
+- ae29d8e — validation harness (scripts/roomtext-dark-probe/): binds the
+  REAL RoomHub with local R2 and ran the whole story: promote 4/4, parity
+  100% byte match (emoji/ZWJ, CJK, CRLF, 484KB), flush -> shadow HEADs
+  only, live WS edit with echo-as-ack + broadcast + idempotent replay +
+  readonly refusal, and production keys etag-verified untouched twice.
+  **16/16 PASS.**
+
+Remaining before "migrated OUR data": run promote/parity against real room
+contents (pull via authenticated export into local dev, or deploy dark to
+prod — the latter is the user's call). Production authority flip stays a
+separate explicitly-approved step.
+
 ## 2026-07-19 — A/B retraction, Linear mapping, plan of record: freeze-and-instrument
 
 Three things landed together and set the plan of record.
