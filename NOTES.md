@@ -42,6 +42,19 @@ production authority):
   readonly refusal, and production keys etag-verified untouched twice.
   **16/16 PASS.**
 
+- 2b8b95b — adversarial review of the mount found TWO high-confidence bugs,
+  both fixed: (1) an infinite flush loop — flushOne exported at
+  snapshot_revision but ordinary pushes only checkpoint every 128 updates,
+  so clearDirty retired nothing and the 2s alarm re-fired forever
+  republishing stale state (checkpointText, which had zero callers, was the
+  missing step; now called first in flushOne). (2) push-path prefix escape —
+  handlePushes gated on readonly but not pathVisible, so an edit-scoped
+  share could commit outside its prefix (symmetric NOT_FOUND fence added).
+  Plus janitor backoff + deferDirty FIFO fairness, a 64-push/frame cap, and
+  the promote 422/409 split. Harness gained the loop-catching phase; now
+  21/21. The 16/16 harness had MISSED the loop because it only checked flush
+  success, never that the dirty row actually cleared — lesson recorded.
+
 Remaining before "migrated OUR data": run promote/parity against real room
 contents (pull via authenticated export into local dev, or deploy dark to
 prod — the latter is the user's call). Production authority flip stays a
