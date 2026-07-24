@@ -15,10 +15,13 @@ import {
   RoomTextStore,
   decideRoomTextPublication,
   isRetryableRoomTextFailure,
+  type OpenRoomTextResult,
   type PushRoomTextInput,
+  type PushRoomTextSuccess,
   type RoomTextFailure,
+  type RoomTextMirrorState,
 } from "./room-text-store";
-import { roomTextUpdateToken } from "./room-text";
+import { decodeRoomText, roomTextUpdateToken, type RoomTextAnchor } from "./room-text";
 import type {
   RoomTextBroadcastUpdate,
   RoomTextClientFrame,
@@ -32,10 +35,19 @@ import type {
 // same frame forever and never hears an ack or a discard. OUTBOUND frames
 // are deliberately unbounded (snapshot hydration carries up to ~1MB of
 // document); the hub's guard is inbound-only.
-export const ROOM_TEXT_INBOUND_FRAME_MAX_CHARS = 1_200_000;
+// Worst case JSON expands each one-byte control character to six characters
+// (`\u0001`). Add room for 1,000 range envelopes and identity fields so every
+// update accepted by ROOM_TEXT_MAX_INSERT_BYTES can actually reach the store.
+export const ROOM_TEXT_INBOUND_FRAME_MAX_CHARS = 1_750_000;
 
 /** Max pushes handled per inbound frame; the real client sends one. */
 export const ROOM_TEXT_MAX_PUSHES_PER_FRAME = 64;
+
+const PRIMARY_AUTHORITY = "roomtext-v1";
+const PRIMARY_META_AUTHORITY = "br-authority";
+const PRIMARY_META_EPOCH = "br-epoch";
+const PRIMARY_META_REVISION = "br-revision";
+const PRIMARY_META_SHA256 = "br-sha256";
 
 const ROOM_TEXT_FRAME_TYPES: ReadonlySet<string> = new Set(["connect", "push", "ping"]);
 
@@ -77,8 +89,302 @@ export class RoomHubText {
     return this.store;
   }
 
+  /**
+   * Claim one exact R2 object for RoomText without transforming its bytes.
+   * The same-byte conditional PUT is the migration fence: if R2 moved after
+   * the Worker read it, no SQLite state is created and the caller must retry
+   * from the new object. A crash after the PUT is recoverable because the R2
+   * metadata carries the claimed generation and hash.
+   */
+  async importPrimary(input: RoomTextPrimaryImportInput): Promise<RoomTextPrimaryResult> {
+    try {
+      if (!validStorageIdentity(input.userId) || !validStorageIdentity(input.room)
+        || !validPrimaryPath(input.path) || typeof input.sourceEtag !== "string"
+        || !input.sourceEtag || !(input.bytes instanceof ArrayBuffer)) {
+        return { ok: false, error: "INVALID_REQUEST" };
+      }
+      const key = primaryKey(input.userId, input.room, input.path);
+      const source = new Uint8Array(input.bytes);
+      const current = await this.r2.head(key);
+      if (!current || current.etag !== input.sourceEtag || current.size !== source.byteLength) {
+        return { ok: false, error: "SOURCE_MOVED" };
+      }
+      const sha256 = await sha256Bytes(source);
+      const sourceText = decodePrimaryBytes(source);
+      const texts = this.texts();
+      let opened = texts.openText(input.path);
+      if (opened.ok) {
+        if (opened.epoch !== 1 || opened.revision !== 0 || opened.content !== sourceText) {
+          return {
+            ok: false,
+            error: "MIGRATION_CONFLICT",
+            message: "a different candidate document already occupies this path; neither copy was overwritten",
+          };
+        }
+      } else if (opened.error !== "NOT_FOUND") {
+        return primaryStoreFailure(opened);
+      }
+
+      const tagged = parsePrimaryMetadata(current.customMetadata);
+      let claimed = current;
+      if (tagged) {
+        if (tagged.epoch !== 1 || tagged.revision !== 0 || tagged.sha256 !== sha256) {
+          return { ok: false, error: "MIGRATION_CONFLICT", message: "R2 already carries a different RoomText generation" };
+        }
+      } else {
+        const wrote = await this.r2.put(key, source, {
+          onlyIf: { etagMatches: current.etag },
+          httpMetadata: current.httpMetadata,
+          customMetadata: {
+            ...(current.customMetadata || {}),
+            ...primaryMetadata(1, 0, sha256),
+          },
+        });
+        if (!wrote) return { ok: false, error: "SOURCE_MOVED" };
+        claimed = wrote;
+      }
+
+      if (!opened.ok && opened.error === "NOT_FOUND") {
+        opened = texts.createText({ fileId: input.path, path: input.path, bytes: source });
+      }
+      if (!opened.ok) return primaryStoreFailure(opened);
+      const mirrored = texts.setMirrorActive({
+        fileId: opened.fileId,
+        r2Etag: claimed.etag,
+        epoch: opened.epoch,
+        revision: opened.revision,
+        sha256,
+        updatedAt: claimed.uploaded.getTime(),
+      });
+      if (!mirrored.ok) return primaryStoreFailure(mirrored);
+      if (!mirrored.mirror) return { ok: false, error: "STORAGE_CORRUPT", message: "mirror row disappeared after attach" };
+      await this.ctx.storage.put("rt:room", { userId: input.userId, room: input.room });
+      await this.armJanitor();
+      return { ok: true, file: primaryFile(opened, mirrored.mirror) };
+    } catch (error) {
+      return { ok: false, error: "MIGRATION_FAILED", message: errorMessage(error) };
+    }
+  }
+
+  async openPrimary(input: RoomTextPrimaryOpenInput): Promise<RoomTextPrimaryResult> {
+    if (!validStorageIdentity(input.userId) || !validStorageIdentity(input.room)
+      || !validPrimaryPath(input.path)) {
+      return { ok: false, error: "INVALID_REQUEST" };
+    }
+    const texts = this.texts();
+    const opened = texts.openText(input.path);
+    if (!opened.ok) return opened.error === "NOT_FOUND"
+      ? { ok: false, error: "NOT_IMPORTED" }
+      : primaryStoreFailure(opened);
+    const mirrored = texts.mirrorState(opened.fileId);
+    if (!mirrored.ok) return primaryStoreFailure(mirrored);
+    if (!mirrored.mirror) return { ok: false, error: "NOT_IMPORTED" };
+    if (mirrored.mirror.status === "diverged") {
+      return {
+        ok: false,
+        error: "R2_DIVERGED",
+        message: "the R2 mirror changed outside RoomText; both copies were preserved and editing is disabled",
+      };
+    }
+    return this.publishPrimary(input.userId, input.room, opened.fileId);
+  }
+
+  async replacePrimary(input: RoomTextPrimaryReplaceInput): Promise<RoomTextPrimaryMutationResult> {
+    if (!input.intentHash || !input.clientId || !input.requestId || typeof input.content !== "string") {
+      return { ok: false, error: "INVALID_REQUEST" };
+    }
+    const texts = this.texts();
+    const replay = texts.replayIntent(input.clientId, input.requestId, input.intentHash);
+    if (replay) {
+      if (!replay.ok) return primaryStoreFailure(replay);
+      const projected = await this.publishPrimary(input.userId, input.room, replay.fileId);
+      return projected.ok
+        ? { ...projected, replayed: true, update: replay.update, anchors: replay.anchors }
+        : projected;
+    }
+    const current = await this.openPrimary(input);
+    if (!current.ok) return current;
+    const base = parseRoomTextVersionToken(input.baseVersion);
+    if (!base || base.epoch !== current.file.epoch || base.revision !== current.file.revision) {
+      return { ok: false, error: "CONFLICT", file: current.file };
+    }
+    if (input.content === current.file.content) return { ok: true, file: current.file, replayed: false };
+    const headBefore = current.file.revision;
+    const pushed = texts.pushText({
+      protocol: ROOM_TEXT_PROTOCOL,
+      fileId: current.file.fileId,
+      epoch: current.file.epoch,
+      baseRevision: current.file.revision,
+      clientId: input.clientId,
+      requestId: input.requestId,
+      intentHash: input.intentHash,
+      changes: [{ from: 0, to: current.file.content.length, insert: input.content }],
+      anchors: input.anchors,
+    });
+    if (!pushed.ok) return primaryStoreFailure(pushed);
+    if (pushed.revision > headBefore) this.broadcastPrimaryUpdate(pushed);
+    const projected = await this.publishPrimary(input.userId, input.room, pushed.fileId);
+    await this.armJanitor();
+    return projected.ok
+      ? { ...projected, replayed: pushed.revision <= headBefore, update: pushed.update, anchors: pushed.anchors }
+      : { ...projected, committed: true, revision: pushed.revision };
+  }
+
+  async editPrimary(input: RoomTextPrimaryEditInput): Promise<RoomTextPrimaryMutationResult> {
+    if (!input.intentHash || !input.clientId || !input.requestId || typeof input.oldText !== "string"
+      || !input.oldText || typeof input.newText !== "string") {
+      return { ok: false, error: "INVALID_REQUEST" };
+    }
+    const texts = this.texts();
+    const replay = texts.replayIntent(input.clientId, input.requestId, input.intentHash);
+    if (replay) {
+      if (!replay.ok) return primaryStoreFailure(replay);
+      const projected = await this.publishPrimary(input.userId, input.room, replay.fileId);
+      return projected.ok
+        ? { ...projected, replayed: true, update: replay.update, anchors: replay.anchors }
+        : projected;
+    }
+    const current = await this.openPrimary(input);
+    if (!current.ok) return current;
+    const matches = literalMatches(
+      current.file.content,
+      input.oldText,
+      input.before || "",
+      input.after || "",
+    );
+    if (matches.length === 0) return { ok: false, error: "TARGET_NOT_FOUND", file: current.file };
+    if (matches.length > 1) {
+      return { ok: false, error: "TARGET_AMBIGUOUS", matchCount: matches.length, file: current.file };
+    }
+    const from = matches[0];
+    const headBefore = current.file.revision;
+    const pushed = texts.pushText({
+      protocol: ROOM_TEXT_PROTOCOL,
+      fileId: current.file.fileId,
+      epoch: current.file.epoch,
+      baseRevision: current.file.revision,
+      clientId: input.clientId,
+      requestId: input.requestId,
+      intentHash: input.intentHash,
+      changes: [{ from, to: from + input.oldText.length, insert: input.newText }],
+      anchors: input.anchors,
+    });
+    if (!pushed.ok) return primaryStoreFailure(pushed);
+    if (pushed.revision > headBefore) this.broadcastPrimaryUpdate(pushed);
+    const projected = await this.publishPrimary(input.userId, input.room, pushed.fileId);
+    await this.armJanitor();
+    return projected.ok
+      ? {
+          ...projected,
+          replayed: pushed.revision <= headBefore,
+          matchedAt: from,
+          update: pushed.update,
+          anchors: pushed.anchors,
+        }
+      : { ...projected, committed: true, revision: pushed.revision };
+  }
+
+  private async publishPrimary(userId: string, room: string, fileId: string): Promise<RoomTextPrimaryResult> {
+    const texts = this.texts();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const opened = texts.openText(fileId);
+      if (!opened.ok) return primaryStoreFailure(opened);
+      const mirrorResult = texts.mirrorState(fileId);
+      if (!mirrorResult.ok) return primaryStoreFailure(mirrorResult);
+      const mirror = mirrorResult.mirror;
+      if (!mirror) return { ok: false, error: "NOT_IMPORTED" };
+      if (mirror.status === "diverged") return { ok: false, error: "R2_DIVERGED" };
+      const key = primaryKey(userId, room, opened.path);
+      let current: R2Object | null;
+      try {
+        current = await this.r2.head(key);
+      } catch (error) {
+        return { ok: false, error: "PROJECTION_UNAVAILABLE", message: errorMessage(error) };
+      }
+      if (!current) return this.markPrimaryDiverged(fileId, "", "the R2 mirror disappeared");
+      const metadata = parsePrimaryMetadata(current.customMetadata);
+      if (!metadata) {
+        return this.markPrimaryDiverged(fileId, current.etag, "the R2 object lost its RoomText ownership marker");
+      }
+
+      // An ETag mismatch may be a recovered successful publish or an
+      // out-of-order publisher. Verify the bytes behind its metadata before
+      // trusting it; a foreign writer that copied stale metadata cannot pass.
+      if (current.etag !== mirror.r2Etag) {
+        const body = await this.r2.get(key);
+        if (!body) return this.markPrimaryDiverged(fileId, "", "the R2 mirror disappeared");
+        const bodyHash = await sha256Bytes(new Uint8Array(await body.arrayBuffer()));
+        if (bodyHash !== metadata.sha256) {
+          return this.markPrimaryDiverged(fileId, current.etag, "the R2 bytes do not match their RoomText generation marker");
+        }
+      }
+
+      const headHash = await sha256Text(opened.content);
+      if (metadata.epoch !== opened.epoch || metadata.revision > opened.revision) {
+        return this.markPrimaryDiverged(fileId, current.etag, "R2 advertises a generation newer than the Durable Object head");
+      }
+      if (metadata.revision === opened.revision) {
+        if (metadata.sha256 !== headHash) {
+          return this.markPrimaryDiverged(fileId, current.etag, "equal RoomText revisions contain different bytes");
+        }
+        const active = texts.setMirrorActive({
+          fileId,
+          r2Etag: current.etag,
+          epoch: opened.epoch,
+          revision: opened.revision,
+          sha256: headHash,
+          updatedAt: current.uploaded.getTime(),
+        });
+        if (!active.ok) return primaryStoreFailure(active);
+        if (!active.mirror) return { ok: false, error: "STORAGE_CORRUPT", message: "mirror row disappeared after publish" };
+        return { ok: true, file: primaryFile(opened, active.mirror) };
+      }
+
+      const wrote = await this.r2.put(key, new TextEncoder().encode(opened.content), {
+        onlyIf: { etagMatches: current.etag },
+        httpMetadata: current.httpMetadata,
+        customMetadata: {
+          ...(current.customMetadata || {}),
+          ...primaryMetadata(opened.epoch, opened.revision, headHash),
+        },
+      });
+      if (!wrote) continue;
+      const active = texts.setMirrorActive({
+        fileId,
+        r2Etag: wrote.etag,
+        epoch: opened.epoch,
+        revision: opened.revision,
+        sha256: headHash,
+        updatedAt: wrote.uploaded.getTime(),
+      });
+      if (!active.ok) return primaryStoreFailure(active);
+      if (!active.mirror) return { ok: false, error: "STORAGE_CORRUPT", message: "mirror row disappeared after publish" };
+      return { ok: true, file: primaryFile(opened, active.mirror) };
+    }
+    return { ok: false, error: "PROJECTION_BUSY", message: "R2 changed repeatedly; the RoomText commit remains durable and queued" };
+  }
+
+  private markPrimaryDiverged(fileId: string, observedEtag: string, message: string): RoomTextPrimaryResult {
+    this.texts().markMirrorDiverged(fileId, observedEtag);
+    return { ok: false, error: "R2_DIVERGED", message };
+  }
+
+  private broadcastPrimaryUpdate(result: PushRoomTextSuccess): void {
+    this.broadcastUpdates(result.fileId, {
+      epoch: result.epoch,
+      updates: [{
+        ...result.update,
+        updateToken: roomTextUpdateToken(result.update.clientId, result.update.requestId),
+      }],
+    });
+  }
+
   /** Route one parsed RoomText frame from the hub's webSocketMessage. */
-  async handleFrame(ws: WebSocket, frame: RoomTextClientFrame): Promise<void> {
+  async handleFrame(
+    ws: WebSocket,
+    frame: RoomTextClientFrame,
+    options: { allowPush?: boolean } = {},
+  ): Promise<void> {
     if (frame.type === "ping") {
       // Intentional wake: the client's zombie detector needs a real
       // round-trip through the engine host, not the auto-response pair.
@@ -91,7 +397,19 @@ export class RoomHubText {
       return;
     }
     if (frame.type === "push") {
-      // Cap the batch: without it a single 1.2MB frame of ~600k minimal
+      if (options.allowPush === false) {
+        for (const push of frame.pushes.slice(0, ROOM_TEXT_MAX_PUSHES_PER_FRAME)) {
+          this.send(ws, {
+            type: "discard",
+            updateToken: tokenFor(push),
+            code: "INVALID_REQUEST",
+            retryable: false,
+            message: "RoomText writes are frozen for migration",
+          });
+        }
+        return;
+      }
+      // Cap the batch: without it one maximum-size frame of tiny elements
       // elements would cost one reply frame per element (~60x outbound
       // amplification), reachable even from a view-slug socket via the
       // readonly-rejection loop. The real client sends one push at a time.
@@ -217,20 +535,12 @@ export class RoomHubText {
         });
         continue;
       }
-      // Ack to the sender for fresh commits AND idempotent replays alike;
-      // rebasedChanges present only when the server moved the update.
-      const rebased = result.update.parentRevision > result.submittedBaseRevision;
-      this.send(ws, {
-        type: "ack",
-        updateToken: token,
-        status: "commit",
-        revision: result.revision,
-        ...(rebased ? { rebasedChanges: result.update.changes } : {}),
-      });
       if (result.revision > headBefore) {
-        // Fresh commit: queue for the updates broadcast to OTHER sockets
-        // bound to the same file. Replays broadcast nothing — everyone else
-        // heard the update when it first committed.
+        // Fresh commit: the canonical broadcast goes to every socket,
+        // INCLUDING the sender. RoomTextClient recognizes its updateToken in
+        // that ordered stream as the acknowledgement; a separate direct ack
+        // would confirm the speculative edit outside the revision stream and
+        // force an unnecessary resync.
         const group = freshByFile.get(result.fileId) ?? { epoch: result.epoch, updates: [] };
         group.epoch = result.epoch;
         group.updates.push({
@@ -238,22 +548,34 @@ export class RoomHubText {
           updateToken: roomTextUpdateToken(result.update.clientId, result.update.requestId),
         });
         freshByFile.set(result.fileId, group);
+      } else {
+        // Idempotent replay: the original broadcast already happened, so a
+        // direct ack is the only response that can retire a replay-only
+        // outbox entry after snapshot recovery.
+        const rebased = result.update.parentRevision > result.submittedBaseRevision;
+        this.send(ws, {
+          type: "ack",
+          updateToken: token,
+          status: "commit",
+          revision: result.revision,
+          ...(rebased ? { rebasedChanges: result.update.changes } : {}),
+        });
       }
     }
-    for (const [fileId, group] of freshByFile) this.broadcastUpdates(ws, fileId, group);
+    for (const [fileId, group] of freshByFile) this.broadcastUpdates(fileId, group, ws);
     return freshByFile.size > 0;
   }
 
   /**
-   * One updates frame per file per inbound message, to every OTHER socket
+   * One updates frame per file per inbound message, to every socket
    * bound to that file. Reuses the hub's prefix-visibility predicate so a
    * share-scoped socket only ever hears about files under its prefix — the
    * same fence broadcast() applies to activity events.
    */
   private broadcastUpdates(
-    sender: WebSocket,
     fileId: string,
     group: { epoch: number; updates: RoomTextBroadcastUpdate[] },
+    sender?: WebSocket,
   ): void {
     const opened = this.texts().openText(fileId);
     const path = opened.ok ? opened.path : "";
@@ -265,9 +587,12 @@ export class RoomHubText {
       updates: group.updates,
     } satisfies RoomTextServerFrame);
     for (const socket of this.ctx.getWebSockets()) {
-      if (socket === sender) continue;
       const attachment = (socket.deserializeAttachment() || {}) as RoomTextHostAttachment;
-      if (attachment.rtFile !== fileId) continue;
+      // The sender may push before connect (the write-side prefix fence is
+      // intentionally independent of read hydration). It still needs the
+      // canonical echo as its ack. Everyone else must have explicitly bound
+      // this file or a multi-file room broadcast would leak content.
+      if (socket !== sender && attachment.rtFile !== fileId) continue;
       if (!this.pathVisible(path, String(attachment.prefix || ""))) continue;
       try { socket.send(frame); } catch (_) { /* socket mid-close; skip */ }
     }
@@ -354,7 +679,10 @@ export class RoomHubText {
     const entries = texts.dirtyFiles(limit);
     const results: RoomTextJanitorFileResult[] = [];
     for (const entry of entries) {
-      const result = await this.flushOne(meta, entry.fileId);
+      const mirror = texts.mirrorState(entry.fileId);
+      const result = mirror.ok && mirror.mirror
+        ? await this.flushPrimary(meta, entry.fileId)
+        : await this.flushOne(meta, entry.fileId);
       // A failing file goes to the BACK of the FIFO so 8 poison rows can
       // never monopolize the drain window and starve siblings.
       if (!result.ok) texts.deferDirty(entry.fileId);
@@ -369,6 +697,19 @@ export class RoomHubText {
       await this.armJanitor(allFailed ? 30_000 : 2_000);
     }
     return { ok: true, flushed: results.filter((r) => r.ok).length, remaining, results };
+  }
+
+  private async flushPrimary(
+    meta: { userId: string; room: string },
+    fileId: string,
+  ): Promise<RoomTextJanitorFileResult> {
+    const projected = await this.publishPrimary(meta.userId, meta.room, fileId);
+    if (!projected.ok) return { fileId, ok: false, error: projected.error };
+    // The canonical key now contains the current bytes. Keep the existing
+    // immutable history-artifact pipeline as a second recovery layer; it
+    // checkpoints/compacts and clears the durable dirty mark only after both
+    // projections are safe.
+    return this.flushOne(meta, fileId);
   }
 
   private async flushOne(meta: { userId: string; room: string }, fileId: string): Promise<RoomTextJanitorFileResult> {
@@ -482,6 +823,179 @@ function base64(bytes: ArrayBuffer): string {
 
 function hex(digest: ArrayBuffer): string {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export type RoomTextPrimaryOpenInput = {
+  userId: string;
+  room: string;
+  path: string;
+};
+
+export type RoomTextPrimaryImportInput = RoomTextPrimaryOpenInput & {
+  bytes: ArrayBuffer;
+  sourceEtag: string;
+};
+
+type RoomTextPrimaryMutationBase = RoomTextPrimaryOpenInput & {
+  clientId: string;
+  requestId: string;
+  intentHash: string;
+  anchors?: readonly RoomTextAnchor[];
+};
+
+export type RoomTextPrimaryReplaceInput = RoomTextPrimaryMutationBase & {
+  baseVersion: string;
+  content: string;
+};
+
+export type RoomTextPrimaryEditInput = RoomTextPrimaryMutationBase & {
+  oldText: string;
+  newText: string;
+  before?: string;
+  after?: string;
+};
+
+export type RoomTextPrimaryFile = {
+  fileId: string;
+  path: string;
+  epoch: number;
+  revision: number;
+  byteLength: number;
+  content: string;
+  version: string;
+  r2Etag: string;
+  sha256: string;
+  updatedAt: number;
+};
+
+export type RoomTextPrimaryFailure = {
+  ok: false;
+  error: string;
+  message?: string;
+  file?: RoomTextPrimaryFile;
+  matchCount?: number;
+  committed?: boolean;
+  revision?: number;
+};
+
+export type RoomTextPrimaryResult =
+  | { ok: true; file: RoomTextPrimaryFile }
+  | RoomTextPrimaryFailure;
+
+export type RoomTextPrimaryMutationResult =
+  | {
+      ok: true;
+      file: RoomTextPrimaryFile;
+      replayed?: boolean;
+      matchedAt?: number;
+      update?: PushRoomTextSuccess["update"];
+      anchors?: RoomTextAnchor[];
+    }
+  | RoomTextPrimaryFailure;
+
+export function roomTextVersionToken(epoch: number, revision: number): string {
+  return `rt1:${epoch}:${revision}`;
+}
+
+export function parseRoomTextVersionToken(value: unknown): { epoch: number; revision: number } | null {
+  if (typeof value !== "string") return null;
+  const match = /^rt1:([1-9][0-9]*):(0|[1-9][0-9]*)$/.exec(value);
+  if (!match) return null;
+  const epoch = Number(match[1]);
+  const revision = Number(match[2]);
+  return Number.isSafeInteger(epoch) && Number.isSafeInteger(revision) ? { epoch, revision } : null;
+}
+
+function primaryFile(
+  opened: Extract<OpenRoomTextResult, { ok: true }>,
+  mirror: RoomTextMirrorState,
+): RoomTextPrimaryFile {
+  return {
+    fileId: opened.fileId,
+    path: opened.path,
+    epoch: opened.epoch,
+    revision: opened.revision,
+    byteLength: opened.byteLength,
+    content: opened.content,
+    version: roomTextVersionToken(opened.epoch, opened.revision),
+    r2Etag: mirror.r2Etag,
+    sha256: mirror.sha256,
+    updatedAt: mirror.updatedAt,
+  };
+}
+
+function primaryStoreFailure(value: { ok: false; error: string; message?: string }): RoomTextPrimaryFailure {
+  return { ok: false, error: value.error, ...(value.message ? { message: value.message } : {}) };
+}
+
+function validStorageIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 128
+    && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function validPrimaryPath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 1_024
+    || value.startsWith("/") || value.includes("\\") || value.includes("\0")) return false;
+  return value.split("/").every((part) => part && part !== "." && part !== "..");
+}
+
+function primaryKey(userId: string, room: string, path: string): string {
+  return `users/${userId}/${room}/${path}`;
+}
+
+function primaryMetadata(epoch: number, revision: number, sha256: string): Record<string, string> {
+  return {
+    [PRIMARY_META_AUTHORITY]: PRIMARY_AUTHORITY,
+    [PRIMARY_META_EPOCH]: String(epoch),
+    [PRIMARY_META_REVISION]: String(revision),
+    [PRIMARY_META_SHA256]: sha256,
+  };
+}
+
+function parsePrimaryMetadata(metadata: Record<string, string> | undefined): {
+  epoch: number;
+  revision: number;
+  sha256: string;
+} | null {
+  if (!metadata || metadata[PRIMARY_META_AUTHORITY] !== PRIMARY_AUTHORITY) return null;
+  const epoch = Number(metadata[PRIMARY_META_EPOCH]);
+  const revision = Number(metadata[PRIMARY_META_REVISION]);
+  const sha256 = metadata[PRIMARY_META_SHA256] || "";
+  if (!Number.isSafeInteger(epoch) || epoch < 1 || !Number.isSafeInteger(revision) || revision < 0
+    || !/^[a-f0-9]{64}$/.test(sha256)) return null;
+  return { epoch, revision, sha256 };
+}
+
+async function sha256Bytes(bytes: Uint8Array): Promise<string> {
+  const exact = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  return hex(await crypto.subtle.digest("SHA-256", exact));
+}
+
+async function sha256Text(content: string): Promise<string> {
+  return sha256Bytes(new TextEncoder().encode(content));
+}
+
+function decodePrimaryBytes(bytes: Uint8Array): string {
+  return decodeRoomText(bytes).toString();
+}
+
+function literalMatches(content: string, target: string, before: string, after: string): number[] {
+  const matches: number[] = [];
+  let cursor = 0;
+  while (cursor <= content.length - target.length) {
+    const at = content.indexOf(target, cursor);
+    if (at < 0) break;
+    const beforeMatches = !before || content.slice(Math.max(0, at - before.length), at) === before;
+    const afterStart = at + target.length;
+    const afterMatches = !after || content.slice(afterStart, afterStart + after.length) === after;
+    if (beforeMatches && afterMatches) matches.push(at);
+    cursor = at + Math.max(1, target.length);
+  }
+  return matches;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export type RoomTextPromoteInput = {

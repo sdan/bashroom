@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   ROOM_TEXT_INBOUND_FRAME_MAX_CHARS,
+  RoomHubText,
   isRoomTextClientFrameType,
+  parseRoomTextVersionToken,
   roomTextShadowKey,
+  roomTextVersionToken,
 } from "./room-hub-text";
 
 // The dark-mount isolation invariant: every key the shadow janitor can
@@ -51,14 +54,63 @@ describe("isRoomTextClientFrameType", () => {
 
 describe("inbound frame bound", () => {
   it("covers worst-case JSON escaping of a maximum insert", () => {
-    // MAX_INSERT_BYTES is 262_144; every char escaped to \uXXXX inflates
-    // 6x in UTF-16 code units... but the wire ceiling that matters is the
-    // FRAME: a full push envelope with one max insert plus protocol
-    // overhead must fit. 1.2M > 262_144 * 4 (worst realistic JSON string
-    // escape inflation for surrogate-heavy content is ~3-4x measured) with
-    // headroom for the envelope; the hub's generic 300k bound does NOT
-    // cover it — that is the whole reason this constant exists.
-    expect(ROOM_TEXT_INBOUND_FRAME_MAX_CHARS).toBeGreaterThan(262_144 * 4);
+    // U+0001 is one UTF-8 byte but JSON emits six characters (\\u0001).
+    // Build the real one-push envelope so a legal paste can never be silently
+    // dropped before the store gets a chance to validate it.
+    const frame = JSON.stringify({
+      type: "push",
+      pushes: [{
+        protocol: 1,
+        fileId: "notes.md",
+        epoch: 1,
+        baseRevision: 0,
+        clientId: "client-a",
+        requestId: "request-a",
+        changes: [{ from: 0, to: 0, insert: "\u0001".repeat(262_144) }],
+      }],
+    });
+    expect(ROOM_TEXT_INBOUND_FRAME_MAX_CHARS).toBeGreaterThan(frame.length);
     expect(ROOM_TEXT_INBOUND_FRAME_MAX_CHARS).toBeLessThanOrEqual(2_000_000);
+  });
+});
+
+describe("migration freeze", () => {
+  it("rejects socket pushes before the store or R2 is touched", async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const socket = {
+      send(value: string) { sent.push(JSON.parse(value)); },
+    } as unknown as WebSocket;
+    const host = new RoomHubText(
+      {} as DurableObjectState,
+      {} as R2Bucket,
+      () => true,
+    );
+    await host.handleFrame(socket, {
+      type: "push",
+      pushes: [{
+        protocol: 1,
+        fileId: "notes.md",
+        epoch: 1,
+        baseRevision: 0,
+        clientId: "client-a",
+        requestId: "request-a",
+        changes: [{ from: 0, to: 0, insert: "blocked" }],
+      }],
+    }, { allowPush: false });
+    expect(sent).toEqual([expect.objectContaining({
+      type: "discard",
+      code: "INVALID_REQUEST",
+      retryable: false,
+    })]);
+  });
+});
+
+describe("RoomText version tokens", () => {
+  it("round-trips only safe epoch/revision pairs", () => {
+    expect(roomTextVersionToken(3, 41)).toBe("rt1:3:41");
+    expect(parseRoomTextVersionToken("rt1:3:41")).toEqual({ epoch: 3, revision: 41 });
+    for (const invalid of ["", "rt1:0:1", "rt1:1:-1", "rt2:1:1", "rt1:1:01", "etag"] ) {
+      expect(parseRoomTextVersionToken(invalid)).toBeNull();
+    }
   });
 });

@@ -538,11 +538,11 @@ Wire the callback into /settings.</pre>
     <div class="faq">
       <details class="q">
         <summary>How does it work?</summary>
-        <div class="a"><p>Bashroom is organized around rooms: a room is a durable project workspace, like <code>/rooms/my-app</code>, where agents keep the files they need for handoff.</p><p>When an agent runs a command, Bashroom starts a fresh cloud shell for that account and mounts its rooms into it, so normal bash — <code>cat</code>, <code>rg</code>, <code>git</code> — works on the same files another session will see later. The shell resets after each call; the room files do not.</p><p>Six tools cover the whole surface: <code>bashroom</code> is the shell, <code>bashroom_write</code> writes a file byte-for-byte past bash quoting, and <code>tree</code>/<code>read</code>/<code>search</code>/<code>stat</code> read those same R2 objects directly when you only need file context — bounded, so a big file can't flood the model's context window.</p></div>
+        <div class="a"><p>Bashroom is organized around rooms: a room is a durable project workspace, like <code>/rooms/my-app</code>, where agents keep the files they need for handoff.</p><p>When an agent runs a command, Bashroom starts a fresh cloud shell and mounts its rooms read-only, so normal bash — <code>cat</code>, <code>rg</code>, <code>git</code> — can inspect the same files another session sees. Durable mutations use structured tools with explicit conflict protection.</p><p><code>bashroom_edit</code> changes one uniquely named Markdown span through the room sequencer, <code>bashroom_write</code> creates or replaces a file, and bounded tree/read/search/stat tools retrieve context without booting Linux.</p></div>
       </details>
       <details class="q">
         <summary>How is it secure?</summary>
-        <div class="a">Each account gets its own ephemeral sandbox and its own slice of R2. When an agent runs bash, Bashroom mounts only that account's allowed rooms at <code>/rooms</code>, using <code>s3fs</code> to make those R2 objects look like normal files. Another user's rooms are not mounted in the sandbox, and structured tools still go through the Worker's account and room checks before touching R2. The account token stays in the local <code>bashroom mcp</code> process, so the model can use Bashroom without seeing the credential.</div>
+        <div class="a">Each account gets its own ephemeral sandbox and storage prefix. Only that account's allowed rooms are mounted, read-only, at <code>/rooms</code>. Structured tools authorize the exact room and path before reaching RoomText or R2. The account token stays in the local <code>bashroom mcp</code> process, so the model can use Bashroom without seeing the credential.</div>
       </details>
       <details class="q">
         <summary>How do you use it?</summary>
@@ -550,7 +550,7 @@ Wire the callback into /settings.</pre>
       </details>
       <details class="q">
         <summary>How long will it stick around?</summary>
-        <div class="a">It's cheap to run — rooms live in R2 and shells are ephemeral, so even heavy use (hundreds of calls a day, 50MB of notes) costs under $1/month, which I'm happy to keep footing. If that ever changes it would become a small fee, not a rug-pull: rooms are plain files, and <code>bashroom export</code> pulls everything out in one command.</div>
+        <div class="a">It's cheap to run — room state is compact, R2 keeps a byte-for-byte recovery copy, and shells are ephemeral. If pricing ever changes it would become a small fee, not a rug-pull: rooms remain plain files, and <code>bashroom export</code> pulls everything out in one command.</div>
       </details>
     </div>
 

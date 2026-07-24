@@ -92,6 +92,7 @@ type UpdateRow = {
 
 type RequestRow = {
   normalized_input: string;
+  mapped_anchors_json: string;
   file_id: string;
   epoch: number;
   submitted_base_revision: number;
@@ -106,6 +107,17 @@ type DigestRow = {
   revision: number;
   first_seq: number;
   last_seq: number;
+  updated_at: number;
+};
+
+type MirrorRow = {
+  file_id: string;
+  r2_etag: string;
+  epoch: number;
+  revision: number;
+  sha256: string;
+  status: "active" | "diverged";
+  observed_etag: string;
   updated_at: number;
 };
 
@@ -176,6 +188,11 @@ export type PushRoomTextInput = {
   baseRevision: number;
   clientId: string;
   requestId: string;
+  // Optional hash of the higher-level operation that produced `changes`.
+  // The MCP literal-edit adapter uses it to recognize a retry BEFORE it
+  // resolves the literal against a newer head. It is part of the persisted
+  // idempotency envelope, but has no effect on OT ordering.
+  intentHash?: string;
   changes: readonly WireTextChange[];
   // Head-revision observer positions (open comment anchors) the host wants
   // mapped through the accepted update. Deliberately excluded from the
@@ -218,6 +235,21 @@ export type PushRoomTextSuccess = {
 };
 
 export type PushRoomTextResult = PushRoomTextSuccess | RoomTextFailure;
+
+export type RoomTextMirrorState = {
+  fileId: string;
+  r2Etag: string;
+  epoch: number;
+  revision: number;
+  sha256: string;
+  status: "active" | "diverged";
+  observedEtag: string;
+  updatedAt: number;
+};
+
+export type RoomTextMirrorResult =
+  | { ok: true; mirror: RoomTextMirrorState | null }
+  | RoomTextFailure;
 
 export type PullRoomTextResult =
   | {
@@ -529,11 +561,122 @@ export class RoomTextStore {
     }
   }
 
+  /**
+   * Return the original accepted result for a higher-level operation retry.
+   * Literal MCP edits must check this before resolving their target against
+   * today's head: after the first commit, the quoted text may have moved or
+   * disappeared even though the retry is the same logical request.
+   */
+  replayIntent(clientIdInput: string, requestIdInput: string, intentHashInput: string): PushRoomTextResult | null {
+    try {
+      const clientId = validateKey(clientIdInput, "clientId");
+      const requestId = validateKey(requestIdInput, "requestId");
+      const intentHash = validateKey(intentHashInput, "intentHash");
+      const row = this.storage.sql.exec<RequestRow>(
+        `SELECT normalized_input, mapped_anchors_json, file_id, epoch,
+                submitted_base_revision, revision
+           FROM room_text_requests WHERE client_id = ? AND request_id = ?`,
+        clientId, requestId,
+      ).toArray()[0];
+      if (!row) return null;
+      let storedIntent = "";
+      try {
+        const parsed = JSON.parse(row.normalized_input) as { intentHash?: unknown };
+        storedIntent = typeof parsed.intentHash === "string" ? parsed.intentHash : "";
+      } catch {
+        return { ok: false, error: "STORAGE_CORRUPT", message: "idempotency envelope is invalid" };
+      }
+      if (storedIntent !== intentHash) return { ok: false, error: "IDEMPOTENCY_MISMATCH" };
+      return this.responseForRequest(row, clientId, requestId);
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  mirrorState(fileIdInput: string): RoomTextMirrorResult {
+    try {
+      const fileId = validateKey(fileIdInput, "fileId");
+      const row = this.storage.sql.exec<MirrorRow>(
+        `SELECT file_id, r2_etag, epoch, revision, sha256, status,
+                observed_etag, updated_at
+           FROM room_text_mirrors WHERE file_id = ?`,
+        fileId,
+      ).toArray()[0];
+      return { ok: true, mirror: row ? toMirrorState(row) : null };
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  setMirrorActive(input: {
+    fileId: string;
+    r2Etag: string;
+    epoch: number;
+    revision: number;
+    sha256: string;
+    updatedAt?: number;
+  }): RoomTextMirrorResult {
+    try {
+      const fileId = validateKey(input.fileId, "fileId");
+      const r2Etag = validateOpaqueValue(input.r2Etag, "r2Etag", 256);
+      if (!Number.isSafeInteger(input.epoch) || input.epoch < 1
+        || !Number.isSafeInteger(input.revision) || input.revision < 0
+        || !/^[a-f0-9]{64}$/.test(input.sha256)) {
+        throw new InvalidRequestError("mirror version is invalid");
+      }
+      const file = this.fileRow(fileId);
+      if (!file) return { ok: false, error: "NOT_FOUND" };
+      if (file.epoch !== input.epoch || input.revision > file.head_revision) {
+        return { ok: false, error: "FUTURE_REVISION", epoch: file.epoch, revision: file.head_revision };
+      }
+      const updatedAt = Number.isSafeInteger(input.updatedAt) && Number(input.updatedAt) >= 0
+        ? Number(input.updatedAt)
+        : Date.now();
+      this.storage.sql.exec(
+        `INSERT INTO room_text_mirrors (
+           file_id, r2_etag, epoch, revision, sha256, status,
+           observed_etag, updated_at
+         ) VALUES (?, ?, ?, ?, ?, 'active', '', ?)
+         ON CONFLICT(file_id) DO UPDATE SET
+           r2_etag = excluded.r2_etag,
+           epoch = excluded.epoch,
+           revision = excluded.revision,
+           sha256 = excluded.sha256,
+           status = 'active',
+           observed_etag = '',
+           updated_at = excluded.updated_at`,
+        fileId, r2Etag, input.epoch, input.revision, input.sha256, updatedAt,
+      );
+      return this.mirrorState(fileId);
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
+  markMirrorDiverged(fileIdInput: string, observedEtagInput: string): RoomTextMirrorResult {
+    try {
+      const fileId = validateKey(fileIdInput, "fileId");
+      const observedEtag = observedEtagInput
+        ? validateOpaqueValue(observedEtagInput, "observedEtag", 256)
+        : "";
+      const updated = this.storage.sql.exec(
+        `UPDATE room_text_mirrors
+            SET status = 'diverged', observed_etag = ?, updated_at = ?
+          WHERE file_id = ?`,
+        observedEtag, Date.now(), fileId,
+      );
+      if (updated.rowsWritten !== 1) return { ok: false, error: "NOT_FOUND" };
+      return this.mirrorState(fileId);
+    } catch (error) {
+      return failureFrom(error);
+    }
+  }
+
   pushText(input: PushRoomTextInput): PushRoomTextResult {
     try {
       const normalized = normalizePush(input);
       const deduped = this.storage.sql.exec<RequestRow>(
-        `SELECT normalized_input, file_id, epoch,
+        `SELECT normalized_input, mapped_anchors_json, file_id, epoch,
                 submitted_base_revision, revision
            FROM room_text_requests WHERE client_id = ? AND request_id = ?`,
         normalized.clientId, normalized.requestId,
@@ -600,7 +743,7 @@ export class RoomTextStore {
         // Recheck inside the transaction. This is redundant under normal DO
         // delivery but protects the helper's invariant if callers evolve.
         const existing = this.storage.sql.exec<RequestRow>(
-          `SELECT normalized_input, file_id, epoch,
+          `SELECT normalized_input, mapped_anchors_json, file_id, epoch,
                   submitted_base_revision, revision
              FROM room_text_requests WHERE client_id = ? AND request_id = ?`,
           normalized.clientId, normalized.requestId,
@@ -711,10 +854,10 @@ export class RoomTextStore {
         }
         this.storage.sql.exec(
           `INSERT INTO room_text_requests (
-             client_id, request_id, normalized_input, file_id, epoch,
+             client_id, request_id, normalized_input, mapped_anchors_json, file_id, epoch,
              submitted_base_revision, revision, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          normalized.clientId, normalized.requestId, normalized.json,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          normalized.clientId, normalized.requestId, normalized.json, serializeMappedAnchors(response.anchors),
           normalized.fileId, row.epoch, normalized.baseRevision, revision, now,
         );
         // Fresh accept only (replays returned above): the digest index and
@@ -828,7 +971,7 @@ export class RoomTextStore {
       // Dedup runs inside THE batch transaction; earlier accepts in this
       // very batch are visible here, so an in-batch retry replays cleanly.
       const existing = this.storage.sql.exec<RequestRow>(
-        `SELECT normalized_input, file_id, epoch,
+        `SELECT normalized_input, mapped_anchors_json, file_id, epoch,
                 submitted_base_revision, revision
            FROM room_text_requests WHERE client_id = ? AND request_id = ?`,
         normalized.clientId, normalized.requestId,
@@ -967,10 +1110,10 @@ export class RoomTextStore {
     }
     this.storage.sql.exec(
       `INSERT INTO room_text_requests (
-         client_id, request_id, normalized_input, file_id, epoch,
+         client_id, request_id, normalized_input, mapped_anchors_json, file_id, epoch,
          submitted_base_revision, revision, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      normalized.clientId, normalized.requestId, normalized.json,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      normalized.clientId, normalized.requestId, normalized.json, serializeMappedAnchors(response.anchors),
       normalized.fileId, row.epoch, normalized.baseRevision, revision, now,
     );
     this.writeDigest(normalized.fileId, row.path, staged.contentHash, applied.byteLength, revision, now);
@@ -1614,6 +1757,7 @@ export class RoomTextStore {
         client_id TEXT NOT NULL,
         request_id TEXT NOT NULL,
         normalized_input TEXT NOT NULL,
+        mapped_anchors_json TEXT NOT NULL DEFAULT '',
         file_id TEXT NOT NULL,
         epoch INTEGER NOT NULL,
         submitted_base_revision INTEGER NOT NULL,
@@ -1663,7 +1807,32 @@ export class RoomTextStore {
         CHECK (epoch >= 1),
         CHECK (revision >= 0)
       );
+      CREATE TABLE IF NOT EXISTS room_text_mirrors (
+        file_id TEXT PRIMARY KEY,
+        r2_etag TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active', 'diverged')),
+        observed_etag TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL,
+        CHECK (epoch >= 1),
+        CHECK (revision >= 0),
+        CHECK (length(sha256) = 64),
+        FOREIGN KEY (file_id) REFERENCES room_text_files(file_id)
+      );
     `);
+    // Existing dark-mounted RoomHub instances already have the request table.
+    // Add the replay payload in place; the empty default preserves every old
+    // idempotency row and means "this request did not carry host anchors."
+    const requestColumns = this.storage.sql.exec<{ name: string }>(
+      "PRAGMA table_info(room_text_requests)",
+    ).toArray();
+    if (!requestColumns.some((column) => column.name === "mapped_anchors_json")) {
+      this.storage.sql.exec(
+        "ALTER TABLE room_text_requests ADD COLUMN mapped_anchors_json TEXT NOT NULL DEFAULT ''",
+      );
+    }
     // Seed the pre-mutation root so a client that synced the empty room
     // still gets an O(changed) diff once files appear.
     this.storage.sql.exec(
@@ -1784,6 +1953,9 @@ export class RoomTextStore {
       roomCommit: update.room_commit,
       byteLength: update.after_byte_length,
       update: toCanonicalUpdate(update),
+      ...(request.mapped_anchors_json
+        ? { anchors: parseMappedAnchors(request.mapped_anchors_json) }
+        : {}),
     };
   }
 
@@ -1952,6 +2124,34 @@ export class RoomTextStore {
   }
 }
 
+function serializeMappedAnchors(anchors: readonly RoomTextAnchor[] | undefined): string {
+  return anchors === undefined ? "" : JSON.stringify(anchors);
+}
+
+function parseMappedAnchors(value: string): RoomTextAnchor[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new RoomTextError("STORAGE_CORRUPT", "stored anchor replay is invalid JSON");
+  }
+  if (!Array.isArray(parsed) || parsed.length > 10_000) {
+    throw new RoomTextError("STORAGE_CORRUPT", "stored anchor replay is invalid");
+  }
+  return parsed.map((entry) => {
+    if (!entry || typeof entry !== "object") {
+      throw new RoomTextError("STORAGE_CORRUPT", "stored anchor replay entry is invalid");
+    }
+    const anchor = entry as { id?: unknown; start?: unknown; end?: unknown };
+    if (typeof anchor.id !== "string" || !anchor.id
+      || !Number.isSafeInteger(anchor.start) || !Number.isSafeInteger(anchor.end)
+      || Number(anchor.start) < 0 || Number(anchor.end) < Number(anchor.start)) {
+      throw new RoomTextError("STORAGE_CORRUPT", "stored anchor replay entry is invalid");
+    }
+    return { id: anchor.id, start: Number(anchor.start), end: Number(anchor.end) };
+  });
+}
+
 function normalizePush(input: PushRoomTextInput): PushRoomTextInput & { json: string } {
   if (!input || input.protocol !== ROOM_TEXT_PROTOCOL || !Number.isSafeInteger(input.epoch)
     || input.epoch < 1 || !Number.isSafeInteger(input.baseRevision) || input.baseRevision < 0
@@ -1961,6 +2161,9 @@ function normalizePush(input: PushRoomTextInput): PushRoomTextInput & { json: st
   const fileId = validateKey(input.fileId, "fileId");
   const clientId = validateKey(input.clientId, "clientId");
   const requestId = validateKey(input.requestId, "requestId");
+  const intentHash = input.intentHash === undefined
+    ? undefined
+    : validateKey(input.intentHash, "intentHash");
   const changes = input.changes.map((change) => ({
     from: change?.from,
     to: change?.to,
@@ -1973,6 +2176,7 @@ function normalizePush(input: PushRoomTextInput): PushRoomTextInput & { json: st
     baseRevision: input.baseRevision,
     clientId,
     requestId,
+    ...(intentHash ? { intentHash } : {}),
     changes,
   };
   const json = JSON.stringify(normalized);
@@ -2047,6 +2251,26 @@ function validateKey(value: unknown, name: string): string {
     throw new InvalidRequestError(`${name} is invalid`);
   }
   return value;
+}
+
+function validateOpaqueValue(value: unknown, name: string, maxLength: number): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > maxLength || value.includes("\0")) {
+    throw new InvalidRequestError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function toMirrorState(row: MirrorRow): RoomTextMirrorState {
+  return {
+    fileId: row.file_id,
+    r2Etag: row.r2_etag,
+    epoch: row.epoch,
+    revision: row.revision,
+    sha256: row.sha256,
+    status: row.status,
+    observedEtag: row.observed_etag,
+    updatedAt: row.updated_at,
+  };
 }
 
 function validatePath(value: unknown): string {

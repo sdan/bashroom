@@ -23,25 +23,23 @@ import {
   RoomHubText,
   ROOM_TEXT_INBOUND_FRAME_MAX_CHARS,
   isRoomTextClientFrameType,
+  type RoomTextPrimaryFile,
+  type RoomTextPrimaryEditInput,
+  type RoomTextPrimaryImportInput,
+  type RoomTextPrimaryOpenInput,
+  type RoomTextPrimaryReplaceInput,
   type RoomTextPromoteInput,
 } from "./room-hub-text";
 import type { RoomTextClientFrame } from "./room-text-client";
+import { ROOM_TEXT_MAX_BYTES, type RoomTextAnchor } from "./room-text";
 
 export { ContainerProxy } from "@cloudflare/sandbox";
 export { DocumentCollab };
 
-type Env = {
-  REGISTRY: DurableObjectNamespace<Registry>;
-  ACCOUNTS: DurableObjectNamespace<AccountDO>;
-  SANDBOXES: DurableObjectNamespace<Sandbox>;
-  ROOM_HUBS: DurableObjectNamespace<RoomHub>;
-  DOCUMENT_COLLABS: DurableObjectNamespace<DocumentCollab>;
-  ROOMS_R2: R2Bucket;
-  GITHUB_CLIENT_ID?: string;
-  GITHUB_CLIENT_SECRET?: string;
-  BASHROOM_PUBLIC_URL?: string;
-  SANDBOX_TRANSPORT?: string;
-};
+// Wrangler generates every binding from wrangler.jsonc. ROOM_TEXT_MODE is
+// widened because the same artifact intentionally deploys through
+// off -> freeze -> on during the authority handoff.
+type Env = Omit<CloudflareEnv, "ROOM_TEXT_MODE"> & { ROOM_TEXT_MODE?: string };
 
 // Sandbox subclass — wrangler.jsonc declares class_name: "Sandbox" and
 // the container image. We only need to extend SandboxBase and set the
@@ -186,7 +184,9 @@ export class RoomHub extends DurableObject<Env> {
     let frame: { type?: string; path?: unknown; caret?: unknown; content?: unknown };
     try { frame = JSON.parse(message); } catch (_) { return; }
     if (frame && isRoomTextClientFrameType(frame.type)) {
-      await this.rt().handleFrame(ws, frame as unknown as RoomTextClientFrame);
+      await this.rt().handleFrame(ws, frame as unknown as RoomTextClientFrame, {
+        allowPush: this.env.ROOM_TEXT_MODE !== "freeze",
+      });
       return;
     }
     if (message.length > 300_000) return;
@@ -277,6 +277,10 @@ export class RoomHub extends DurableObject<Env> {
   async rtPromote(input: RoomTextPromoteInput) { return this.rt().promote(input); }
   async rtParity() { return this.rt().parity(); }
   async rtFlush() { return this.rt().janitorDrain(); }
+  async rtPrimaryImport(input: RoomTextPrimaryImportInput) { return this.rt().importPrimary(input); }
+  async rtPrimaryOpen(input: RoomTextPrimaryOpenInput) { return this.rt().openPrimary(input); }
+  async rtPrimaryReplace(input: RoomTextPrimaryReplaceInput) { return this.rt().replacePrimary(input); }
+  async rtPrimaryEdit(input: RoomTextPrimaryEditInput) { return this.rt().editPrimary(input); }
 
   // RoomHub's first alarm — the shadow flush janitor. Idle-stopping by
   // construction: it only ever re-arms while dirty rows remain, so a quiet
@@ -570,6 +574,16 @@ type R2File = R2FileMetadata & {
   content: string;
   is_binary: boolean;
 };
+
+type RoomTextMode = "off" | "freeze" | "on";
+
+type AuthoritativeFileResult =
+  | { ok: true; file: R2File | null; authority: "r2" | "roomtext" }
+  | { ok: false; error: string; message?: string; file?: R2File };
+
+type AuthoritativeWriteResult =
+  | { ok: true; file: R2File; authority: "r2" | "roomtext"; replayed?: boolean; matched_at?: number }
+  | { ok: false; error: string; message?: string; file?: R2File; match_count?: number; committed?: boolean; revision?: number };
 
 type ParsedRoomsPath = {
   root: boolean;
@@ -1743,7 +1757,7 @@ function createServer(env: Env, ctx: ExecutionContext, headerToken: string, ip: 
 
   server.tool(
     "bashroom",
-    "Run bash against /rooms, a durable filesystem for agents FUSE-mounted from Cloudflare R2. Real Linux shell with bash, git, ripgrep, jq, find, less, tree, fd, rsync — there is no hidden command parser, so anything that works in bash works here.\n\nEach call gets a fresh process session: cwd, env vars, and background processes do not carry over. The warm container filesystem is shared, so /tmp may persist or be visible to concurrent calls; only /rooms is guaranteed durable. Outbound network is blocked. Room admin (create-room, rooms, mounts, who, history) is the visible `bashroom` executable inside the shell. History is activity, not file-version recovery.\n\nExamples:\n- ls /rooms                                  — see which rooms you can reach\n- cat /rooms/my-app/index.md                 — read a room's index\n- bashroom create-room my-app                — make a new room\n- rg -n 'TODO' /rooms/my-app                 — regex search with ripgrep\n\nWhen NOT to use this: if you only need to list, read, search, stat, or replace one room file, prefer bashroom_tree / bashroom_read / bashroom_search / bashroom_stat / bashroom_write — they operate directly on R2 without booting the sandbox and return bounded output.",
+    "Run real bash with authorized rooms mounted read-only at /rooms. Use it for pipelines, git inspection, regex, find, jq, and computation; mutate durable files with bashroom_edit or bashroom_write so every write carries RoomText/R2 concurrency protection.\n\nEach call gets a fresh process session: cwd, env vars, and background processes do not carry over. The warm container filesystem is shared, so /tmp may persist or be visible to concurrent calls; only /rooms is durable. Outbound network is blocked. Room admin (create-room, rooms, mounts, who, history) is the visible `bashroom` executable inside the shell. History is activity, not file-version recovery.\n\nExamples:\n- ls /rooms                                  — see which rooms you can reach\n- cat /rooms/my-app/index.md                 — read a room's index\n- bashroom create-room my-app                — make a new room\n- rg -n 'TODO' /rooms/my-app                 — regex search with ripgrep\n\nDo not use shell redirection, sed -i, mv, or rm under /rooms: the mount is intentionally read-only. For one bounded operation prefer bashroom_tree / bashroom_read / bashroom_search / bashroom_stat / bashroom_edit / bashroom_write.",
     {
       command: z.string().min(1).max(MAX_COMMAND_CHARS).describe("Bash command to run, for example: ls /rooms; cat /rooms/my-room/index.md"),
       stdin: z.string().optional().describe("Optional standard input for the command. Piped to the command via base64 round-trip so any byte sequence (quotes, newlines, NUL) is safe."),
@@ -1759,12 +1773,12 @@ function createServer(env: Env, ctx: ExecutionContext, headerToken: string, ip: 
 
   server.tool(
     "bashroom_write",
-    "Write one file under /rooms directly to R2, bypassing bash quoting and sandbox startup. The content lands byte-for-byte. Use this instead of `echo ... > file` or a heredoc whenever content contains quotes, backticks, $variables, markdown code fences, or arbitrary bytes.\n\nExample: bashroom_write({ path: '/rooms/my-app/notes/2026-06-09.md', content: '# Handoff\\n\\n## state\\n...', base_etag: '<etag from bashroom_read>' }). For binary, base64-encode the bytes and pass encoding='base64'.\n\nLimits: max 5MB after decoding; the path must name a file inside a room you can write. Writes replace the whole file. Three modes: pass base_etag to reject a stale overwrite of an existing file; pass create_only=true when creating a NEW file so two agents can't create over each other (fails with error='exists' if the file already exists); omit both only when an unconditional replacement is intentional.",
+    "Replace or create one authorized file without starting Linux. Eligible Markdown is committed through the room's RoomText sequencer and mirrored byte-for-byte to R2; unsupported or binary files remain R2-owned.\n\nExample: bashroom_write({ path: '/rooms/my-app/notes/2026-06-09.md', content: '# Handoff\\n\\n## state\\n...', base_etag: '<version from bashroom_read>' }). For binary, base64-encode the bytes and pass encoding='base64'.\n\nLimits: max 5MB after decoding. Whole-file replacement should carry base_etag; existing RoomText Markdown requires it and rejects stale versions. Use create_only=true for a NEW file so two agents cannot create over each other. Prefer bashroom_edit when changing one span of existing Markdown.",
     {
       path: z.string().min(1).max(1024).describe("Absolute path under /rooms, e.g. /rooms/my-room/notes/today.md"),
       content: z.string().max(MAX_WRITE_ENCODED_CHARS).describe("File content. UTF-8 by default; pass standard base64 bytes with encoding='base64' for binary."),
       encoding: z.enum(["utf-8", "base64"]).optional().describe("'utf-8' (default) treats content as text; 'base64' decodes content as binary before writing."),
-      base_etag: z.string().min(1).max(128).optional().describe("Optional etag from bashroom_read/stat. The write fails with conflict if the file changed."),
+      base_etag: z.string().min(1).max(128).optional().describe("Version from bashroom_read/stat. Required for safe replacement of existing RoomText Markdown; stale versions return conflict."),
       create_only: z.boolean().optional().describe("Write only if the file does NOT already exist — fails with error='exists' (and the current etag) otherwise. Use when creating a new file. Mutually exclusive with base_etag."),
     },
     async ({ path, content, encoding, base_etag, create_only }) => {
@@ -1777,8 +1791,32 @@ function createServer(env: Env, ctx: ExecutionContext, headerToken: string, ip: 
   );
 
   server.tool(
+    "bashroom_edit",
+    "Edit one uniquely identified span of an existing Markdown file through RoomText. The server resolves old_text against the CURRENT authoritative head inside the room sequencer, then commits one atomic ChangeSet and broadcasts it to human editors. Quote enough surrounding text with before/after when old_text repeats. Zero matches returns target_not_found; multiple matches returns target_ambiguous; neither case changes the file. request_id is the stable idempotency key for this logical edit — reuse it only when retrying the exact same operation.\n\nExample: bashroom_edit({ path:'/rooms/project/index.md', old_text:'Status: draft', new_text:'Status: approved', before:'## Launch\\n', request_id:'approve-launch-v1' }).",
+    {
+      path: z.string().min(1).max(1024).describe("Absolute Markdown path under /rooms/<room>/"),
+      old_text: z.string().min(1).max(64_000).describe("Exact text to replace. It must resolve to one span after optional context filters."),
+      new_text: z.string().max(262_144).describe("Replacement text; empty deletes the matched span."),
+      before: z.string().max(8_000).optional().describe("Optional exact text immediately before old_text, used only to disambiguate."),
+      after: z.string().max(8_000).optional().describe("Optional exact text immediately after old_text, used only to disambiguate."),
+      request_id: z.string().min(1).max(128).regex(/^[a-zA-Z0-9._:@/-]+$/).describe("Stable idempotency key for this logical edit."),
+    },
+    async ({ path, old_text, new_text, before, after, request_id }) => {
+      const result = await runEditFile(env, ctx, headerToken, ip, {
+        path,
+        oldText: old_text,
+        newText: new_text,
+        before,
+        after,
+        requestId: request_id,
+      });
+      return mcpJsonResult(result, !result.ok);
+    },
+  );
+
+  server.tool(
     "bashroom_tree",
-    "List rooms or files directly from R2 without starting bash — the fastest way to orient yourself. Returns metadata (path, size, updated_at, etag, content type), never file bodies.\n\nTwo modes:\n- bashroom_tree({ path: '/rooms' })                — list every room you can reach, with your role and scopes\n- bashroom_tree({ path: '/rooms/my-app/notes' })   — list files under a prefix, recursively\n\nA good first call in any session is path='/rooms': it tells you what exists before you read anything. Output is bounded by max_entries (up to 1000) and sets truncated=true when there's more — narrow the prefix rather than raising the cap. For glob patterns or sorting tricks, fall back to the bashroom tool with `fd` or `find`.",
+    "List authorized rooms or file metadata without starting bash — the fastest way to orient yourself. Returns path, size, updated_at, version/etag, and content type, never file bodies. Output is bounded; narrow the prefix when truncated. Use path='/rooms' first, or '/rooms/<room>/<prefix>' for one subtree.",
     {
       path: z.string().default("/rooms").describe("Absolute path: /rooms to list rooms, or /rooms/<room>/<optional-prefix> to list files."),
       max_entries: z.number().int().min(1).max(MAX_MCP_TREE_ENTRIES).optional().describe(`Maximum files to return, up to ${MAX_MCP_TREE_ENTRIES}.`),
@@ -1791,7 +1829,7 @@ function createServer(env: Env, ctx: ExecutionContext, headerToken: string, ip: 
 
   server.tool(
     "bashroom_read",
-    "Read a bounded byte range of one file directly from R2 without starting bash. Use this instead of `cat`: the max_bytes cap (up to 512KB) means a file can never be bigger than you guessed and flood your context window.\n\nExamples:\n- bashroom_read({ path: '/rooms/my-app/index.md' })                          — read from the top\n- bashroom_read({ path: '/rooms/my-app/log/big.md', offset: 64000 })        — page through a large file\n\nThe result includes the file's true size_bytes and truncated=true when there is more past your range — page with offset rather than re-reading from 0. Binary files are flagged is_binary instead of dumped raw. If you don't know the file's size yet, bashroom_stat is a cheaper first call than a read.",
+    "Read a bounded byte range from the authoritative file state without starting bash. The max_bytes cap (up to 512KB) prevents an unexpectedly large file from flooding context. The result includes size, version/etag, and truncated; page with offset. Binary files are flagged instead of dumped.",
     {
       path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/ARCHITECTURAL.md."),
       offset: z.number().int().min(0).optional().describe("Byte offset to start reading from. Defaults to 0."),
@@ -1805,7 +1843,7 @@ function createServer(env: Env, ctx: ExecutionContext, headerToken: string, ip: 
 
   server.tool(
     "bashroom_search",
-    "Search room files for a literal string directly from R2, without starting bash. Case-insensitive by default; returns file + line + matched text for each hit, so it's the quick 'where did we write about X' tool.\n\nExample: bashroom_search({ path: '/rooms/my-app', query: 'handoff' }) — find every mention under a room or narrower prefix.\n\nThis is literal substring match only — no regex, no globs. For regex, multiline patterns, or anything `rg` can do, use the bashroom tool (`rg -n 'pattern' /rooms/my-app`). Output is bounded by max_matches / max_files / max_bytes_per_file and reports scanned_files, skipped_files, and truncated, so you can tell the difference between 'no matches' and 'didn't look everywhere' — narrow the path prefix when truncated.",
+    "Search authoritative room files for a bounded literal substring without starting bash. Case-insensitive by default; returns file, line, and preview. For regex or multiline patterns use read-only bash with rg. The result reports scanned/skipped files and truncation.",
     {
       path: z.string().min(1).describe("Absolute room or prefix path under /rooms/<room>/, e.g. /rooms/bashroom/notes."),
       query: z.string().min(1).max(256).describe("Literal text to search for."),
@@ -1829,7 +1867,7 @@ function createServer(env: Env, ctx: ExecutionContext, headerToken: string, ip: 
 
   server.tool(
     "bashroom_stat",
-    "Return R2 metadata for one file without reading its body: size, modified time, etag, version, content type, and custom metadata. The cheapest call in the harness — no sandbox, no file body.\n\nUse it to answer 'has this changed since I last looked?' (compare etag or updated_at) before re-reading, or 'how big is this?' before choosing bashroom_read offsets. Example: bashroom_stat({ path: '/rooms/my-app/index.md' }).",
+    "Return authoritative metadata for one file without its body: size, modified time, version/etag, content type, and authority metadata. Use it to detect changes or size a bounded read.",
     {
       path: z.string().min(1).describe("Absolute file path under /rooms/<room>/, e.g. /rooms/bashroom/index.md."),
     },
@@ -2002,7 +2040,93 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       return json(account, account.ok === false ? 401 : 200);
     }
 
+    // Lossless RoomText migration, deliberately account-scoped and paged.
+    // It rewrites each eligible R2 object with IDENTICAL bytes plus a guarded
+    // generation marker, then creates/verifies the DO copy. Unsupported files
+    // are reported and left untouched. This route is available only during
+    // the write freeze (or after cutover for repair), never in ordinary R2
+    // mode where a legacy writer could immediately invalidate the claim.
+    if (url.pathname === "/account/roomtext-migrate" && request.method === "POST") {
+      const mode = configuredRoomTextMode(env);
+      if (mode === "off") return json({ ok: false, error: "roomtext_not_enabled" }, 409);
+      const input = await readJson(request);
+      const room = parseOptionalWiki(String(input.room || ""));
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      const action = input.action === "verify" ? "verify" : "migrate";
+      const cursor = typeof input.cursor === "string" ? input.cursor.slice(0, 4096) : undefined;
+      const limit = clampInt(Number(input.limit), 50, 100);
+      const account = await authorizeAccount(env, bearerToken(request), clientIp(request), {
+        route: `account.roomtext.${action}`,
+        includeRooms: true,
+      });
+      if (!account.ok) return json(account, 401);
+      const userId = String(account.user_id || "");
+      const membership = (account.rooms || []).find((row) => row.room === room);
+      if (!userId || !membership) return json({ ok: false, error: "forbidden" }, 403);
+      if (!membership.scopes.includes("admin") || !membership.scopes.includes("write")) {
+        return json({ ok: false, error: "admin_required" }, 403);
+      }
+      const prefix = r2KeyForRoom(userId, room);
+      const listOptions: R2ListOptions & { include?: Array<"httpMetadata" | "customMetadata"> } = {
+        prefix,
+        cursor,
+        limit,
+        include: ["httpMetadata", "customMetadata"],
+      };
+      const page = await env.ROOMS_R2.list(listOptions);
+      const stub = roomTextHub(env, userId, room);
+      const results: Array<Record<string, unknown>> = [];
+      for (const object of page.objects) {
+        const path = object.key.slice(prefix.length);
+        if (!path || path.endsWith("/")) {
+          results.push({ path, status: "skipped", reason: "directory_marker" });
+          continue;
+        }
+        if (!roomTextEligiblePath(path)) {
+          results.push({ path, status: "skipped", reason: "non_markdown", bytes: object.size });
+          continue;
+        }
+        if (object.size > ROOM_TEXT_MAX_BYTES) {
+          results.push({ path, status: "skipped", reason: "oversized", bytes: object.size });
+          continue;
+        }
+        if (action === "verify") {
+          const verified = await stub.rtPrimaryOpen({ userId, room, path });
+          results.push(verified.ok
+            ? { path, status: "verified", bytes: verified.file.byteLength, sha256: verified.file.sha256, version: verified.file.version }
+            : { path, status: "error", error: verified.error, message: verified.message || "" });
+          continue;
+        }
+        const source = await env.ROOMS_R2.get(object.key);
+        if (!source) {
+          results.push({ path, status: "error", error: "source_moved" });
+          continue;
+        }
+        const migrated = await stub.rtPrimaryImport({
+          userId,
+          room,
+          path,
+          bytes: await source.arrayBuffer(),
+          sourceEtag: source.etag,
+        });
+        results.push(migrated.ok
+          ? { path, status: "migrated", bytes: migrated.file.byteLength, sha256: migrated.file.sha256, version: migrated.file.version }
+          : { path, status: "error", error: migrated.error, message: migrated.message || "" });
+      }
+      return json({
+        ok: true,
+        action,
+        room,
+        results,
+        truncated: page.truncated,
+        cursor: page.truncated ? page.cursor : null,
+      });
+    }
+
     if (url.pathname === "/account/room-create" && request.method === "POST") {
+      if (configuredRoomTextMode(env) === "freeze") {
+        return json({ ok: false, error: "migration_in_progress" }, 503);
+      }
       const input = await readJson(request);
       const result = await registry(env, "/account-room-create", {
         token: bearerToken(request),
@@ -2021,6 +2145,12 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     // touch R2. AccountDO gives us the user id without hitting Registry for
     // the preflight when the token is routeable.
     if (url.pathname === "/account/room-delete" && request.method === "POST") {
+      if (configuredRoomTextMode(env) === "freeze") {
+        return json({ ok: false, error: "migration_in_progress" }, 503);
+      }
+      if (configuredRoomTextMode(env) === "on") {
+        return json({ ok: false, error: "roomtext_room_delete_not_supported" }, 409);
+      }
       const input = await readJson(request);
       const wiki = String(input.wiki || input.room || "");
       const token = bearerToken(request);
@@ -2199,18 +2329,20 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
         const grant = await resolveShareGrant(env, slug, clientIp(request));
         if (!grant) return json({ ok: false, error: "not_found" }, 403);
         if (!pathInSharePrefix(path, grant.prefix)) return json({ ok: false, error: "forbidden" }, 403);
-        const file = await r2File(env, grant.userId, grant.room, path);
-        if (!file) return json({ ok: false, error: "not_found" }, 404);
-        return json({ ok: true, file });
+        const opened = await authoritativeFile(env, grant.userId, grant.room, path);
+        if (!opened.ok) return json(opened, authorityErrorStatus(opened.error));
+        if (!opened.file) return json({ ok: false, error: "not_found" }, 404);
+        return json({ ok: true, file: opened.file });
       }
       if (!room) return json({ ok: false, error: "room_required" }, 400);
       const account = await authorizeAccount(env, token, clientIp(request), { route: "web.file", includeRooms: true });
       const userId = String(account.user_id || "");
       const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
       if (!userId || !rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
-      const file = await r2File(env, userId, room, path);
-      if (!file) return json({ ok: false, error: "not_found" }, 404);
-      return json({ ok: true, file });
+      const opened = await authoritativeFile(env, userId, room, path);
+      if (!opened.ok) return json(opened, authorityErrorStatus(opened.error));
+      if (!opened.file) return json({ ok: false, error: "not_found" }, 404);
+      return json({ ok: true, file: opened.file });
     }
 
     // Raw byte download of one file — used by `bashroom export` so binary
@@ -2226,6 +2358,20 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       const userId = String(account.user_id || "");
       const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
       if (!userId || !rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
+      if (configuredRoomTextMode(env) === "on" && roomTextEligiblePath(path)) {
+        const opened = await authoritativeFile(env, userId, room, path);
+        if (!opened.ok) return json(opened, authorityErrorStatus(opened.error));
+        if (!opened.file) return json({ ok: false, error: "not_found" }, 404);
+        if (opened.authority === "roomtext") {
+          return new Response(new TextEncoder().encode(opened.file.content), {
+            headers: {
+              "content-type": opened.file.content_type,
+              "x-content-type-options": "nosniff",
+              etag: opened.file.http_etag,
+            },
+          });
+        }
+      }
       const object = await env.ROOMS_R2.get(r2KeyForFile(userId, room, path));
       if (!object) return json({ ok: false, error: "not_found" }, 404);
       return new Response(object.body, {
@@ -2238,8 +2384,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
     // Save a file body from the web editor. Same membership gate as the GET
     // plus a "write" scope check, so read-only members can view but not save.
-    // Writes go straight to R2 (no sandbox boot) — the FUSE mount reads the
-    // same objects, so the next shell call sees the edit.
+    // Writes use the file's declared authority without booting a sandbox.
     if (url.pathname === "/web/api/file" && request.method === "PUT") {
       const token = bearerToken(request);
       const input = await readJson(request);
@@ -2264,12 +2409,11 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
         if (editor.ok === false) return json({ ok: false, error: "signin_required" }, 401);
         const actor = String(editor.handle || "guest");
         const shareBaseEtag = typeof input.base_etag === "string" ? input.base_etag : "";
-        const sharedWrote = await r2Put(env, grant.userId, grant.room, path, content, shareBaseEtag || undefined);
-        if (!sharedWrote) {
-          const current = await r2File(env, grant.userId, grant.room, path);
-          return json({ ok: false, error: "conflict", file: current }, 412);
-        }
-        const sharedFile = r2FileFromPut(sharedWrote, grant.userId, grant.room, content);
+        const replaced = await replaceAuthoritativeText(
+          env, grant.userId, grant.room, path, content, shareBaseEtag, `web:${String(editor.user_id || editor.handle || "guest")}`,
+        );
+        if (!replaced.ok) return json(replaced, writeErrorStatus(replaced.error));
+        const sharedFile = replaced.file;
         pokeRoomHub(ctx, env, grant.userId, grant.room, actor, path, "web", sharedFile.etag);
         defer(ctx, registry(env, "/audit-append", {
           user_id: grant.userId,
@@ -2294,12 +2438,11 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       // back the current file so the editor (or an agent) can re-merge —
       // lost updates become explicit conflicts instead of silent clobbers.
       const baseEtag = typeof input.base_etag === "string" ? input.base_etag : "";
-      const wrote = await r2Put(env, userId, room, path, content, baseEtag || undefined);
-      if (!wrote) {
-        const current = await r2File(env, userId, room, path);
-        return json({ ok: false, error: "conflict", file: current }, 412);
-      }
-      const file = r2FileFromPut(wrote, userId, room, content);
+      const replaced = await replaceAuthoritativeText(
+        env, userId, room, path, content, baseEtag, `web:${userId}`,
+      );
+      if (!replaced.ok) return json(replaced, writeErrorStatus(replaced.error));
+      const file = replaced.file;
       // Presence: a web edit is the human writing — attribute to the handle.
       // The etag lets other tabs skip refetching a version they already hold.
       pokeRoomHub(ctx, env, userId, room, String(account.handle || "you"), path, "web", file.etag);
@@ -2318,14 +2461,13 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     // ─── Public shares ────────────────────────────────────────────────────
     // POST mints (or returns the existing) share link for a page or
     // directory prefix; GET lists the caller's shares; DELETE revokes one.
-    // ─── RoomText dark-mount validation surface ─────────────────────────
-    // Promote copies an R2 file into the room's hot store (shadow — R2 stays
-    // the production authority; the janitor publishes only to
-    // roomtext-shadow/ keys). Parity returns the hot heads' hashes so the
-    // caller can byte-compare against R2. Flush forces a janitor drain so
-    // validation is deterministic. All three require write-scope room
-    // membership — this is an operator surface, inert unless called.
+    // ─── Legacy RoomText dark-mount validation surface ───────────────────
+    // Promotion is accepted only while mode=off. Once freeze/on begins, the
+    // lossless primary migration is the only path that may attach an R2 file.
     if (url.pathname === "/web/api/roomtext/promote" && request.method === "POST") {
+      if (configuredRoomTextMode(env) !== "off") {
+        return json({ ok: false, error: "dark_promote_disabled_after_cutover" }, 409);
+      }
       const token = bearerToken(request);
       const input = await readJson(request);
       const room = parseOptionalWiki(String(input.room || ""));
@@ -2433,7 +2575,9 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     if (url.pathname === "/web/api/shared" && request.method === "GET") {
       const access = await authorizeSharedDocument(env, request, url.searchParams.get("slug") || "");
       if (!access.ok) return json({ ok: false, error: access.error }, access.status);
-      const file = await r2File(env, access.ownerUserId, access.room, access.path);
+      const opened = await authoritativeFile(env, access.ownerUserId, access.room, access.path);
+      if (!opened.ok) return json(opened, authorityErrorStatus(opened.error));
+      const file = opened.file;
       if (!file) return json({ ok: false, error: "not_found" }, 404);
       if (file.is_binary) return json({ ok: false, error: "binary_file" }, 415);
       const comments = await documentCollab(env, access.ownerUserId, access.room, access.path).then((stub) => stub.listComments());
@@ -2460,12 +2604,17 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       if (!baseEtag) return json({ ok: false, error: "base_etag_required" }, 400);
       const writeBytes = utf8ByteLength(content);
       if (writeBytes > MAX_WRITE_BYTES) return json({ ok: false, error: "too_large" }, 413);
-      const wrote = await r2Put(env, access.ownerUserId, access.room, access.path, content, baseEtag);
-      if (!wrote) {
-        const current = await r2File(env, access.ownerUserId, access.room, access.path);
-        return json({ ok: false, error: "conflict", file: current }, 412);
-      }
-      const file = r2FileFromPut(wrote, access.ownerUserId, access.room, content);
+      const replaced = await replaceAuthoritativeText(
+        env,
+        access.ownerUserId,
+        access.room,
+        access.path,
+        content,
+        baseEtag,
+        `web:${access.actorUserId}`,
+      );
+      if (!replaced.ok) return json(replaced, writeErrorStatus(replaced.error));
+      const file = replaced.file;
       pokeRoomHub(ctx, env, access.ownerUserId, access.room, access.actor, access.path, "web", file.etag);
       defer(ctx, registry(env, "/audit-append", {
         user_id: access.ownerUserId,
@@ -2919,7 +3068,7 @@ async function runShell(env: Env, ctx: ExecutionContext, headerToken: string, ip
   if (!userId) {
     return { stdout: "", stderr: "bashroom: no account\n", exitCode: 1, changed: 0, changed_paths: [] };
   }
-  const result = await runShellV2(env, ctx, userId, command, stdin);
+  const result = await runShellV2(env, ctx, userId, command, stdin, account.rooms || []);
   // Presence: room-level touch for every room the command names. path=""
   // means "activity in this room" (readers refresh the tree, not a file);
   // heuristic until R2 event notifications provide per-file precision.
@@ -2961,9 +3110,84 @@ interface WriteResult {
   current_etag?: string;
 }
 
-// bashroom_write — authorize the exact room/path and write directly to R2.
-// Linux is unnecessary for a single-object write and would expose the wider
-// mounted filesystem to a path that should have one narrow capability.
+async function runEditFile(
+  env: Env,
+  ctx: ExecutionContext,
+  headerToken: string,
+  ip: string,
+  input: {
+    path: string;
+    oldText: string;
+    newText: string;
+    before?: string;
+    after?: string;
+    requestId: string;
+  },
+): Promise<Record<string, unknown> & { ok: boolean }> {
+  let parsed: ParsedRoomsPath;
+  try {
+    parsed = parseMcpRoomsPath(input.path, false);
+    if (parsed.root || !parsed.path) return { ok: false, error: "file_path_required" };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "invalid_path" };
+  }
+  const inputBytes = utf8ByteLength(input.path) + utf8ByteLength(input.oldText)
+    + utf8ByteLength(input.newText) + utf8ByteLength(input.before || "") + utf8ByteLength(input.after || "");
+  const account = await authorizeAccount(env, headerToken, ip, {
+    route: "mcp.edit",
+    inputBytes,
+    writeBytes: utf8ByteLength(input.newText),
+    includeRooms: true,
+  });
+  if (!account.ok) return { ok: false, error: String(account.error || "unauthorized") };
+  const userId = String(account.user_id || "");
+  const membership = (account.rooms || []).find((row) => row.room === parsed.room);
+  if (!userId || !membership) return { ok: false, error: "forbidden" };
+  if (!hasScope(membership.scopes, "write")) return { ok: false, error: "insufficient_scope" };
+  const result = await editAuthoritativeText(env, {
+    userId,
+    room: parsed.room,
+    path: parsed.path,
+    clientId: `mcp:${userId}`,
+    requestId: input.requestId,
+    oldText: input.oldText,
+    newText: input.newText,
+    before: input.before,
+    after: input.after,
+  });
+  if (!result.ok) {
+    return {
+      ...result,
+      ...(result.file ? { file: withoutFileContent(result.file) } : {}),
+    };
+  }
+  const actor = String(membership.actor || account.handle || "agent");
+  pokeRoomHub(ctx, env, userId, parsed.room, actor, parsed.path, "mcp", result.file.etag);
+  defer(ctx, registry(env, "/audit-append", {
+    user_id: userId,
+    room: parsed.room,
+    actor,
+    kind: "write",
+    path: parsed.path,
+    command: `roomtext:${input.requestId}`,
+    exit_code: 0,
+  }));
+  return {
+    ok: true,
+    path: input.path,
+    matched_at: result.matched_at,
+    replayed: Boolean(result.replayed),
+    file: withoutFileContent(result.file),
+  };
+}
+
+function withoutFileContent(file: R2File): Omit<R2File, "content"> {
+  const { content: _content, ...metadata } = file;
+  return metadata;
+}
+
+// bashroom_write — authorize the exact room/path and route to its declared
+// authority. Linux is unnecessary for one narrow file capability.
 async function runWriteFile(
   env: Env,
   ctx: ExecutionContext,
@@ -3002,6 +3226,48 @@ async function runWriteFile(
   const membership = (account.rooms || []).find((row) => row.room === parsed.room);
   if (!membership) return { ok: false, path, bytes: 0, error: "forbidden" };
   if (!hasScope(membership.scopes, "write")) return { ok: false, path, bytes: 0, error: "insufficient_scope" };
+  if (configuredRoomTextMode(env) === "freeze") {
+    return { ok: false, path, bytes: 0, error: "migration_in_progress" };
+  }
+  if (configuredRoomTextMode(env) === "on" && encoding === "utf-8"
+    && roomTextEligiblePath(parsed.path) && !createOnly) {
+    const replaced = await replaceAuthoritativeText(
+      env,
+      userId,
+      parsed.room,
+      parsed.path,
+      content,
+      baseEtag || "",
+      `mcp:${userId}`,
+    );
+    if (!replaced.ok) {
+      return {
+        ok: false,
+        path,
+        bytes: 0,
+        error: replaced.error,
+        current_etag: replaced.file?.etag,
+      };
+    }
+    const actor = String(membership.actor || account.handle || "agent");
+    pokeRoomHub(ctx, env, userId, parsed.room, actor, parsed.path, "mcp", replaced.file.etag);
+    defer(ctx, registry(env, "/audit-append", {
+      user_id: userId,
+      room: parsed.room,
+      actor,
+      kind: "write",
+      path: parsed.path,
+      command: null,
+      exit_code: 0,
+    }));
+    return {
+      ok: true,
+      path,
+      bytes,
+      etag: replaced.file.etag,
+      version: replaced.file.version,
+    };
+  }
   try {
     // create_only rides R2's commit-time precondition check via the Headers
     // form of onlyIf — the SAME primitive delta-rs trusts for multi-writer
@@ -3020,11 +3286,34 @@ async function runWriteFile(
       },
     );
     if (!object) {
+      if (configuredRoomTextMode(env) === "on" && encoding === "utf-8" && roomTextEligiblePath(parsed.path)) {
+        const current = await authoritativeFile(env, userId, parsed.room, parsed.path);
+        return {
+          ok: false,
+          path,
+          bytes: 0,
+          error: createOnly ? "exists" : "conflict",
+          current_etag: current.ok ? current.file?.etag : undefined,
+        };
+      }
       const current = await env.ROOMS_R2.head(r2KeyForFile(userId, parsed.room, parsed.path));
       return { ok: false, path, bytes: 0, error: createOnly ? "exists" : "conflict", current_etag: current?.etag };
     }
+    let resultEtag = object.etag;
+    let resultVersion = object.version;
+    // A newly-created eligible Markdown file is claimed immediately so the
+    // response carries the RoomText version token, not a one-use R2 ETag.
+    if (configuredRoomTextMode(env) === "on" && encoding === "utf-8"
+      && roomTextEligiblePath(parsed.path) && bytes <= ROOM_TEXT_MAX_BYTES) {
+      const imported = await authoritativeFile(env, userId, parsed.room, parsed.path);
+      if (!imported.ok || !imported.file) {
+        return { ok: false, path, bytes: 0, error: imported.ok ? "migration_failed" : imported.error };
+      }
+      resultEtag = imported.file.etag;
+      resultVersion = imported.file.version;
+    }
     const actor = String(membership.actor || account.handle || "agent");
-    pokeRoomHub(ctx, env, userId, parsed.room, actor, parsed.path, "mcp", object.etag);
+    pokeRoomHub(ctx, env, userId, parsed.room, actor, parsed.path, "mcp", resultEtag);
     defer(ctx, registry(env, "/audit-append", {
       user_id: userId,
       room: parsed.room,
@@ -3034,7 +3323,7 @@ async function runWriteFile(
       command: null,
       exit_code: 0,
     }));
-    return { ok: true, path, bytes, etag: object.etag, version: object.version };
+    return { ok: true, path, bytes, etag: resultEtag, version: resultVersion };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, path, bytes: 0, error: message };
@@ -3231,29 +3520,24 @@ async function mcpSharedRead(env: Env, token: string, ip: string, link: string, 
   if (!slug) return { ok: false, error: "invalid_share_link" };
   const access = await authorizeSharedDocumentToken(env, token, ip, slug);
   if (!access.ok) return { ok: false, error: access.error };
-  const key = r2KeyForFile(access.ownerUserId, access.room, access.path);
-  const object = await env.ROOMS_R2.head(key);
-  if (!object) return { ok: false, error: "not_found" };
-  const prefix = r2KeyForRoom(access.ownerUserId, access.room);
-  const metadata = r2MetadataForObject(object, prefix);
-  if (!isTextFile(metadata.path, metadata.content_type)) return { ok: false, error: "binary_file", file: { ...metadata, is_binary: true } };
+  const opened = await authoritativeFile(env, access.ownerUserId, access.room, access.path);
+  if (!opened.ok) return opened;
+  if (!opened.file) return { ok: false, error: "not_found" };
+  const file = opened.file;
+  if (file.is_binary) return { ok: false, error: "binary_file", file };
   const limit = clampInt(maxBytes, DEFAULT_MCP_READ_BYTES, MAX_MCP_READ_BYTES);
-  const length = Math.min(limit, metadata.size_bytes);
-  let content = "";
-  if (length > 0) {
-    const body = await env.ROOMS_R2.get(key, { range: { offset: 0, length } });
-    if (!body || !("text" in body)) return { ok: false, error: "not_found" };
-    content = await body.text();
-  }
+  const encoded = new TextEncoder().encode(file.content);
+  const length = Math.min(limit, encoded.byteLength);
+  const content = new TextDecoder().decode(encoded.subarray(0, length));
   const comments = await (await documentCollab(env, access.ownerUserId, access.room, access.path)).listComments();
   return {
     ok: true,
     role: access.role,
     room: access.room,
-    file: { ...metadata, is_binary: false },
+    file: withoutFileContent(file),
     content,
     bytes_returned: utf8ByteLength(content),
-    truncated: length < metadata.size_bytes,
+    truncated: length < encoded.byteLength,
     comments,
   };
 }
@@ -3274,12 +3558,22 @@ async function mcpSharedWrite(
   if (access.role !== "edit") return { ok: false, error: "read_only" };
   const bytes = utf8ByteLength(content);
   if (bytes > MAX_WRITE_BYTES) return { ok: false, error: "too_large" };
-  const wrote = await r2Put(env, access.ownerUserId, access.room, access.path, content, baseEtag);
-  if (!wrote) {
-    const current = await env.ROOMS_R2.head(r2KeyForFile(access.ownerUserId, access.room, access.path));
-    return { ok: false, error: "conflict", current_etag: current?.etag || null };
+  const replaced = await replaceAuthoritativeText(
+    env,
+    access.ownerUserId,
+    access.room,
+    access.path,
+    content,
+    baseEtag,
+    `mcp:${access.actorUserId}`,
+  );
+  if (!replaced.ok) {
+    return {
+      ...replaced,
+      current_etag: replaced.file?.etag || null,
+    };
   }
-  const file = r2FileFromPut(wrote, access.ownerUserId, access.room, content);
+  const file = replaced.file;
   pokeRoomHub(ctx, env, access.ownerUserId, access.room, access.actor, access.path, "mcp", file.etag);
   defer(ctx, registry(env, "/audit-append", {
     user_id: access.ownerUserId,
@@ -3385,18 +3679,15 @@ async function mcpRead(env: Env, token: string, ip: string, path: string, offset
     const roomAuth = await authorizeMcpStoragePath(env, token, ip, "mcp.read", parsed, utf8ByteLength(path));
     if (!roomAuth.ok) return roomAuth;
 
-    const key = r2KeyForFile(roomAuth.userId, roomAuth.room, roomAuth.path);
-    const object = await env.ROOMS_R2.head(key);
-    if (!object) return { ok: false, error: "not_found", path: formatRoomsPath(roomAuth.room, roomAuth.path) };
-
-    const prefix = r2KeyForRoom(roomAuth.userId, roomAuth.room);
-    const metadata = r2MetadataForObject(object, prefix);
-    const isBinary = !isTextFile(metadata.path, metadata.content_type);
-    if (isBinary) return { ok: false, error: "binary_file", file: { ...metadata, is_binary: true } };
-
-    const start = clampInt(offset, 0, Math.max(0, metadata.size_bytes));
+    const opened = await authoritativeFile(env, roomAuth.userId, roomAuth.room, roomAuth.path);
+    if (!opened.ok) return opened;
+    if (!opened.file) return { ok: false, error: "not_found", path: formatRoomsPath(roomAuth.room, roomAuth.path) };
+    const { content: fullContent, ...metadata } = opened.file;
+    if (metadata.is_binary) return { ok: false, error: "binary_file", file: metadata };
+    const encoded = new TextEncoder().encode(fullContent);
+    const start = clampInt(offset, 0, Math.max(0, encoded.byteLength));
     const limit = clampInt(maxBytes, DEFAULT_MCP_READ_BYTES, MAX_MCP_READ_BYTES);
-    if (start >= metadata.size_bytes) {
+    if (start >= encoded.byteLength) {
       return {
         ok: true,
         file: { ...metadata, is_binary: false },
@@ -3408,17 +3699,15 @@ async function mcpRead(env: Env, token: string, ip: string, path: string, offset
       };
     }
 
-    const length = Math.min(limit, metadata.size_bytes - start);
-    const body = await env.ROOMS_R2.get(key, { range: { offset: start, length } });
-    if (!body || !("text" in body)) return { ok: false, error: "not_found", path: formatRoomsPath(roomAuth.room, roomAuth.path) };
-    const content = await body.text();
+    const length = Math.min(limit, encoded.byteLength - start);
+    const content = new TextDecoder().decode(encoded.subarray(start, start + length));
     return {
       ok: true,
       file: { ...metadata, is_binary: false },
       offset: start,
       max_bytes: limit,
       bytes_returned: utf8ByteLength(content),
-      truncated: start + length < metadata.size_bytes,
+      truncated: start + length < encoded.byteLength,
       content,
     };
   } catch (error) {
@@ -3459,9 +3748,17 @@ async function webSearchRoom(
         if (!metadata.size_bytes) continue;
         if (!isTextFile(metadata.path, metadata.content_type)) continue;
         if (metadata.size_bytes > 256_000) continue;
-        const body = await env.ROOMS_R2.get(object.key, { range: { offset: 0, length: Math.min(metadata.size_bytes, 256_000) } });
-        if (!body || !("text" in body)) continue;
-        const lines = (await body.text()).split(/\r?\n/);
+        let source = "";
+        if (configuredRoomTextMode(env) === "on" && roomTextEligiblePath(metadata.path)) {
+          const opened = await authoritativeFile(env, userId, room, metadata.path);
+          if (!opened.ok || !opened.file || opened.file.is_binary || opened.file.size_bytes > 256_000) continue;
+          source = opened.file.content;
+        } else {
+          const body = await env.ROOMS_R2.get(object.key, { range: { offset: 0, length: Math.min(metadata.size_bytes, 256_000) } });
+          if (!body || !("text" in body)) continue;
+          source = await body.text();
+        }
+        const lines = source.split(/\r?\n/);
         for (let li = 0; li < lines.length; li += 1) {
           if (!lines[li].toLowerCase().includes(needle)) continue;
           if (budget.matches <= 0) break;
@@ -3521,10 +3818,21 @@ async function mcpSearch(
         skipped.push({ path: metadata.path, reason: "file_too_large", size_bytes: metadata.size_bytes });
         continue;
       }
-      const body = await env.ROOMS_R2.get(object.key, { range: { offset: 0, length: Math.min(metadata.size_bytes, maxBytesPerFile) } });
-      if (!body || !("text" in body)) continue;
+      let content = "";
+      if (configuredRoomTextMode(env) === "on" && roomTextEligiblePath(metadata.path)) {
+        const opened = await authoritativeFile(env, roomAuth.userId, roomAuth.room, metadata.path);
+        if (!opened.ok) {
+          skipped.push({ path: metadata.path, reason: opened.error, size_bytes: metadata.size_bytes });
+          continue;
+        }
+        if (!opened.file || opened.file.is_binary || opened.file.size_bytes > maxBytesPerFile) continue;
+        content = opened.file.content;
+      } else {
+        const body = await env.ROOMS_R2.get(object.key, { range: { offset: 0, length: Math.min(metadata.size_bytes, maxBytesPerFile) } });
+        if (!body || !("text" in body)) continue;
+        content = await body.text();
+      }
       scannedFiles += 1;
-      const content = await body.text();
       const lines = content.split(/\r?\n/);
       for (let index = 0; index < lines.length; index += 1) {
         const haystack = input.caseSensitive ? lines[index] : lines[index].toLowerCase();
@@ -3560,9 +3868,10 @@ async function mcpStat(env: Env, token: string, ip: string, path: string): Promi
     const roomAuth = await authorizeMcpStoragePath(env, token, ip, "mcp.stat", parsed, utf8ByteLength(path));
     if (!roomAuth.ok) return roomAuth;
 
-    const object = await env.ROOMS_R2.head(r2KeyForFile(roomAuth.userId, roomAuth.room, roomAuth.path));
-    if (!object) return { ok: false, error: "not_found", path: formatRoomsPath(roomAuth.room, roomAuth.path) };
-    const metadata = r2MetadataForObject(object, r2KeyForRoom(roomAuth.userId, roomAuth.room));
+    const opened = await authoritativeFile(env, roomAuth.userId, roomAuth.room, roomAuth.path);
+    if (!opened.ok) return opened;
+    if (!opened.file) return { ok: false, error: "not_found", path: formatRoomsPath(roomAuth.room, roomAuth.path) };
+    const metadata = withoutFileContent(opened.file);
     return {
       ok: true,
       path: formatRoomsPath(roomAuth.room, roomAuth.path),
@@ -3711,6 +4020,9 @@ async function handleSandboxAccountRequest(env: Env, userId: string, path: strin
 }
 
 async function createRoomForUser(env: Env, userId: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (configuredRoomTextMode(env) === "freeze") {
+    return { ok: false, error: "migration_in_progress" };
+  }
   const result = await registry(env, "/internal-room-create", {
     user_id: userId,
     room: input.room || input.wiki || "",
@@ -3882,6 +4194,164 @@ function r2FileFromPut(object: R2Object, userId: string, room: string, content: 
 // content stays behind account-authenticated JSON APIs. Unknown slug and
 // empty directory both 404 identically so the route doesn't leak which slugs
 // exist.
+async function replaceAuthoritativeText(
+  env: Env,
+  userId: string,
+  room: string,
+  path: string,
+  content: string,
+  baseVersion: string,
+  clientId: string,
+): Promise<AuthoritativeWriteResult> {
+  const mode = configuredRoomTextMode(env);
+  if (mode === "freeze") return { ok: false, error: "migration_in_progress" };
+  const current = await authoritativeFile(env, userId, room, path);
+  if (!current.ok) return current;
+
+  if (mode === "on" && current.authority === "roomtext") {
+    if (!current.file) {
+      if (utf8ByteLength(content) > ROOM_TEXT_MAX_BYTES) {
+        const wrote = await r2Put(env, userId, room, path, content, baseVersion || undefined);
+        if (!wrote) return { ok: false, error: "conflict" };
+        return { ok: true, file: r2FileFromPut(wrote, userId, room, content), authority: "r2" };
+      }
+      const created = await env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content, {
+        onlyIf: new Headers({ "If-None-Match": "*" }),
+        httpMetadata: { contentType: contentTypeForPath(path) },
+      });
+      if (!created) {
+        const winner = await authoritativeFile(env, userId, room, path);
+        return { ok: false, error: "conflict", ...(winner.ok && winner.file ? { file: winner.file } : {}) };
+      }
+      const imported = await authoritativeFile(env, userId, room, path);
+      if (!imported.ok) return imported;
+      if (!imported.file) return { ok: false, error: "migration_failed", message: "created file could not be imported" };
+      return { ok: true, file: imported.file, authority: imported.authority };
+    }
+    if (utf8ByteLength(content) > ROOM_TEXT_MAX_BYTES) {
+      return { ok: false, error: "document_too_large", file: current.file };
+    }
+    const anchors = await openCommentAnchors(env, userId, room, path);
+    const intentHash = await stableDigest(["replace", path, baseVersion, content]);
+    const result = await roomTextHub(env, userId, room).rtPrimaryReplace({
+      userId,
+      room,
+      path,
+      baseVersion,
+      content,
+      clientId,
+      requestId: intentHash,
+      intentHash,
+      anchors,
+    });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.error.toLowerCase(),
+        ...(result.message ? { message: result.message } : {}),
+        ...(result.file ? { file: primaryFileAsR2(result.file) } : {}),
+        ...(result.committed ? { committed: true, revision: result.revision } : {}),
+      };
+    }
+    await persistMappedCommentAnchors(env, userId, room, path, result.anchors);
+    return { ok: true, file: primaryFileAsR2(result.file), authority: "roomtext", replayed: result.replayed };
+  }
+
+  const wrote = await r2Put(env, userId, room, path, content, baseVersion || undefined);
+  if (!wrote) {
+    return { ok: false, error: "conflict", file: await r2File(env, userId, room, path) || undefined };
+  }
+  return { ok: true, file: r2FileFromPut(wrote, userId, room, content), authority: "r2" };
+}
+
+async function editAuthoritativeText(
+  env: Env,
+  input: {
+    userId: string;
+    room: string;
+    path: string;
+    clientId: string;
+    requestId: string;
+    oldText: string;
+    newText: string;
+    before?: string;
+    after?: string;
+  },
+): Promise<AuthoritativeWriteResult> {
+  const mode = configuredRoomTextMode(env);
+  if (mode === "freeze") return { ok: false, error: "migration_in_progress" };
+  if (mode !== "on") return { ok: false, error: "roomtext_not_enabled" };
+  if (!roomTextEligiblePath(input.path)) return { ok: false, error: "roomtext_ineligible_path" };
+  const current = await authoritativeFile(env, input.userId, input.room, input.path);
+  if (!current.ok) return current;
+  if (!current.file) return { ok: false, error: "not_found" };
+  if (current.authority !== "roomtext") {
+    return { ok: false, error: "roomtext_ineligible_file", message: "the file is oversized or not valid RoomText UTF-8" };
+  }
+  const anchors = await openCommentAnchors(env, input.userId, input.room, input.path);
+  const intentHash = await stableDigest([
+    "literal-edit", input.path, input.oldText, input.newText, input.before || "", input.after || "",
+  ]);
+  const result = await roomTextHub(env, input.userId, input.room).rtPrimaryEdit({
+    userId: input.userId,
+    room: input.room,
+    path: input.path,
+    clientId: input.clientId,
+    requestId: input.requestId,
+    intentHash,
+    oldText: input.oldText,
+    newText: input.newText,
+    before: input.before,
+    after: input.after,
+    anchors,
+  });
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: result.error.toLowerCase(),
+      ...(result.message ? { message: result.message } : {}),
+      ...(result.file ? { file: primaryFileAsR2(result.file) } : {}),
+      ...(result.matchCount !== undefined ? { match_count: result.matchCount } : {}),
+      ...(result.committed ? { committed: true, revision: result.revision } : {}),
+    };
+  }
+  await persistMappedCommentAnchors(env, input.userId, input.room, input.path, result.anchors);
+  return {
+    ok: true,
+    file: primaryFileAsR2(result.file),
+    authority: "roomtext",
+    replayed: result.replayed,
+    matched_at: result.matchedAt,
+  };
+}
+
+async function openCommentAnchors(env: Env, userId: string, room: string, path: string): Promise<RoomTextAnchor[]> {
+  const comments = await (await documentCollab(env, userId, room, path)).listComments();
+  return comments
+    .filter((comment) => !comment.resolved_at)
+    .map((comment) => ({ id: comment.id, start: comment.anchor_start, end: comment.anchor_end }));
+}
+
+async function persistMappedCommentAnchors(
+  env: Env,
+  userId: string,
+  room: string,
+  path: string,
+  anchors: RoomTextAnchor[] | undefined,
+): Promise<void> {
+  if (!anchors?.length) return;
+  const result = await (await documentCollab(env, userId, room, path)).remapCommentAnchors(
+    anchors.map((anchor) => ({ id: anchor.id, anchor_start: anchor.start, anchor_end: anchor.end })),
+  );
+  if (!result.ok) throw new Error(`comment_anchor_remap:${result.error}`);
+}
+
+async function stableDigest(parts: readonly string[]): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(parts));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function servePublicShare(env: Env, request: Request, url: URL, ctx: ExecutionContext): Promise<Response> {
   // Edge cache: a hot share link should not wake the Registry singleton on
   // every hit. Responses carry max-age=60, but Worker responses aren't
@@ -3911,9 +4381,9 @@ async function servePublicShare(env: Env, request: Request, url: URL, ctx: Execu
   // before the JSON collaboration endpoint returns content or comments.
   if (role !== "view") {
     if (!prefix || rest) return publicShareNotFound();
-    const object = await env.ROOMS_R2.head(r2KeyForFile(userId, room, prefix));
-    const contentType = object?.httpMetadata?.contentType || contentTypeForPath(prefix);
-    if (!object || !isTextFile(prefix, contentType)) return publicShareNotFound();
+    const opened = await authoritativeFile(env, userId, room, prefix);
+    if (!opened.ok || !opened.file || opened.file.is_binary) return publicShareNotFound();
+    const sharedFile = opened.file;
     // Edit links serve the /web SPA itself in capability mode — the same
     // live-preview editor, presence bar, and conflict flow as the app, with
     // slug-authorized API calls. One editing surface to maintain. Comment
@@ -3923,7 +4393,7 @@ async function servePublicShare(env: Env, request: Request, url: URL, ctx: Execu
       // first paint then needs ZERO API round-trips — the SPA seeds its
       // cache from the grant and revalidates in the background. Large
       // files fall back to the normal fetch path.
-      const inline = object.size <= 262_144 ? await r2File(env, userId, room, prefix) : null;
+      const inline = sharedFile.size_bytes <= 262_144 ? sharedFile : null;
       return new Response(webIndexHtml({ slug, room, path: prefix, role, ...(inline ? { file: inline } : {}) }), {
         headers: {
           "content-type": "text/html; charset=utf-8",
@@ -3956,6 +4426,23 @@ async function servePublicShare(env: Env, request: Request, url: URL, ctx: Execu
   };
 
   if (target) {
+    if (configuredRoomTextMode(env) === "on" && roomTextEligiblePath(target)) {
+      const opened = await authoritativeFile(env, userId, room, target);
+      if (!opened.ok) {
+        return html(publicShellHtml("temporarily unavailable", `<div class="empty">This file is safely quarantined while its copies are reconciled.</div>`), 409);
+      }
+      if (opened.file && opened.authority === "roomtext") {
+        const nonce = crypto.randomUUID();
+        return store(new Response(publicMarkdownHtml(room, target, opened.file.content, nonce, slug), {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "public, max-age=60",
+            "x-content-type-options": "nosniff",
+            "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'`,
+          },
+        }));
+      }
+    }
     const object = await env.ROOMS_R2.get(r2KeyForFile(userId, room, target));
     if (object) {
       const contentType = object.httpMetadata?.contentType || contentTypeForPath(target);
@@ -4242,7 +4729,33 @@ ${body}
 // Entrypoint replacing v1's runShell(). Every command goes to a fresh
 // session inside the per-user warm sandbox — control-plane verbs live
 // on dedicated /account/room-* HTTP endpoints, not in bash.
-async function runShellV2(env: Env, ctx: ExecutionContext, userId: string, command: string, stdin: string): Promise<ShellResult> {
+async function runShellV2(
+  env: Env,
+  ctx: ExecutionContext,
+  userId: string,
+  command: string,
+  stdin: string,
+  rooms: AccountRoom[],
+): Promise<ShellResult> {
+  if (configuredRoomTextMode(env) !== "off") {
+    // The mount is a read projection once RoomText owns Markdown. Drain each
+    // room before starting Linux so `cat` observes every durable RoomText
+    // commit even if its background projection previously retried.
+    const flushes = await Promise.all(rooms.map(async (membership) => ({
+      room: membership.room,
+      result: await roomTextHub(env, userId, membership.room).rtFlush(),
+    })));
+    const failed = flushes.find(({ result }) => result.results.some((entry) => !entry.ok));
+    if (failed) {
+      return {
+        stdout: "",
+        stderr: `bashroom: /rooms projection for ${failed.room} is quarantined; no shell was started\n`,
+        exitCode: 1,
+        changed: 0,
+        changed_paths: [],
+      };
+    }
+  }
   // Real bash via the sandbox. One sandbox per user, fresh session per call.
   const sandbox = await ensureSandboxReady(env, userId);
   const sessionId = `cmd-${crypto.randomUUID()}`;
@@ -4308,22 +4821,27 @@ async function ensureSandboxReady(env: Env, userId: string): Promise<Sandbox> {
   // and matches the SDK's documented future-default.
   const sandbox = getSandbox(env.SANDBOXES, userId, { normalizeId: true });
   await sandbox.setOutboundByHost("bashroom.internal", "bashroomControl", { userId });
-  if (!(await isRoomsMounted(sandbox))) {
+  const readOnly = configuredRoomTextMode(env) !== "off";
+  const mountMode = readOnly ? "roomtext-ro-v1" : "r2-rw-v1";
+  if (!(await isRoomsMounted(sandbox, mountMode))) {
     // Upgrade any warm container that still has the former credential-bearing
     // mount. The binding mode routes R2 traffic through ContainerProxy and
     // never writes S3 credentials into the untrusted Linux environment.
     await sandbox.unmountBucket("/rooms").catch(() => undefined);
     await sandbox.mountBucket("ROOMS_R2", "/rooms", {
       prefix: `/users/${userId}/`,
+      readOnly,
     });
-    await sandbox.exec("touch /tmp/.bashroom-r2-binding-v1");
+    await sandbox.exec(`printf %s ${JSON.stringify(mountMode)} > /tmp/.bashroom-mount-mode`);
   }
   return sandbox;
 }
 
-async function isRoomsMounted(sandbox: Sandbox): Promise<boolean> {
+async function isRoomsMounted(sandbox: Sandbox, expectedMode: string): Promise<boolean> {
   try {
-    const result = await sandbox.exec("mountpoint -q /rooms && test -f /tmp/.bashroom-r2-binding-v1 && echo MOUNTED || echo NOT_MOUNTED");
+    const result = await sandbox.exec(
+      `mountpoint -q /rooms && test "$(cat /tmp/.bashroom-mount-mode 2>/dev/null)" = ${JSON.stringify(expectedMode)} && echo MOUNTED || echo NOT_MOUNTED`,
+    );
     return result.stdout.trim() === "MOUNTED";
   } catch {
     return false;
@@ -4341,11 +4859,11 @@ async function seedR2Room(env: Env, userId: string, room: string, actor: string)
   const cleanActor = sanitizeActor(actor || "actor");
   const files: Record<string, string> = {
     "README.md":
-      `# ${room}\n\nA Bashroom room. Multiple agents read and write the files here through ` +
-      `durable bash. Edit this README to describe what this specific room is for.\n`,
+      `# ${room}\n\nA Bashroom room. Multiple agents read and edit these durable files through ` +
+      `RoomText-aware tools. Edit this README to describe what this room is for.\n`,
     "AGENTS.md":
       `# Bashroom room conventions\n\n` +
-      `Shared Markdown filesystem. Multiple agents read and write here.\n` +
+      `Shared Markdown filesystem. Multiple agents read and edit here.\n` +
       `Reorganize freely — rename, split, merge, or delete files when the\n` +
       `structure no longer fits. Room history is an activity log, not file\n` +
       `version recovery, so preserve anything you may need later.\n\n` +
@@ -4354,10 +4872,10 @@ async function seedR2Room(env: Env, userId: string, room: string, actor: string)
       `- Standalone topics → \`notes/<topic>.md\` (one file per subject)\n` +
       `- Top-level \`index.md\` is the table of contents — keep it current when files change\n\n` +
       `## Rules\n\n` +
-      `- IMPORTANT: append to log files (\`>>\`), don't overwrite (\`>\`) — preserves chronology\n` +
+      `- IMPORTANT: /rooms is read-only in bash. Use bashroom_edit for targeted changes or bashroom_write with the version you read.\n` +
       `- IMPORTANT: update \`index.md\` whenever the file tree changes\n` +
       `- Creating a new file? Use bashroom_write with create_only=true — if it fails with 'exists', another agent beat you: read theirs and merge.\n` +
-      `- To claim a file exclusively, create \`<file>.lock\` with create_only=true; delete it when done. If the lock exists, work elsewhere or wait.\n` +
+      `- Prefer a unique late-resolved bashroom_edit over replacing a whole shared document.\n` +
       `- Markdown only. No binaries.\n` +
       `- If a file gets long, split it into a folder.\n`,
     "index.md":
@@ -4375,8 +4893,22 @@ async function seedR2Room(env: Env, userId: string, room: string, actor: string)
       `One Markdown file per topic. Filename = topic, kebab-case (e.g. \`auth-flow.md\`).\n` +
       `Delete this README when the folder has real content.\n`,
   };
-  // Parallel PUTs — each room has ~5 files and R2 PUTs are independent.
-  await Promise.all(Object.entries(files).map(([path, content]) => r2Put(env, userId, room, path, content)));
+  // Seed create-only. A partially deleted/recreated room can leave objects
+  // behind; preserving those bytes is safer than silently replacing them.
+  // In RoomText mode, immediately claim every eligible seed so the first
+  // caller receives the same version-token authority as an existing room.
+  await Promise.all(Object.entries(files).map(async ([path, content]) => {
+    await env.ROOMS_R2.put(r2KeyForFile(userId, room, path), content, {
+      onlyIf: new Headers({ "If-None-Match": "*" }),
+      httpMetadata: { contentType: contentTypeForPath(path) },
+    });
+    if (configuredRoomTextMode(env) === "on" && roomTextEligiblePath(path)) {
+      const claimed = await authoritativeFile(env, userId, room, path);
+      if (!claimed.ok || !claimed.file) {
+        throw new Error(`room_seed_import_failed:${path}:${claimed.ok ? "missing" : claimed.error}`);
+      }
+    }
+  }));
   await registry(env, "/audit-append", {
     user_id: userId, room, actor: cleanActor, kind: "seed", path: null, command: null, exit_code: 0,
   });
@@ -4386,6 +4918,87 @@ async function r2Tree(env: Env, userId: string, room: string): Promise<R2FileMet
   const objects = await r2List(env, userId, room, true);
   const prefix = r2KeyForRoom(userId, room);
   return objects.map((object) => r2MetadataForObject(object, prefix));
+}
+
+function configuredRoomTextMode(env: Env): RoomTextMode {
+  return env.ROOM_TEXT_MODE === "on" || env.ROOM_TEXT_MODE === "freeze"
+    ? env.ROOM_TEXT_MODE
+    : "off";
+}
+
+function roomTextEligiblePath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.endsWith(".md") || lower.endsWith(".markdown");
+}
+
+function roomTextHub(env: Env, userId: string, room: string): DurableObjectStub<RoomHub> {
+  return env.ROOM_HUBS.get(env.ROOM_HUBS.idFromName(`${userId}:${room}`));
+}
+
+function primaryFileAsR2(file: RoomTextPrimaryFile): R2File {
+  return {
+    path: file.path,
+    size_bytes: file.byteLength,
+    updated_at: new Date(file.updatedAt).toISOString(),
+    etag: file.version,
+    http_etag: `"${file.version}"`,
+    version: file.version,
+    content_type: contentTypeForPath(file.path),
+    custom_metadata: {
+      authority: "roomtext-v1",
+      epoch: String(file.epoch),
+      revision: String(file.revision),
+      sha256: file.sha256,
+    },
+    content: file.content,
+    is_binary: false,
+  };
+}
+
+/**
+ * Open the sole authoritative copy. In `on` mode, eligible Markdown lazily
+ * migrates by exact bytes and conditional source ETag. Oversized or non-
+ * Markdown objects stay explicitly R2-owned; a failed migration returns an
+ * incompatibility error instead of decoding or overwriting the object.
+ */
+async function authoritativeFile(
+  env: Env,
+  userId: string,
+  room: string,
+  path: string,
+): Promise<AuthoritativeFileResult> {
+  if (configuredRoomTextMode(env) !== "on" || !roomTextEligiblePath(path)) {
+    return { ok: true, file: await r2File(env, userId, room, path), authority: "r2" };
+  }
+  const stub = roomTextHub(env, userId, room);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const opened = await stub.rtPrimaryOpen({ userId, room, path });
+    if (opened.ok) return { ok: true, file: primaryFileAsR2(opened.file), authority: "roomtext" };
+    if (opened.error !== "NOT_IMPORTED") {
+      return { ok: false, error: opened.error, ...(opened.message ? { message: opened.message } : {}) };
+    }
+
+    const source = await env.ROOMS_R2.get(r2KeyForFile(userId, room, path));
+    if (!source) return { ok: true, file: null, authority: "roomtext" };
+    const metadata = r2MetadataForObject(source, r2KeyForRoom(userId, room));
+    if (source.size > ROOM_TEXT_MAX_BYTES || !isTextFile(path, metadata.content_type)) {
+      return {
+        ok: true,
+        authority: "r2",
+        file: {
+          ...metadata,
+          content: isTextFile(path, metadata.content_type) ? await source.text() : "",
+          is_binary: !isTextFile(path, metadata.content_type),
+        },
+      };
+    }
+    const bytes = await source.arrayBuffer();
+    const imported = await stub.rtPrimaryImport({ userId, room, path, bytes, sourceEtag: source.etag });
+    if (imported.ok) return { ok: true, file: primaryFileAsR2(imported.file), authority: "roomtext" };
+    if (imported.error === "SOURCE_MOVED") continue;
+    return { ok: false, error: imported.error, ...(imported.message ? { message: imported.message } : {}) };
+  }
+  return { ok: false, error: "source_busy", message: "the R2 source changed repeatedly during migration" };
 }
 
 async function r2File(env: Env, userId: string, room: string, path: string): Promise<R2File | null> {
@@ -4525,6 +5138,21 @@ function formatShellResult(result: ShellResult): string {
   return `${output}${output && !output.endsWith("\n") ? "\n" : ""}[bashroom] exit=${result.exitCode} changed=${result.changed}${paths}\n`;
 }
 
+function authorityErrorStatus(error: string): number {
+  if (error === "not_found") return 404;
+  if (error.includes("unavailable") || error.includes("busy") || error === "source_busy") return 503;
+  if (error.includes("invalid") || error.includes("ineligible")) return 415;
+  return 409;
+}
+
+function writeErrorStatus(error: string): number {
+  if (error === "conflict") return 412;
+  if (error === "migration_in_progress" || error.includes("unavailable") || error.includes("busy")) return 503;
+  if (error.includes("too_large")) return 413;
+  if (error === "not_found") return 404;
+  return authorityErrorStatus(error);
+}
+
 function json(value: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(value, null, 2), {
     status,
@@ -4549,8 +5177,8 @@ function html(value: string, status = 200): Response {
 function httpHelpText(): string {
   return `# Bashroom
 
-A filesystem for agents. \`/rooms\` is FUSE-mounted from
-Cloudflare R2 and persists across calls.
+A filesystem for agents. Eligible Markdown is ordered by RoomText and mirrored
+to R2; \`/rooms\` is a read-only shell projection.
 
 ## Agent-readable
 
@@ -4577,8 +5205,9 @@ claude mcp add --scope user --transport http bashroom https://bashroom.sdan.io/m
 ## Tools
 
 - \`bashroom({ command, stdin? })\` — runs bash inside your sandbox.
-- \`bashroom_write({ path, content, encoding?, base_etag? })\` — writes a file directly with optional conflict detection.
-- \`bashroom_tree/read/search/stat(...)\` — reads bounded R2 context without
+- \`bashroom_edit({ path, old_text, new_text, before?, after?, request_id })\` — commits one uniquely anchored Markdown edit.
+- \`bashroom_write({ path, content, encoding?, base_etag?, create_only? })\` — creates or replaces a file with conflict detection.
+- \`bashroom_tree/read/search/stat(...)\` — reads bounded authoritative context without
   starting bash.
 
 ## Source
@@ -4594,10 +5223,10 @@ function llmsTxt(env: Env, request: Request): string {
   return `# Bashroom
 
 > A filesystem for agents. MCP exposes real \`bash\` plus
-> bounded R2 file tools for tree, read, search, stat, and direct writes.
-> \`/rooms\` is FUSE-mounted from Cloudflare R2 inside the sandbox.
+> bounded authoritative file tools plus sequenced Markdown edits.
+> \`/rooms\` is mounted read-only inside the sandbox.
 > Room admin is available through the visible \`bashroom\` helper; destructive
-> room deletion stays laptop-only.
+> room deletion is disabled while RoomText owns files.
 
 ## Use
 
@@ -4609,8 +5238,9 @@ function llmsTxt(env: Env, request: Request): string {
 ## MCP
 
 - [MCP endpoint](${base}/mcp): streamable HTTP transport
-- Tools: \`bashroom\`, \`bashroom_write\`, \`bashroom_tree\`,
-  \`bashroom_read\`, \`bashroom_search\`, \`bashroom_stat\`
+- Tools: \`bashroom\`, \`bashroom_edit\`, \`bashroom_write\`, \`bashroom_tree\`,
+  \`bashroom_read\`, \`bashroom_search\`, \`bashroom_stat\`,
+  \`bashroom_shared_read\`, \`bashroom_shared_write\`, \`bashroom_shared_comment\`
 
 ## Optional
 

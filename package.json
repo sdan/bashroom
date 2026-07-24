@@ -20,6 +20,7 @@
     "test": "vitest run --dir src",
     "test:room-text-workerd": "node scripts/room-text-probe/run.mjs",
     "test:room-text-adversarial": "node scripts/room-text-probe/blast-adversarial.mjs",
+    "migrate:roomtext": "node scripts/migrate-roomtext.mjs",
     "webcheck": "node scripts/check-webui.mjs src/web-ui.ts /tmp/bashroom-web-ui.js && node --check /tmp/bashroom-web-ui.js && node scripts/check-collab-ui.mjs src/web-collab.ts src/index.ts",
     "smoke": "node bin/bashroom.js --help",
     "check": "npm run typecheck && npm test && npm run test:room-text-workerd && npm run webcheck && npm run smoke"
@@ -33,19 +34,19 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "4.20260617.1",
     "json-joy": "^18.28.0",
     "tslib": "^2.8.1",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4",
-    "wrangler": "4.102.0",
+    "wrangler": "4.114.0",
     "ws": "^8.18.3"
   },
   "engines": {
     "node": ">=20"
   },
   "overrides": {
-    "fast-uri": "3.1.3",
+    "body-parser": "2.3.0",
+    "fast-uri": "3.1.4",
     "ip-address": "10.2.0",
     "js-yaml": "4.3.0",
     "qs": "6.15.3"

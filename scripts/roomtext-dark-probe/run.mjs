@@ -31,8 +31,8 @@ const FILES = [
   { path: "notes/crlf.md", content: "line one\r\nline two\r\nmixed\rendings\n" },
 ];
 
-function wsClient(params) {
-  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?room=${ROOM}&${params}`);
+function wsClient(params, room = ROOM) {
+  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?room=${encodeURIComponent(room)}&${params}`);
   const inbox = [];
   const waiters = [];
   ws.on("message", (data) => {
@@ -125,18 +125,19 @@ try {
   await connect(viewer, "c-carol");
 
   editor.send({ type: "push", pushes: [{ protocol: 1, fileId: "index.md", epoch: hydA.epoch, baseRevision: hydA.headRevision, clientId: "alice", requestId: "r1", changes: [{ from: 0, to: 0, insert: "EDITED: " }] }] });
-  const ack = await editor.next((f) => f.type === "ack");
-  phase("push: echo-as-ack commit to sender", ack.status === "commit" && ack.revision === hydA.headRevision + 1, ack);
+  const selfUpdate = await editor.next((f) => f.type === "updates");
+  const ackRevision = selfUpdate.updates[0]?.revision;
+  phase("push: canonical echo acknowledges sender", ackRevision === hydA.headRevision + 1, { revision: ackRevision });
   const upd = await watcher.next((f) => f.type === "updates");
   phase("push: updates broadcast to other same-file socket", upd.fileId === "index.md" && upd.updates.length === 1, { headRevision: upd.headRevision });
 
   // idempotent replay: same (clientId, requestId) must ack identically, no re-broadcast
   editor.send({ type: "push", pushes: [{ protocol: 1, fileId: "index.md", epoch: hydA.epoch, baseRevision: hydA.headRevision, clientId: "alice", requestId: "r1", changes: [{ from: 0, to: 0, insert: "EDITED: " }] }] });
   const replayAck = await editor.next((f) => f.type === "ack");
-  phase("push: idempotent replay acks same revision", replayAck.revision === ack.revision, replayAck);
+  phase("push: idempotent replay acks same revision", replayAck.revision === ackRevision, replayAck);
 
   // readonly socket: push must be refused with a non-retryable discard
-  viewer.send({ type: "push", pushes: [{ protocol: 1, fileId: "index.md", epoch: hydA.epoch, baseRevision: ack.revision, clientId: "carol", requestId: "rx", changes: [{ from: 0, to: 0, insert: "HACK" }] }] });
+  viewer.send({ type: "push", pushes: [{ protocol: 1, fileId: "index.md", epoch: hydA.epoch, baseRevision: ackRevision, clientId: "carol", requestId: "rx", changes: [{ from: 0, to: 0, insert: "HACK" }] }] });
   const discard = await viewer.next((f) => f.type === "discard");
   phase("readonly socket: push refused, non-retryable", discard.retryable === false, discard);
 
@@ -154,12 +155,12 @@ try {
   const eve = wsClient("viewer=eve&readonly=0&prefix=notes");
   await eve.open();
   await eve.next((f) => f.type === "hello");
-  eve.send({ type: "push", pushes: [{ protocol: 1, fileId: "index.md", epoch: hydA.epoch, baseRevision: ack.revision, clientId: "eve", requestId: "e1", changes: [{ from: 0, to: 0, insert: "ESCAPED" }] }] });
+  eve.send({ type: "push", pushes: [{ protocol: 1, fileId: "index.md", epoch: hydA.epoch, baseRevision: ackRevision, clientId: "eve", requestId: "e1", changes: [{ from: 0, to: 0, insert: "ESCAPED" }] }] });
   const fenced = await eve.next((f) => f.type === "discard");
   phase("prefix fence: out-of-prefix push refused (no oracle)", fenced.code === "NOT_FOUND" && fenced.retryable === false, fenced);
   eve.send({ type: "push", pushes: [{ protocol: 1, fileId: "notes/crlf.md", epoch: 1, baseRevision: 0, clientId: "eve", requestId: "e2", changes: [{ from: 0, to: 0, insert: "in-prefix: " }] }] });
-  const inPrefix = await eve.next((f) => f.type === "ack");
-  phase("prefix fence: in-prefix push commits", inPrefix.status === "commit" && inPrefix.revision === 1, inPrefix);
+  const inPrefix = await eve.next((f) => f.type === "updates");
+  phase("prefix fence: in-prefix push commits", inPrefix.updates[0]?.revision === 1, inPrefix);
   eve.ws.close();
 
   // F. flush after edit: hot diverges from source (expected in dark mode),
@@ -171,7 +172,7 @@ try {
   // two were never touched and must still match their R2 source exactly.
   const editedPaths = new Set(["index.md", "notes/crlf.md"]);
   const untouchedStillMatch = parity2.files.filter((f) => !editedPaths.has(f.path)).every((f) => f.match);
-  phase("after edit: hot head diverged, source etag unmoved (dark)", indexRow && !indexRow.match && !indexRow.etag_moved && indexRow.revision === ack.revision, { revision: indexRow?.revision });
+  phase("after edit: hot head diverged, source etag unmoved (dark)", indexRow && !indexRow.match && !indexRow.etag_moved && indexRow.revision === ackRevision, { revision: indexRow?.revision });
   phase("after edit: untouched files still 100% match", untouchedStillMatch, {});
   const finalUsers = await get(`/r2-list?prefix=${usersPrefix}`);
   phase("final: production keys byte-for-byte untouched", finalUsers.keys.length === FILES.length && finalUsers.keys.every((k) => [...seededEtags.values()].includes(k.etag)), { keys: finalUsers.keys.length });
@@ -182,11 +183,86 @@ try {
   // must be a no-op. (Pre-fix: artifact exported at snapshot_revision 0,
   // clearDirty(0) retired nothing, alarm re-fired every 2s forever.)
   const head = await get(`/shadow-head?room=${ROOM}&path=index.md`);
-  phase("janitor: shadow HEAD advanced to edited revision", head.ok && head.manifest.revision === ack.revision, head.manifest);
+  phase("janitor: shadow HEAD advanced to edited revision", head.ok && head.manifest.revision === ackRevision, head.manifest);
   const drain2 = await post("/flush", { room: ROOM });
   phase("janitor: dirty set fully retired (no loop)", drain2.remaining === 0 && drain2.results.length === 0, drain2);
   const parity3 = await get(`/parity?room=${ROOM}`);
   phase("janitor: no file left dirty after drain", parity3.files.every((f) => f.dirty === false), parity3.files.map((f) => ({ path: f.path, dirty: f.dirty })));
+
+  // H. Production-primary migration path: conditional same-byte claim,
+  // literal edit, exact canonical projection, idempotent retry, and foreign
+  // writer quarantine. Both copies must survive the adversarial final step.
+  const primaryRoom = `${ROOM}-primary`;
+  const primaryPath = "index.md";
+  const primarySource = "# primary\n\nStatus: draft\n";
+  await post("/seed", { room: primaryRoom, path: primaryPath, content: primarySource });
+  const imported = await post("/primary-import", { room: primaryRoom, path: primaryPath });
+  phase("primary: exact R2 bytes imported at revision zero", imported.ok && imported.file.content === primarySource && imported.file.version === "rt1:1:0", {
+    version: imported.file?.version,
+  });
+  const claimed = await get(`/r2-get?room=${encodeURIComponent(primaryRoom)}&path=${encodeURIComponent(primaryPath)}`);
+  phase("primary: R2 source claimed without changing bytes", claimed.content === primarySource && claimed.customMetadata["br-authority"] === "roomtext-v1", {
+    authority: claimed.customMetadata["br-authority"],
+  });
+
+  const literal = await post("/primary-edit", {
+    room: primaryRoom,
+    path: primaryPath,
+    requestId: "literal-1",
+    intentHash: "b".repeat(64),
+    oldText: "draft",
+    newText: "approved",
+    before: "Status: ",
+  });
+  phase("primary: literal edit commits one new revision", literal.ok && literal.file.version === "rt1:1:1" && literal.file.content.includes("approved"), {
+    version: literal.file?.version,
+  });
+  const projected = await get(`/r2-get?room=${encodeURIComponent(primaryRoom)}&path=${encodeURIComponent(primaryPath)}`);
+  phase("primary: canonical R2 projection matches RoomText head", projected.content === literal.file.content && projected.customMetadata["br-revision"] === "1", {
+    revision: projected.customMetadata["br-revision"],
+  });
+
+  const retry = await post("/primary-edit", {
+    room: primaryRoom,
+    path: primaryPath,
+    requestId: "literal-1",
+    intentHash: "b".repeat(64),
+    oldText: "draft",
+    newText: "approved",
+    before: "Status: ",
+  });
+  phase("primary: lost-response retry replays instead of resolving twice", retry.ok && retry.replayed === true && retry.file.version === "rt1:1:1", {
+    replayed: retry.replayed,
+  });
+
+  const staleReplace = await post("/primary-replace", {
+    room: primaryRoom,
+    path: primaryPath,
+    baseVersion: "rt1:1:0",
+    requestId: "replace-stale",
+    intentHash: "c".repeat(64),
+    content: "stale overwrite",
+  });
+  phase("primary: stale whole-file replacement conflicts safely", staleReplace.ok === false && staleReplace.error === "CONFLICT" && staleReplace.file.content.includes("approved"), {
+    error: staleReplace.error,
+  });
+
+  const foreign = "FOREIGN R2 COPY — preserve me\n";
+  await post("/foreign-write", { room: primaryRoom, path: primaryPath, content: foreign });
+  const quarantined = await post("/primary-open", { room: primaryRoom, path: primaryPath });
+  const foreignStillThere = await get(`/r2-get?room=${encodeURIComponent(primaryRoom)}&path=${encodeURIComponent(primaryPath)}`);
+  phase("primary: foreign R2 write quarantines instead of overwriting", quarantined.ok === false && quarantined.error === "R2_DIVERGED" && foreignStillThere.content === foreign, {
+    error: quarantined.error,
+  });
+  const preserved = wsClient("viewer=recovery&readonly=1", primaryRoom);
+  await preserved.open();
+  await preserved.next((f) => f.type === "hello");
+  preserved.send({ type: "connect", connectRequestId: "recover", protocolVersion: 1, fileId: primaryPath, epoch: 0, lastRevision: 0 });
+  const preservedHead = await preserved.next((f) => f.type === "hydration" && f.connectRequestId === "recover");
+  phase("primary: RoomText copy also survives divergence", preservedHead.doc === literal.file.content && preservedHead.headRevision === 1, {
+    revision: preservedHead.headRevision,
+  });
+  preserved.ws.close();
 
   console.log("\n=== SUMMARY ===");
   console.log(JSON.stringify({ passed: results.phases.filter((p) => p.ok).length, failed: results.failures.length, failures: results.failures }, null, 2));

@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "bashroom",
   "main": "src/index.ts",
-  "compatibility_date": "2026-04-20",
+  "compatibility_date": "2026-07-24",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
     "bindings": [
@@ -89,6 +89,10 @@
   "vars": {
     "GITHUB_CLIENT_ID": "Ov23ligO8e72A6E9MGRx",
     "BASHROOM_PUBLIC_URL": "https://bashroom.sdan.io",
+    // Three-stage authority handoff: off -> freeze -> on. Production starts
+    // dark; the migration driver only runs while frozen, and `on` makes the
+    // R2 FUSE mount read-only so no writer can bypass RoomText.
+    "ROOM_TEXT_MODE": "on",
     // Sandbox SDK: HTTP/WebSocket transports are removed 2026-07-09; RPC is
     // the supported transport going forward (read by the Sandbox DO's ctor).
     "SANDBOX_TRANSPORT": "rpc"

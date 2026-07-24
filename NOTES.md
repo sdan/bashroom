@@ -5,6 +5,45 @@ design decisions with their context, and experiments. ARCHITECTURAL.md is
 the current-state truth; this file is the why-we-believe-it log. Add new
 entries at the top with `## YYYY-MM-DD — topic`.
 
+## 2026-07-24 — RoomText became production Markdown authority
+
+Cut over with an explicit `off -> freeze -> on` deployment fence. Production
+version `731f0c07-b582-4a61-a3d5-1f7a7ba62315` has `ROOM_TEXT_MODE=on`.
+
+No-loss evidence:
+
+- Pre-cutover cloud copy: `bashroom-rooms-pre-roomtext-20260724`, 724/724
+  source objects SHA-256 matched by the temporarily deployed copy worker.
+  Report SHA-256: `6f8e7b50a0b460b6f15cf8a3d7faf9bde742735424bc84af2a977661ef80e369`.
+- Frozen local export: 699 files, 5,490,192 bytes. Manifest SHA-256:
+  `15e02c2ee542e3d31d3593be43ce45ad2a98904fc5c0182032c94db611a0f697`;
+  tarball SHA-256:
+  `c5a9c2dae914bf7efdb3d00c4ef996d995abe61740781978746e60866cb86454`.
+- The pre-freeze and frozen manifests were identical. A second full export
+  after migration produced the same manifest, proving that conditional R2
+  ownership metadata writes changed zero file bytes.
+- 698 eligible Markdown files imported and independently verified; zero
+  errors. `longloop/session-log.md` is 1,157,721 bytes, exceeds RoomText's
+  1,000,000-byte cap, and remains byte-identical under explicit R2 authority.
+  Twelve other skipped R2 objects were directory markers.
+- Migration report SHA-256:
+  `47ab9c939f9d7ef6ca9ba44f49894542670986f98647d8e2381fa3c34263fd8a`.
+  Independent verify-only report SHA-256:
+  `738f11c5170f35e8b3ff41addb1b68a8a3992d72bd5ac00d196ff58ce6371eae`.
+
+Production canary (`milkdown-test/roomtext-production-canary-20260724.md`):
+create-only returned `rt1:1:0`; literal edit returned `rt1:1:1`; replay of the
+same request returned the same revision; a stale whole-file replacement was
+rejected; the final edit returned `rt1:1:2`. MCP, web, direct R2, and the
+read-only shell projection all matched SHA-256
+`a631ab9732837a005549eeb20ee39900c2cf6b38f0e9195574d137befd37576c`.
+
+Deliberate product constraints after cutover: `/rooms` is read-only; use
+`bashroom_edit` or versioned `bashroom_write`. Room deletion is disabled until
+Registry, R2, and RoomHub SQLite have one explicit delete protocol. The web UI
+still submits whole-document CAS saves; RoomText is production authority, but
+the headless delta client is not yet wired into the browser editor.
+
 ## 2026-07-20 — Dark mount lands: RoomText inside RoomHub, 16/16 in real workerd
 
 User decision (2026-07-19) superseded the freeze: port + migrate + validate.

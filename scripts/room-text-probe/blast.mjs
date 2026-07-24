@@ -195,13 +195,13 @@ const anchoredPush = await post("/push", anchoredRequest);
 assert.equal(anchoredPush.ok, true);
 assert.deepEqual(anchoredPush.anchors, [{ id: commentId, start: 9, end: 14 }]);
 
-// An idempotent replay returns the same revision but never re-reports
-// anchors: the first accept already carried the mapping, and mapping an
-// already rewritten anchor through the same update would double-shift it.
+// An idempotent replay returns the exact stored absolute anchor result. The
+// host can safely SET those positions again after a lost response or failed
+// cross-DO remap; it must never map the already-rewritten anchor a second time.
 const anchoredReplay = await post("/push", anchoredRequest);
 assert.equal(anchoredReplay.ok, true);
 assert.equal(anchoredReplay.revision, anchoredPush.revision);
-assert.equal(anchoredReplay.anchors, undefined);
+assert.deepEqual(anchoredReplay.anchors, anchoredPush.anchors);
 
 const remapped = await post("/comments/remap", { anchors: anchoredPush.anchors.map((anchor) => ({
   id: anchor.id,
@@ -588,7 +588,7 @@ console.log(JSON.stringify({
   },
   anchors: {
     mappedOnAccept: `[6,11) -> [9,14)`,
-    replayReportsAnchors: false,
+    replayReportsAnchors: true,
     resolvedFrozen: true,
     verdict: "comment anchors follow the canonical ChangeSet, not substrings",
   },

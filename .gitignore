@@ -1,5 +1,6 @@
 node_modules/
 .wrangler/
+worker-startup.cpuprofile
 .dev.vars
 .env
 .DS_Store

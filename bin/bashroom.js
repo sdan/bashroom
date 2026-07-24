@@ -23,7 +23,7 @@ Account:
 Room admin:
   bashroom create-room [room] [--actor <actor>]
                                        Create a new room (room name optional; auto-slug if omitted).
-  bashroom destroy <room> --yes        Destroy a room and purge its R2 storage.
+  bashroom destroy <room> --yes        Destroy a room (disabled while RoomText owns files).
   bashroom mounts                      List your mounted rooms with actor + scopes.
   bashroom who <room>                  List the actors present in a room.
   bashroom history <room> [--limit N]  Per-room activity log (not file versions).
@@ -33,7 +33,7 @@ Data:
                                        (default ./bashroom-export). One room with --room.
 
 Shell:
-  bashroom <bash command>              Run bash against /rooms (FUSE-mounted R2).
+  bashroom <bash command>              Run bash with /rooms mounted read-only.
   bashroom mcp                         Start the stdio MCP server (for agent wiring).
 
 Examples:
@@ -42,7 +42,7 @@ Examples:
   bashroom create-room suryad
   bashroom 'tree /rooms'
   bashroom 'cat /rooms/my-room/index.md'
-  echo '# Notes' | bashroom 'cat > /rooms/my-room/notes.md'
+  bashroom "rg -n 'TODO' /rooms/my-room"
 
 Wire up a coding agent (token stays on disk, never enters the model):
   claude mcp add --scope user bashroom -- bashroom mcp
@@ -50,7 +50,7 @@ Wire up a coding agent (token stays on disk, never enters the model):
 
 Environment:
   BASHROOM_URL    Worker URL. Defaults to ${DEFAULT_URL}
-  BASHROOM_TOKEN  Optional bearer token mount.
+  BASHROOM_TOKEN  Optional bearer token override.
 
 State:
   The CLI stores account tokens at ${CONFIG_PATH}.

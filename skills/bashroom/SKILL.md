@@ -1,23 +1,24 @@
 ---
 name: bashroom
-description: A filesystem for agents — durable Markdown files at /rooms backed by Cloudflare R2. Use when the task needs notes that persist across agent sessions, when handing off work between running sessions, when keeping a project scratch wiki, when other agents may continue this work, or when the user mentions "bashroom", "room", "shared notes", or "agent handoff".
+description: A filesystem for agents — durable shared Markdown at /rooms, sequenced by RoomText and mirrored to Cloudflare R2. Use for persistent notes, handoffs, project scratch wikis, and collaborative agent edits.
 ---
 
 # Bashroom
 
 `bashroom({ command, stdin? })` runs real `bash` inside a per-user
-Cloudflare Sandbox. Authorized rooms appear at `/rooms/<room>/...`,
-FUSE-mounted from Cloudflare R2. Use it like any Linux shell — there
-is no hidden command parser. Room admin is exposed through the visible
-`bashroom` executable inside the sandbox.
+Cloudflare Sandbox. Authorized rooms appear read-only at
+`/rooms/<room>/...`. Use the shell for inspection, regex, and computation;
+durable writes go through the structured edit/write tools so conflicts cannot
+silently clobber another collaborator. Room admin is exposed through the
+visible `bashroom` executable inside the sandbox.
 
-A second tool, `bashroom_write({ path, content, encoding?, base_etag? })`, writes a
-file directly without going through bash — use it when content has
-quotes, backticks, `$variables`, or arbitrary bytes that would fight
-shell quoting (see [bashroom_write](#bashroom_write) below).
+`bashroom_edit({ path, old_text, new_text, before?, after?, request_id })`
+changes one unique span of Markdown through the room sequencer.
+`bashroom_write({ path, content, encoding?, base_etag?, create_only? })`
+creates or replaces one complete file.
 
 Read-only context tools (`bashroom_tree`, `bashroom_read`,
-`bashroom_search`, `bashroom_stat`) read directly from R2 without
+`bashroom_search`, `bashroom_stat`) read authoritative state without
 starting bash. Prefer them over `tree`, `cat`, or broad `rg` when you
 want bounded, predictable model context.
 
@@ -50,7 +51,9 @@ bashroom history my-room          # per-room activity log (not file versions)
 ```
 
 `bashroom login`, `bashroom token`, `bashroom mcp`, and
-`bashroom destroy` are laptop-only.
+`bashroom destroy` are laptop-only. Destructive room deletion is currently
+disabled while RoomText owns files so a partial Registry/R2/SQLite delete
+cannot strand or lose data.
 
 ## Read and write
 
@@ -63,50 +66,66 @@ bashroom_search({ "path": "/rooms/my-room", "query": "decision" })
 bashroom_stat({ "path": "/rooms/my-room/index.md" })
 ```
 
-Use shell when you need real command behavior:
+Use shell when you need real read/computation behavior:
 
 ```bash
 cat /rooms/<room>/index.md
 cat /rooms/<room>/log.md
 ls /rooms/<room>/notes/
 rg "thing I care about" /rooms/<room>
-
-cat > /rooms/<room>/index.md <<'EOF'
-# Project
-Current state and next steps.
-EOF
-
-printf '%s\n' "## $(date +%H:%M) topic" >> /rooms/<room>/log.md
 ```
 
-Writes flush to R2 through the FUSE mount and are immediately readable
-from the next call.
+`/rooms` is intentionally read-only. Do not use redirection, `sed -i`, `mv`,
+or `rm` there.
+
+## bashroom_edit
+
+Prefer a targeted edit for existing Markdown. The server resolves the literal
+against the current head inside RoomText, so an insertion elsewhere does not
+stale a numeric offset.
+
+```jsonc
+bashroom_edit({
+  "path": "/rooms/my-room/index.md",
+  "old_text": "Status: draft",
+  "new_text": "Status: approved",
+  "before": "## Launch\n",
+  "request_id": "approve-launch-v1"
+})
+```
+
+- `old_text` plus optional immediate `before`/`after` context must identify
+  exactly one span. Zero or multiple matches change nothing.
+- `request_id` is the idempotency key. Reuse it only when retrying that exact
+  operation.
+- An edit is one canonical ChangeSet and is broadcast to connected editors.
 
 ## bashroom_write
 
 When file content contains quotes, backticks, `$variables`, or arbitrary
 bytes, heredocs and `echo >` get mangled by shell quoting. Use the
-`bashroom_write` tool instead — it writes the authorized object directly
-to R2, bypassing bash and sandbox startup entirely:
+`bashroom_write` tool instead — it routes the authorized file through
+RoomText or its explicit R2 fallback without starting the sandbox:
 
 ```jsonc
 bashroom_write({
   "path": "/rooms/my-room/notes/snippet.md",  // must be under /rooms/<room>/
   "content": "anything: `backticks`, $vars, \"quotes\", newlines — all literal",
   "encoding": "utf-8",  // "utf-8" (default) | "base64" for binary
-  "base_etag": "etag from bashroom_read or bashroom_stat" // optional CAS guard
+  "base_etag": "version from bashroom_read or bashroom_stat" // replacement guard
 })
 ```
 
 - **Path must name a file under `/rooms/<room>/`**, and the caller must have
   that room's `write` scope.
 - **5 MB decoded-byte cap** per write. Base64 is validated before decoding.
-- **Prefer `base_etag` for replacements.** A stale etag returns `conflict`
-  instead of silently overwriting another writer. Omit it only when an
-  unconditional replacement is intentional.
+- **Pass `base_etag` for replacements.** Existing RoomText Markdown requires
+  the version returned by read/stat; a stale version returns `conflict`.
+- **Use `create_only=true` for a new path.** It fails with `exists` if another
+  collaborator created the file first.
 
-Prefer plain `>>`/`cat` for ordinary appends; reach for `bashroom_write`
-specifically when quoting would otherwise corrupt the content.
+Prefer `bashroom_edit` for a small change; use `bashroom_write` when the whole
+document is the intended unit.
 
 ## Read-only context tools
 
@@ -117,7 +136,7 @@ specifically when quoting would otherwise corrupt the content.
 - `bashroom_search({ path, query, case_sensitive?, max_matches?,
   max_files?, max_bytes_per_file? })` performs bounded literal search
   over text files. Use `bashroom` + `rg` for regex or advanced search.
-- `bashroom_stat({ path })` returns R2 metadata for one file without
+- `bashroom_stat({ path })` returns authoritative metadata for one file without
   reading its body.
 
 ## Shared document links
@@ -134,9 +153,10 @@ bashroom_shared_write({
 })
 bashroom_shared_comment({
   "link": "https://bashroom.sdan.io/s/<slug>",
-  "quote": "exact unique visible text",
+  "quote": "exact substring of the raw Markdown source",
   "body": "the inline comment",
-  "document_etag": "etag from bashroom_shared_read"
+  "document_etag": "version from bashroom_shared_read",
+  "anchor_start": 42
 })
 ```
 
@@ -146,7 +166,7 @@ bashroom_shared_comment({
   replacement.
 - Always read first and pass `base_etag` when editing. A stale save returns
   `conflict`, never a silent overwrite.
-- Stored rendered-text offsets are the anchor authority; there is no quote
+- Stored raw-Markdown source offsets are the anchor authority; there is no quote
   re-anchoring. A comment whose offsets no longer match its `quote` shows as
   drifted ("Text moved") in the share page rather than highlighting a guess.
 
@@ -164,8 +184,9 @@ Standard Linux utilities work as expected.
   entries, append `## HH:MM topic` sections), `notes/<topic>.md`
   (one file per subject). Each room ships an `AGENTS.md` with its own
   per-room rules — read it before writing.
-- Append to log files (`>>`), do not overwrite (`>`) — preserves
-  chronology. Other agents may be writing the same file.
+- Append logically by reading the current file and using a unique
+  `bashroom_edit` anchor, or replace with `bashroom_write` plus its version.
+  Shell redirection under `/rooms` is unavailable.
 - Keep entries short and structured for the next agent.
 - Do not write secrets. Files are private but not encrypted at rest.
 
@@ -192,9 +213,9 @@ why, the dead ends, the next move.
 - **No secrets.** No keys, tokens, or PII. Activity history is not file
   version recovery.
 
-**Where.** Append to the project room's `log/YYYY-MM-DD.md` under a
-`## HH:MM <topic> — handoff` heading. Append (`>>`), never overwrite. Update
-that room's `index.md` only if its file tree changed.
+**Where.** Add the handoff to the project room's `log/YYYY-MM-DD.md` under a
+`## HH:MM <topic> — handoff` heading using `bashroom_edit` or a versioned
+whole-file write. Update `index.md` only if its tree changed.
 
 **Skeleton:**
 
@@ -249,7 +270,7 @@ that room's `index.md` only if its file tree changed.
 
 - **Each MCP call is a fresh process session.** `cwd`, environment
   variables, shell variables, and shell functions do NOT persist. The warm
-  sandbox filesystem can persist; `/rooms` is durable R2. Always use absolute
+  sandbox filesystem can persist; `/rooms` is a durable read projection. Always use absolute
   paths.
 - **`/tmp` is shared across this user's concurrent sessions**, unlike
   `cwd`/env. Don't rely on it for per-call scratch; use `/rooms` or
@@ -261,14 +282,15 @@ that room's `index.md` only if its file tree changed.
   arbitrary outbound HTTP remains unavailable.
 - **The 30-second command timeout** applies per call. Long-running work
   must be split, or it gets killed.
-- **R2 is strongly consistent**, so the next read or listing sees a completed
-  write.
+- **RoomText reads are strong** for eligible Markdown; R2 remains the guarded
+  mirror and the authority for unsupported files.
 - **No hidden command interception.** `bashroom create-room ...` works
   because `/usr/local/bin/bashroom` is on `PATH`; ordinary commands still
   run as real bash.
 
 ## What this tool does NOT do
 
-- Delete rooms — destructive room removal is laptop-only.
+- Delete rooms while RoomText owns files — the service rejects partial
+  Registry/R2/SQLite deletion.
 - Reach outbound network by default.
 - Persist shell state between calls.

@@ -1,376 +1,264 @@
 # Bashroom Architecture
 
-This file is the current-state truth. Dated measurements and the reasoning
-behind load-bearing decisions live in [NOTES.md](NOTES.md); start there for
-"why is it built this way".
+This is the current-state contract. Dated measurements and rejected designs
+live in [NOTES.md](NOTES.md).
 
 ## Mission
 
-Bashroom gives an authenticated agent durable files plus a real Linux shell.
-The product contract is deliberately narrow:
+Bashroom gives authenticated humans and agents durable shared files plus a
+real Linux shell. The product stays deliberately narrow:
 
-- R2 is the source of truth for files under `/rooms`.
-- The Worker owns authentication, authorization, quotas, and tool contracts.
-- Cloudflare Sandbox supplies disposable compute; it does not own durable data.
-- MCP is the primary agent interface. The CLI and web app are adapters around
-  the same Worker-owned behavior.
+- Eligible Markdown is strongly ordered by one room Durable Object.
+- R2 is a guarded byte-for-byte mirror and recovery copy for that Markdown.
+- Files RoomText cannot represent remain explicitly R2-owned; they are never
+  coerced, truncated, or silently skipped.
+- Cloudflare Sandbox supplies disposable compute. `/rooms` is a read-only
+  filesystem projection, not a write authority.
+- MCP is the primary agent interface. The web app and CLI use the same Worker
+  authorization and storage paths.
 
-Bashroom is not a general sandbox product, a git host, or a file-versioning
-system. `history` is an activity log and cannot restore old file contents.
+Bashroom is not a git host or a general offline-first filesystem. Activity
+`history` is audit data, not file-version recovery.
 
 ## End-to-end shape
 
 ```text
-MCP client
-  -> local stdio adapter (optional, bin/bashroom.js)
-  -> POST /mcp with bearer token
-  -> Worker-owned tool contract
-       -> tree/read/search/stat: authenticated R2 access
-       -> write: authenticated, scope-checked R2 PUT with optional etag CAS
-       -> bash: fresh process session in the user's warm Sandbox
-            -> /rooms: credentialless R2-binding mount, user prefix only
+MCP / web / role link
+        |
+        v
+Worker: authenticate -> authorize exact room/path -> validate limits
+        |
+        +-- Markdown <= 1,000,000 bytes, exact UTF-8
+        |      |
+        |      v
+        |   RoomHub(<user_id>:<room>)
+        |      - RoomText SQLite head + bounded ChangeSet log
+        |      - idempotency, ordering, digest, dirty set
+        |      - hibernating sockets and presence
+        |      |
+        |      +-- guarded same-byte/current-head projection -> R2
+        |      +-- canonical update broadcast -> connected editors
+        |
+        +-- other files / oversized Markdown -> R2 authority
 
-Browser
-  -> /web/api/*
-  -> AccountDO authorization
-  -> direct R2 reads/writes + RoomHub live activity
-
-Role link (/s/<slug>)
-  -> Registry capability lookup (one owner/room/document + role)
-  -> View: anonymous rendered Markdown
-  -> Comment/Edit: Bashroom identity required
-       -> R2 file body + DocumentCollab inline comments
+Sandbox
+  -> fresh process per shell call
+  -> read-only /rooms mount of the user's R2 prefix
 ```
 
-The stdio server does not declare its own tools. It uses the official MCP
-client transport to forward `tools/list` and `tools/call` to the hosted
-Worker. That makes `src/index.ts` the only MCP contract to maintain.
+One RoomHub is the consistency boundary for a room. There is no per-document
+DO registry or parallel room authority.
 
-## Ownership map
+## Authority classes
 
-| Component | Owns | Must not own |
+| File | Authority | Read/write token |
 | --- | --- | --- |
-| Worker (`src/index.ts`) | Routes, MCP schemas, authorization, orchestration | Durable file bodies |
-| AccountDO | Hot token verification, per-user quotas, room mirror | File bodies, event history |
-| Registry DO | Users, OAuth/device state, canonical memberships, audit rows | File bodies |
-| R2 (`ROOMS_R2`) | Durable room objects and object metadata | Auth policy |
-| Sandbox DO/container | Warm Linux compute and `/rooms` FUSE mount | Credentials, canonical auth, durable state |
-| RoomHub DO | Presence, recent write activity, ephemeral draft relay | File contents at rest |
-| DocumentCollab DO | Inline comment anchors, bodies, and resolution state for one R2 document | File bodies, share capabilities |
-| CLI (`bin/bashroom.js`) | Login/admin UX and transparent stdio transport | MCP tool definitions |
+| `.md` / `.markdown`, exact UTF-8, <= 1,000,000 bytes | RoomHub SQLite | `rt1:<epoch>:<revision>` |
+| Oversized Markdown | R2 | R2 etag |
+| Non-Markdown or binary | R2 | R2 etag |
 
-## MCP contract
+An unsupported file stays readable and byte-identical in R2. Moving a file
+between classes is explicit: a small eligible R2 file is conditionally
+claimed by RoomText; an existing RoomText file is never silently demoted.
 
-The Worker exposes nine tools:
-
-- `bashroom({ command, stdin? })`: real bash for pipelines, git, regex search,
-  and multi-file operations.
-- `bashroom_write({ path, content, encoding?, base_etag? })`: direct R2 write.
-  The decoded payload is capped at 5 MB. The caller needs room `write` scope.
-  `base_etag` turns replacement into compare-and-swap.
-- `bashroom_tree({ path, max_entries? })`: bounded R2 prefix metadata.
-- `bashroom_read({ path, offset?, max_bytes? })`: bounded text byte range.
-- `bashroom_search(...)`: bounded literal search over eligible R2 text objects.
-- `bashroom_stat({ path })`: R2 object metadata without the body.
-- `bashroom_shared_read({ link, max_bytes? })`: bounded access to the exact
-  document named by a Comment or Edit link, including etag and comments.
-- `bashroom_shared_write({ link, content, base_etag })`: CAS-protected
-  replacement through an Edit link.
-- `bashroom_shared_comment({ link, quote, body, ... })`: add a quote-anchored
-  inline comment through a Comment or Edit link.
-
-The direct tools exist because starting Linux for one list, read, stat, or PUT
-adds latency and expands authority for no customer benefit. Shell remains the
-escape hatch for operations that genuinely need Unix semantics.
-
-Every tool authorizes independently. The `/mcp` transport is stateless and
-does not use an `Mcp-Session-Id`.
-
-## Storage and room identity
-
-R2 keys are:
+R2 keys remain:
 
 ```text
 users/<user_id>/<room>/<path>
 ```
 
-This is a per-user ownership model. Cross-account shared *rooms* are not a
-supported product contract: a membership row alone cannot make two user
-prefixes refer to the same canonical object set. Role links are intentionally
-narrower: they authorize one owner-scoped document without creating a room
-membership or a second storage identity.
+For a RoomText-owned file that key is a current recovery mirror. Its custom
+metadata records:
 
-R2 object `etag`, `version`, `uploaded`, and `size` are authoritative metadata.
-Local/FUSE directory mtimes are not product truth.
+```text
+br-authority = roomtext-v1
+br-epoch
+br-revision
+br-sha256
+```
 
-### Write consistency
+RoomText also writes immutable recovery artifacts below
+`roomtext-shadow/users/.../.history/`. Neither projection is the SQLite
+sequencer.
 
-- Web writes and `bashroom_write` go directly to R2.
-- Both enforce decoded byte limits and room `write` scope.
-- Web sends the etag it read; MCP callers can send `base_etag`.
-- A failed conditional PUT returns `conflict` instead of clobbering a newer
-  object.
-- Shell writes use FUSE and therefore retain normal shell behavior, but they do
-  not currently expose per-file etags or changed-path precision.
+## RoomText storage
+
+`RoomTextStore` uses the RoomHub's SQLite database:
+
+- `room_text_heads`: exact current UTF-8 BLOB; ordinary reads decode one row.
+- `room_text_updates`: ordered canonical CodeMirror ChangeSets.
+- `room_text_files`: epoch, head revision, checkpoint, history floor, sizes.
+- `room_text_requests`: idempotency envelope and replayable anchor result.
+- `room_text_commits`: room-wide commit order.
+- `room_text_digests` and `room_text_digest_log`: content and room roots.
+- `room_text_dirty`: durable projection work.
+- `room_text_mirrors`: expected R2 etag/version/hash and quarantine status.
+
+The current document is never rebuilt by replaying its full history. Each
+accepted edit writes the new head BLOB once. The log exists for stale-client
+rebasing, reconnect deltas, idempotency, anchor mapping, and recovery export.
+
+All mutation-critical work is synchronous inside one SQLite transaction:
+
+```text
+dedupe request
+-> validate base revision
+-> rebase over intervening ChangeSets
+-> apply to current head
+-> append canonical update
+-> replace head
+-> advance digest/version
+-> record replay result and dirty mark
+```
+
+No timer, fetch, R2 call, or other Durable Object RPC occurs inside that
+critical section. A non-storage `await` is a DO yield point.
+
+After the SQLite commit, the host conditionally publishes the exact head to
+R2. A lost response is safe: the caller retries the same `(client_id,
+request_id, intent_hash)` and receives the original accepted result.
+
+## Write contracts
+
+The Worker exposes ten MCP tools. The two mutation shapes are intentionally
+different:
+
+- `bashroom_edit({ path, old_text, new_text, before?, after?, request_id })`
+  resolves a literal anchor against the current head inside RoomHub. Exactly
+  one match becomes one ChangeSet. Zero or multiple matches change nothing.
+- `bashroom_write({ path, content, encoding?, base_etag?, create_only? })`
+  replaces a whole file. Existing RoomText Markdown requires the version read
+  by the caller; stale replacements return `conflict`. New files can use
+  `create_only`.
+
+Web and shared-document saves use the same strict whole-file CAS path. The
+headless `RoomTextClient` and WebSocket protocol support delta hydration,
+rebasing, durable outbox replay, and canonical broadcasts, but the current web
+UI still autosaves whole-file drafts. It preserves a conflicting draft and
+asks the user to resolve it; it does not silently overwrite.
+
+## Comments
+
+Comment bodies and resolution state remain in one `DocumentCollab` DO per
+document. Before a text mutation, the Worker reads open source-coordinate
+anchors. RoomText maps them through the exact accepted ChangeSet. The mapped
+result is stored with the RoomText idempotency row before the commit returns,
+then persisted to DocumentCollab.
+
+That makes a failed cross-DO remap repairable: retrying the same file edit
+returns the original absolute anchor positions, so applying them again is
+idempotent. Comment bodies are never deleted by text migration. Resolved
+comments keep their historical offsets.
+
+## Migration and rollback
+
+`ROOM_TEXT_MODE` is the deployment fence:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` | Legacy R2 authority; RoomText code is dark. |
+| `freeze` | Reads continue; content writes and room create/delete are rejected; `/rooms` is read-only; migration is enabled. |
+| `on` | Eligible Markdown uses RoomText; unsupported files remain R2-owned; `/rooms` stays read-only. |
+
+Migration of one file is lossless by construction:
+
+1. Read the R2 object and its etag.
+2. Validate size and exact UTF-8 representation.
+3. SHA-256 the original bytes.
+4. Conditional-PUT the identical bytes with the RoomText ownership marker.
+5. Create or verify SQLite revision 0 from those exact bytes.
+6. Persist the expected R2 generation in `room_text_mirrors`.
+7. Re-open through RoomText and verify before enabling writes.
+
+If R2 moves before step 4, no SQLite candidate is accepted. If the Worker
+stops after step 4, the metadata makes the import resumable. Incompatible files
+stay in R2. Migration errors block the `on` deployment.
+
+Before cutover, production R2 is copied create-only to a separate bucket and
+every source/destination object is SHA-256 compared. The source bucket and
+backup are retained after cutover.
+
+If the canonical R2 key changes outside RoomText, RoomHub does not choose a
+winner. It marks the mirror `diverged`, retains both copies, and rejects reads
+and writes for that file until an operator reconciles them.
 
 ## Sandbox boundary
 
-There is one Sandbox DO per authenticated `user_id`, configured with
-`sleepAfter = "15m"`. The container image is pinned to
-`docker.io/cloudflare/sandbox:0.12.3` in `Dockerfile`.
+There is one Sandbox DO per authenticated `user_id`. Each command gets a fresh
+process session; cwd and environment do not persist. The warm container and
+`/tmp` may be shared between concurrent calls and are not durable state.
 
-On first shell use, the Worker mounts:
+The Worker mounts only `/users/<user_id>/` at `/rooms` through the R2 binding.
+No R2 credential enters Linux. In `freeze` and `on`, the mount is read-only.
+Before starting a shell, the Worker drains pending RoomText projections for
+the user's rooms; a quarantined projection prevents the shell from starting.
 
-```text
-binding: ROOMS_R2
-prefix:  /users/<user_id>/
-path:    /rooms
-```
+Use shell for read pipelines, regex, and computation. File mutations use
+`bashroom_edit` or `bashroom_write`; POSIX writes cannot carry RoomText version
+preconditions.
 
-The mount uses Sandbox SDK R2-binding egress through the exported
-`ContainerProxy`. No R2 access key or secret is written into the container.
-A local sentinel forces warm containers with the former credential-bearing
-mount to unmount and migrate once.
+Outbound network is denied except for `bashroom.internal`, the identity-bound
+control channel used by the visible sandbox helper.
 
-Each shell call creates a fresh named process session and reaps it after the
-response. `cwd` and environment do not carry between calls. The container
-filesystem is still warm and shared: `/tmp` may persist and is visible to
-concurrent calls. Only `/rooms` is a durable product guarantee.
+## Component ownership
 
-Outbound network is denied except for `bashroom.internal`. The sandbox helper
-uses that internal route for non-destructive room control; the Worker supplies
-the trusted user identity from the Sandbox binding, never from a container
-token.
+| Component | Owns | Must not own |
+| --- | --- | --- |
+| Worker | Routes, tool schemas, auth, orchestration | A second file authority |
+| RoomHub | RoomText SQLite, ordering, sockets, presence | Global membership |
+| DocumentCollab | Comment bodies/resolution | File bodies |
+| R2 | Guarded Markdown mirrors; unsupported files | RoomText ordering |
+| AccountDO | Token hot path, quotas, room mirror | File contents |
+| Registry | OAuth, users, memberships, shares, audit | File contents |
+| Sandbox | Disposable Linux compute, read projection | Credentials or durability |
+| CLI | Login/admin UX and MCP forwarding | Tool definitions |
 
-## Authentication and OAuth
+## Authentication and sharing
 
-Two Durable Objects split the hot and cold path:
+Every tool independently authorizes the exact room and path. AccountDO serves
+routeable-token hot authorization; Registry owns OAuth, canonical membership,
+share capabilities, and cold/legacy token lookup. `/mcp` is stateless.
 
-- AccountDO verifies routeable bearer tokens, meters requests, and returns the
-  account's room/scopes mirror.
-- Registry owns GitHub/device OAuth, legacy tokens, canonical memberships,
-  share capabilities, and audit events.
-
-MCP OAuth implements discovery, dynamic client registration, authorization
-code flow, and PKCE S256. Redirect registration accepts public HTTPS URLs and
-loopback HTTP URLs only, with exact-match validation at authorize and token
-exchange. GitHub receives only an opaque `mcp.<state>` value; the registered
-redirect URI, client state, and short-lived authorization code remain in the
-Registry row. This prevents callback-state tampering from selecting a redirect
-target.
-
-All deferred Worker work receives the current `ExecutionContext` explicitly.
-There is no module-global request context because isolates may interleave
-requests.
-
-## Web and live activity
-
-`/web` is a reader/editor backed directly by R2:
-
-- `/web/api/rooms`, `/tree`, `/file`, `/raw`, and `/search` are authenticated.
-- `PUT /web/api/file` requires `write` scope and uses etag CAS.
-- `/s/<slug>` carries one immutable `view`, `comment`, or `edit` role. View
-  links may expose a file or room prefix anonymously. Comment/Edit links are
-  exact-file capabilities and require a separate Bashroom account identity.
-- `DocumentCollab` is keyed by the canonical R2 document identity, so all role
-  links for that file share one inline comment thread. Stored offsets are the
-  anchor authority: a RoomText push may carry open-comment anchors and the
-  accept result returns them mapped through the accepted canonical ChangeSet
-  (`mapPos` assoc -1 for start / +1 for end — typing at an edge stays inside
-  the anchor); the host persists them via `remapCommentAnchors`, which skips
-  resolved comments. Until the RoomText cutover wires that push path into the
-  live share flow, nothing rewrites offsets after an edit, so a stale anchor
-  simply surfaces as drift. The client renders an anchor only when the stored range
-  still matches the quote and otherwise shows drift — the quote-substring
-  re-anchoring fallback was deleted so a repeated or moved quote can never
-  highlight the wrong occurrence.
-- Active content types from shares are downgraded to text and rendered
-  Markdown is sanitized under a restrictive CSP. Mermaid fences render in
-  strict mode; ASCII/text diagram fences remain source-faithful.
-
-RoomHub is keyed by `<user_id>:<room>`. It keeps a small activity ring and
-relays ephemeral draft frames. Every outgoing write or draft is filtered
-against each socket's share prefix. View/Comment sockets are receive-only;
-an authenticated Edit socket may send drafts for its one document. Durable
-saves still use R2 etag CAS rather than treating draft frames as storage.
-Each draft carries the writer's Markdown-source caret offset. Readers map that
-offset into sanitized rendered text and paint an actor-colored cursor; caret
-movement is ephemeral and never enters R2 or the activity log.
-
-## Audit truth
-
-Audit rows record:
-
-- room lifecycle/control events;
-- direct MCP writes;
-- direct web writes;
-- role-link edits/comments with the recipient handle and account id; and
-- shell commands, attributed to each room explicitly mentioned in the command
-  (or to the account-level log when no room is mentioned).
-
-This is observability, not version recovery. Shell changed paths are heuristic
-and currently reported as empty. Do not claim that every filesystem mutation
-is reconstructable.
-
-## Build and source layout
-
-Runtime source is committed, including:
-
-```text
-src/index.ts
-src/security.ts
-src/document-collab.ts
-src/web-collab.ts
-src/web-ui.ts
-src/web-landing.ts
-src/web-device.ts
-bin/bashroom.js
-bin/sandbox-bashroom.js
-skills/bashroom/SKILL.md
-```
-
-The Worker bundles `skills/bashroom/SKILL.md` and serves the exact bytes at
-`/skill.md`; the repo skill and hosted agent guidance therefore share one
-source. `npm run check` runs TypeScript, focused security tests, and the CLI
-smoke test. A clean checkout must pass the same command.
+Cross-account shared rooms are not supported. A role link grants one
+owner-scoped document or view prefix without creating another storage identity.
+View links are anonymous; Comment/Edit mutation requires the recipient's own
+Bashroom identity. All RoomHub socket output is filtered by the link prefix.
 
 ## Security invariants
 
-- Never put bearer tokens, R2 credentials, or OAuth secrets in the sandbox.
-- Parse and authorize the exact room before every direct R2 operation.
-- Enforce limits on decoded bytes, not JavaScript character count.
-- Use etag compare-and-swap for read/modify/write flows.
-- Treat Markdown, filenames, WebSocket frames, and shell commands as untrusted.
-- Keep public share events inside their authorized prefix.
-- Never return owner storage coordinates or sibling paths to a role-link user.
-- Keep destructive room deletion outside the model-facing MCP surface.
+- Never expose bearer tokens, R2 credentials, or OAuth secrets to a sandbox.
+- Authorize the exact room/path before touching R2 or RoomHub.
+- Enforce decoded-byte and frame limits before persistence.
+- Never accept a stale whole-file RoomText replacement.
+- Never resolve an ambiguous literal edit by guessing.
+- Preserve incompatible bytes in R2; quarantine divergence rather than pick a
+  silent winner.
+- Keep destructive room deletion outside model-facing MCP.
+- Treat Markdown, paths, WebSocket frames, and commands as untrusted.
 
-## Infrastructure tradeoffs
+## Build and verification
 
-Why each layer is what it is, and what was deliberately rejected. Evidence
-and dated measurements behind these calls live in NOTES.md.
+Runtime source includes `src/index.ts`, `src/room-hub-text.ts`,
+`src/room-text-store.ts`, `src/room-text-client.ts`, `src/room-text.ts`, the web
+modules, CLI, and `skills/bashroom/SKILL.md`. Wrangler-generated binding types
+live in `worker-configuration.d.ts`.
 
-**Files live in R2, not in Durable Objects, not in D1, not in S3.**
-R2 is strongly consistent, S3-compatible (so the sandbox can FUSE-mount it
-— the whole `/rooms` illusion depends on this), has commit-time conditional
-puts (etag CAS + If-None-Match:* create-only), zero egress, and no
-per-value size ceiling that fights 5MB documents. DO storage cannot be
-mounted, costs more per byte, and funnels every read through a
-single-threaded actor. D1 is one global database — our hot operations are
-per-entity read-modify-write races, which sharded actors make atomic by
-construction; the one global-database-shaped thing we have (Registry) is
-our documented bottleneck, evidence against centralizing further. S3 would
-match R2 semantically but adds egress fees and long-lived credentials the
-binding-mode mounts just eliminated.
-
-**Coordination is optimistic CAS, not CRDT, not consensus, not git.**
-The decision rule is topology: (1) a single authority every writer can
-reach exists (R2 behind one Worker) → consensus protocols are redundant —
-Durable Objects already run consensus underneath; a DO IS a
-platform-provided ordered actor. (2) Writers are never partitioned from
-that authority (agents call our API) → CRDTs' coordination-free merging
-buys nothing and costs merge semantics we can't control. (3) The workload
-is handoff-shaped (agents take turns on shared live memory), not
-parallel-attempt-shaped → git-style branch/fork/merge (Cloudflare
-Artifacts, Mesa) solves a different product. Conflicts are rare and
-explicit: losers get the current etag and retry. Escalation path if
-conflict rates ever demand it: the measured per-room RoomText sequencer
-described below, not a CRDT protocol.
-
-**RoomText is a measured candidate, not production authority yet.** The
-isolated implementation in `src/room-text.ts` and `src/room-text-store.ts`
-stores each file's exact current UTF-8 head BLOB separately from its bounded
-canonical ChangeSet history in DO SQLite. A cold open decodes one head row;
-it never reconstructs current state by replaying history. A bounded cache
-holds immutable CodeMirror `Text` trees for active files. Each accepted edit
-encodes the new head once, then persists that head, idempotency row, revision,
-canonical update, digest, and room commit in one synchronous transaction.
-The head and version checkpoint remain separate rows so two near-1 MB BLOBs
-cannot collide with SQLite's 2 MB row limit. This branch assumes fresh probe
-storage; it does not backfill `room_text_heads` for older candidate databases.
-Any namespace migration must populate and verify every head before routing
-reads to this schema.
-
-The canonical log exists for stale-client rebasing, delta reconnects, comment
-anchors, and version export — not materialization. Version checkpoints occur
-every 128 updates or 256 KB of tail; clients more than 256 updates or 1 MB of
-update payload behind receive the current head as full-state hydration.
-Checkpoints advance a history floor that retains 384 canonical updates or
-8 MB as the live sync window; rows below the floor persist as cold history
-for a flush janitor (probed in `scripts/room-text-probe/`, not yet mounted):
-compact same-client runs strictly below the floor, export a deterministic
-version artifact plus HEAD manifest for R2 (create-only PUT, etag-CAS
-flip), then prune updates, retry pointers, and orphaned commits at one
-atomic boundary. Re-fires and crashes between PUT and flip recover by
-firing again. This is not yet sufficient for production: the probe reproduced
-two multi-file/async failures. A scalar alarm target drops earlier dirty files,
-and an older R2 flush can CAS `HEAD` backward after a newer flush. Cutover
-requires a durable dirty-file queue plus a monotonic `(epoch, revision)` guard
-at the HEAD flip.
-
-A size-gated digest index rides the same transactions (Experiment 2,
-NOTES.md 2026-07-15): every accepted update upserts a per-file digest row
-— a synchronous two-modulus polynomial hash with a length-aware combine,
-whole-content below 32 KB, dirty-spine incremental above it via a WeakMap
-node cache — plus a room root hash over the path-ordered listing, logged
-in a bounded window so `diffDigest(clientRootHash)` answers agent catch-up
-in O(changed files); roots outside the window get the full listing,
-explicitly flagged. Line/search indexing and share-prefix proofs attach to
-this layer later.
-
-The workerd and cross-library results are in
-`benchmarks/room-text/RESULTS.md`. Do not wire RoomText into web/MCP writes
-until the production cutover can make it the sole authority. Dual-writing R2
-and SQLite cannot be atomic and would create split-brain. Until that cutover,
-all current R2/etag behavior documented above remains the product truth.
-`commitBatch`, rename, delete/tombstones, and whole-room listing are still
-missing, so the candidate has not yet proved atomic shell filesystem semantics.
-
-**Selective undo is local inverses remapped over remote updates.**
-`SelectiveUndoHistory` in `src/web-collab.ts` stores inverses of this
-client's OWN changesets only; transactions marked remote (the
-`receiveUpdates` path) never enter history — origin wins even when a
-dispatch wrapper forces `addToHistory` — they only remap the stored
-inverses through the OT cascade, so each undo target survives concurrent
-edits. `undo()`/`redo()` return a brand-new forward changeset the caller
-submits through the normal push pipeline: a new revision, never a revision
-rollback (Figma rule: undo-copy-redo must not change the document).
-
-**Durable Objects are small synchronous arbiters, never large
-orchestrators.** Measured (NOTES.md): request delivery is strictly
-serialized and storage-gated read-modify-write is atomic, but any
-non-storage await is a yield point that loses concurrent updates. So DOs
-here hold the atomic moment only — presence fan-out, comment threads,
-counters, candidate RoomText sequencing — and all I/O composition stays in the
-Worker. Granularity follows consistency boundaries: per-room where events
-share a timeline (RoomHub), per-document where threads serialize
-(DocumentCollab), per-user for isolation (AccountDO, Sandbox), global only
-where unavoidable (Registry).
-
-**The shell path trades integrity for zero ceremony, knowingly.** POSIX
-write() cannot carry a precondition, so bash writes are unconditional
-last-write-wins (see Known limits). The alternatives — commit ceremony
-(git-shaped) or a custom CAS FUSE shim (gcsfuse-style, prior art in
-NOTES.md) — are deliberately deferred until measured conflict rates
-justify them. Mitigations shipped instead: agents are steered to
-bashroom_write (CAS + create_only), and the seeded room conventions teach
-create_only-based lock files.
+`npm run check` runs TypeScript, focused tests, the real local workerd
+RoomText probe, web checks, and CLI smoke test. The dark integration probe in
+`scripts/roomtext-dark-probe/` additionally exercises exact import, R2
+projection, lost-response replay, stale replacement rejection, and external
+R2 divergence.
 
 ## Known limits
 
+- The production web UI still submits whole-file CAS saves; the delta client
+  is not yet mounted into the browser editor.
+- Comment storage is a separate DO. Retryable anchor remapping is safe, but it
+  is not one SQLite transaction with text.
+- RoomText has no production rename/delete or atomic multi-file mutation API.
+  `/rooms` is therefore read-only rather than pretending POSIX writes are safe.
+- Oversized Markdown and non-Markdown files remain R2-owned and do not receive
+  collaborative ChangeSet merging.
 - No cross-account canonical shared-room identity.
-- No file-version recovery or CRDT merge layer.
-- Concurrent divergent drafts do not merge: the latest live frame is shown,
-  and competing durable saves still resolve through an explicit etag conflict.
-- Shell writes bypass CAS: `echo > file` over the FUSE mount is an
-  unconditional S3 put — POSIX write() carries no precondition slot, so the
-  etag/create_only protections exist only on the MCP and web write paths
-  (even `>>` is a whole-object read-modify-write under s3fs). Agents are
-  steered to bashroom_write for anything contested.
-- No exact changed-path capture for arbitrary shell commands.
-- Ranged text reads use byte offsets; callers should page at UTF-8 boundaries.
-- The global Registry remains on legacy/cold authorization paths and can still
-  be a coordination bottleneck there.
-
-Document role links provide scoped collaboration; they do not turn the room
-into a shared filesystem or provide CRDT merging/version recovery.
+- Ranged reads use byte offsets; page at UTF-8 boundaries.
+- Activity history is not version restore.

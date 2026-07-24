@@ -85,6 +85,35 @@ function push(
 }
 
 describe("room-text durable dirty-set", () => {
+  it("adds durable anchor replay to an existing request table without dropping rows", () => {
+    const storage = testStorage();
+    storage.sql.exec(`
+      CREATE TABLE room_text_requests (
+        client_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        normalized_input TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        submitted_base_revision INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (client_id, request_id)
+      )
+    `);
+    storage.sql.exec(
+      `INSERT INTO room_text_requests (
+         client_id, request_id, normalized_input, file_id, epoch,
+         submitted_base_revision, revision, created_at
+       ) VALUES ('old-client', 'old-request', '{}', 'old-file', 1, 0, 1, 1)`,
+    );
+
+    new RoomTextStore(storage);
+
+    const columns = storage.sql.exec<{ name: string }>("PRAGMA table_info(room_text_requests)").toArray();
+    expect(columns.some((column) => column.name === "mapped_anchors_json")).toBe(true);
+    expect(storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM room_text_requests").one().count).toBe(1);
+  });
+
   it("marks on create and advances the mark on push", () => {
     const store = new RoomTextStore(testStorage());
     createFile(store, "f1", "notes.md", "hello");
@@ -186,5 +215,60 @@ describe("room-text durable dirty-set", () => {
     expect(store.clearDirty("f1", -1)).toBe(0);
     expect(store.clearDirty("f1", 0.5)).toBe(0);
     expect(store.dirtyFiles(10)).toHaveLength(1);
+  });
+
+  it("persists the exact R2 mirror generation and quarantines divergence", () => {
+    const storage = testStorage();
+    const first = new RoomTextStore(storage);
+    createFile(first, "f1", "notes.md", "hello");
+    const attached = first.setMirrorActive({
+      fileId: "f1",
+      r2Etag: "etag-1",
+      epoch: 1,
+      revision: 0,
+      sha256: "a".repeat(64),
+      updatedAt: 123,
+    });
+    expect(attached).toMatchObject({
+      ok: true,
+      mirror: { fileId: "f1", r2Etag: "etag-1", revision: 0, status: "active", updatedAt: 123 },
+    });
+
+    const second = new RoomTextStore(storage);
+    expect(second.mirrorState("f1")).toMatchObject({ ok: true, mirror: { r2Etag: "etag-1" } });
+    expect(second.markMirrorDiverged("f1", "foreign-etag")).toMatchObject({
+      ok: true,
+      mirror: { status: "diverged", observedEtag: "foreign-etag" },
+    });
+  });
+
+  it("replays a matching high-level intent before the adapter resolves it again", () => {
+    const storage = testStorage();
+    const store = new RoomTextStore(storage);
+    createFile(store, "f1", "notes.md", "hello");
+    const intentHash = "b".repeat(64);
+    const input = {
+      ...push("f1", 0, "req-intent", "x"),
+      intentHash,
+      anchors: [{ id: "comment-1", start: 1, end: 4 }],
+    };
+    const accepted = store.pushText(input);
+    expect(accepted).toMatchObject({
+      ok: true,
+      revision: 1,
+      anchors: [{ id: "comment-1", start: 2, end: 5 }],
+    });
+    // A fresh adapter instance proves the remap result is durable, not a
+    // process-local response cache. Reapplying these absolute offsets to the
+    // comments DO is idempotent after either a lost response or failed RPC.
+    expect(new RoomTextStore(storage).replayIntent("client-a", "req-intent", intentHash)).toMatchObject({
+      ok: true,
+      revision: 1,
+      anchors: [{ id: "comment-1", start: 2, end: 5 }],
+    });
+    expect(store.replayIntent("client-a", "req-intent", "c".repeat(64))).toMatchObject({
+      ok: false,
+      error: "IDEMPOTENCY_MISMATCH",
+    });
   });
 });

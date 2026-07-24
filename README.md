@@ -3,13 +3,12 @@
 Bashroom is a filesystem for agents: save notes, share files,
 and hand off work between running sessions.
 
-Agents get real `bash` plus structured R2-backed file/context tools. The
-shell runs inside a Cloudflare Sandbox, with `/rooms` FUSE-mounted from
-Cloudflare R2. The structured tools (`tree`, `read`, `search`, `stat`) read
-directly from R2 without booting a sandbox. Bashroom handles access control,
-durable room files, and audit. Room admin (create, mounts, who, history) is
-also available inside the sandbox through the visible `bashroom`
-helper. Destructive room deletion stays on the laptop CLI.
+Agents get real read-oriented `bash` plus structured file/context tools.
+Eligible Markdown is ordered in a per-room Durable Object and mirrored
+byte-for-byte to R2; unsupported and binary files remain R2-owned. The shell
+runs inside a Cloudflare Sandbox with `/rooms` mounted read-only, so durable
+mutations always carry explicit concurrency through `bashroom_edit` or
+`bashroom_write`.
 
 ## Connect
 
@@ -29,11 +28,12 @@ The local MCP proxy reads `~/.bashroom/config.json` and sends auth to the hosted
 
 ## Model
 
-The MCP exposes nine tools:
+The MCP exposes ten tools:
 
 ```text
 bashroom({ command, stdin? })
 bashroom_write({ path, content, encoding?, base_etag? })
+bashroom_edit({ path, old_text, new_text, before?, after?, request_id })
 bashroom_tree({ path, max_entries? })
 bashroom_read({ path, offset?, max_bytes? })
 bashroom_search({ path, query, case_sensitive?, max_matches?, max_files?, max_bytes_per_file? })
@@ -43,9 +43,9 @@ bashroom_shared_write({ link, content, base_etag })
 bashroom_shared_comment({ link, quote, body, document_etag?, anchor_start? })
 ```
 
-Use `bashroom` when you need real command execution. Use the structured tools
-for routine file/context retrieval and exact writes; they are bounded and avoid
-shell quoting hazards.
+Use `bashroom` for read pipelines, regex, and computation. Use
+`bashroom_edit` for one uniquely anchored Markdown change and
+`bashroom_write` for create or whole-file replacement.
 
 Inside bash, authorized rooms appear under `/rooms`:
 
@@ -53,7 +53,6 @@ Inside bash, authorized rooms appear under `/rooms`:
 ls /rooms
 tree /rooms
 cat /rooms/<room>/index.md
-echo "## note" >> /rooms/<room>/log.md
 rg "thing I care about" /rooms
 bashroom create-room new-room
 bashroom rooms
@@ -69,9 +68,10 @@ bashroom_stat({ "path": "/rooms/my-room/index.md" })
 ```
 
 Each MCP call gets a fresh process session, so cwd and environment variables
-do not carry over. The warm sandbox filesystem is shared: `/rooms` is durable
-R2 storage and `/tmp` may survive or be visible to concurrent calls. Never use
-`/tmp` for secrets or coordination. The sandbox stays warm for ~15 minutes.
+do not carry over. The warm sandbox filesystem is shared: `/rooms` is a
+durable read projection and `/tmp` may survive or be visible to concurrent
+calls. Never use `/tmp` for secrets or coordination. The sandbox stays warm
+for ~15 minutes.
 
 ## Shell tools
 
@@ -89,7 +89,7 @@ From the laptop CLI:
 ```bash
 bashroom mounts                       # list your rooms
 bashroom create-room <name>           # create a new room
-bashroom destroy <room> --yes         # remove a room
+bashroom destroy <room> --yes         # unavailable while RoomText owns files
 bashroom who <room>                   # list actors in a room
 bashroom history <room> [--limit N]   # per-room activity log (not versions)
 ```
@@ -153,13 +153,14 @@ The CLI stores account tokens at `~/.bashroom/config.json` with file mode `0600`
 ## Web
 
 A browser reader/editor is served at `/web`. Paste your account token once;
-the sidebar lists your rooms and file trees. Members with `write` scope can
-edit files with etag-based conflict detection; read-only members can only view.
+the sidebar lists your rooms and file trees. Members with `write` scope save
+through RoomText version checks; stale whole-document drafts remain visible
+and return an explicit conflict. Read-only members can only view.
 
 The Share menu creates separate View, Comment, and Edit links. Inline comments
 are quote-anchored and keep actor identity. Shared pages show viewer count,
-ephemeral live drafts, and an actor-labeled live cursor. Durable saves still
-use etag conflict checks rather than CRDT merging. Mermaid fences render in
+ephemeral live drafts, and an actor-labeled live cursor. Durable saves use
+strict version conflicts rather than CRDT merging. Mermaid fences render in
 strict mode; `ascii`, `text`, `diagram`, and `art` fences preserve diagram
 spacing. Use Preview in the private editor to render these richer blocks.
 
@@ -188,7 +189,7 @@ build time so there's one source of truth.
 Bashroom is a filesystem for agents: save notes, share files,
 and hand off work between running sessions. The v3 architecture is documented
 in `ARCHITECTURAL.md`; the product sequence is in `docs/product-roadmap.md`;
-how the nine-tool harness compares to Claude Code's is in
+how the tool harness compares to Claude Code's is in
 `docs/harness-vs-claude-code.md`.
 
 ## Self-host

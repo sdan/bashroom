@@ -33,6 +33,10 @@ export default {
         rtPromote(input: unknown): Promise<{ ok: boolean; [k: string]: unknown }>;
         rtParity(): Promise<{ ok: true; files: Array<Record<string, unknown> & { ok: boolean; path: string; sha256?: string; sourceEtag?: string }> }>;
         rtFlush(): Promise<unknown>;
+        rtPrimaryImport(input: unknown): Promise<{ ok: boolean; [k: string]: unknown }>;
+        rtPrimaryOpen(input: unknown): Promise<{ ok: boolean; [k: string]: unknown }>;
+        rtPrimaryReplace(input: unknown): Promise<{ ok: boolean; [k: string]: unknown }>;
+        rtPrimaryEdit(input: unknown): Promise<{ ok: boolean; [k: string]: unknown }>;
       };
     try {
       if (url.pathname === "/ws") {
@@ -60,6 +64,60 @@ export default {
         if (!object) return json({ ok: false, error: "not_found" }, 404);
         const content = await object.text();
         return json(await hub(room).rtPromote({ userId: USER, room, path, content, sourceEtag: object.etag }));
+      }
+      if (url.pathname === "/primary-import" && request.method === "POST") {
+        const object = await env.ROOMS_R2.get(`users/${USER}/${room}/${path}`);
+        if (!object) return json({ ok: false, error: "not_found" }, 404);
+        return json(await hub(room).rtPrimaryImport({
+          userId: USER,
+          room,
+          path,
+          bytes: await object.arrayBuffer(),
+          sourceEtag: object.etag,
+        }));
+      }
+      if (url.pathname === "/primary-open" && request.method === "POST") {
+        return json(await hub(room).rtPrimaryOpen({ userId: USER, room, path }));
+      }
+      if (url.pathname === "/primary-replace" && request.method === "POST") {
+        return json(await hub(room).rtPrimaryReplace({
+          userId: USER,
+          room,
+          path,
+          clientId: String(body.clientId || "probe"),
+          requestId: String(body.requestId || "replace-1"),
+          intentHash: String(body.intentHash || "a".repeat(64)),
+          baseVersion: String(body.baseVersion || ""),
+          content: String(body.content ?? ""),
+        }));
+      }
+      if (url.pathname === "/primary-edit" && request.method === "POST") {
+        return json(await hub(room).rtPrimaryEdit({
+          userId: USER,
+          room,
+          path,
+          clientId: String(body.clientId || "probe"),
+          requestId: String(body.requestId || "edit-1"),
+          intentHash: String(body.intentHash || "b".repeat(64)),
+          oldText: String(body.oldText || ""),
+          newText: String(body.newText ?? ""),
+          before: typeof body.before === "string" ? body.before : undefined,
+          after: typeof body.after === "string" ? body.after : undefined,
+        }));
+      }
+      if (url.pathname === "/foreign-write" && request.method === "POST") {
+        const put = await env.ROOMS_R2.put(`users/${USER}/${room}/${path}`, String(body.content ?? ""));
+        return json({ ok: Boolean(put), etag: put?.etag || null });
+      }
+      if (url.pathname === "/r2-get") {
+        const object = await env.ROOMS_R2.get(`users/${USER}/${room}/${url.searchParams.get("path") || path}`);
+        if (!object) return json({ ok: false, error: "not_found" }, 404);
+        return json({
+          ok: true,
+          etag: object.etag,
+          content: await object.text(),
+          customMetadata: object.customMetadata || {},
+        });
       }
       if (url.pathname === "/flush" && request.method === "POST") {
         return json(await hub(room).rtFlush());
