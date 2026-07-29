@@ -45,6 +45,13 @@ const roomSockets = new Map(); // room -> Set<ws>
 const json = (res, obj) => { res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(obj)); };
 const readBody = (req) => new Promise((resolve) => { let b = ""; req.on("data", c => b += c); req.on("end", () => resolve(b)); });
 
+const HISTORY = [
+  { epoch: 1, revision: 7, version: "rt1:1:7", created_at: "2026-07-28T15:42:00.000Z", actor: "sdan", source: "web", size_bytes: 212, current: true },
+  { epoch: 1, revision: 6, version: "rt1:1:6", created_at: "2026-07-28T15:31:00.000Z", actor: "Agent", source: "mcp", size_bytes: 196, current: false },
+  { epoch: 1, revision: 5, version: "rt1:1:5", created_at: "2026-07-28T14:08:00.000Z", actor: "sdan", source: "web", size_bytes: 155, current: false },
+  { epoch: 1, revision: 3, version: "rt1:1:3", created_at: "2026-07-27T23:12:00.000Z", actor: "Agent", source: "mcp", size_bytes: 122, current: false },
+];
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   if (url.pathname === "/test/emit" && req.method === "POST") {
@@ -60,11 +67,50 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/web/api/file" && req.method === "PUT") {
     const p = JSON.parse(await readBody(req) || "{}");
     putCount += 1;
-    return json(res, { ok: true, file: { path: p.path, content: p.content, etag: "e" + putCount, version: putCount + 3, size_bytes: (p.content || "").length, updated_at: new Date().toISOString(), is_binary: false } });
+    const revision = 7 + putCount;
+    return json(res, { ok: true, file: { path: p.path, content: p.content, etag: "rt1:1:" + revision, version: "rt1:1:" + revision, size_bytes: (p.content || "").length, updated_at: new Date().toISOString(), is_binary: false, custom_metadata: { authority: "roomtext-v1", epoch: "1", revision: String(revision) } } });
   }
   if (url.pathname === "/web/api/share" && req.method === "POST") {
     const p = JSON.parse(await readBody(req) || "{}");
     return json(res, { ok: true, slug: "mock-" + (p.role || "view"), role: p.role || "view", url: "http://localhost:" + (Number(process.env.PORT) || 8123) + "/s/mock-" + (p.role || "view") });
+  }
+  if (url.pathname === "/web/api/file/history" && req.method === "GET") {
+    return json(res, {
+      ok: true,
+      current: { epoch: 1, revision: 7, version: "rt1:1:7" },
+      versions: HISTORY,
+      truncated: false,
+    });
+  }
+  if (url.pathname === "/web/api/file/history/version" && req.method === "GET") {
+    const revision = Number(url.searchParams.get("revision") || 0);
+    const version = HISTORY.find(item => item.revision === revision);
+    if (!version) return json(res, { ok: false, error: "not_found" });
+    return json(res, {
+      ok: true,
+      version: {
+        ...version,
+        content: "# Earlier version\n\nThis is the saved page from revision " + revision + ".\n\n- Agent changes remain inspectable\n- Restore creates a new version\n",
+      },
+    });
+  }
+  if (url.pathname === "/web/api/file/history/restore" && req.method === "POST") {
+    const p = JSON.parse(await readBody(req) || "{}");
+    const nextRevision = 8;
+    return json(res, {
+      ok: true,
+      file: {
+        path: p.path,
+        content: "# Restored version\n\nThe old checkpoint is current again without deleting later history.\n",
+        etag: "rt1:1:" + nextRevision,
+        version: "rt1:1:" + nextRevision,
+        size_bytes: 91,
+        updated_at: new Date().toISOString(),
+        is_binary: false,
+        custom_metadata: { authority: "roomtext-v1", epoch: "1", revision: String(nextRevision) },
+      },
+      restored_from: { epoch: p.epoch, revision: p.revision, version: "rt1:" + p.epoch + ":" + p.revision },
+    });
   }
   if (url.pathname === "/web/api/put-count") return json(res, { putCount });
   if (url.pathname === "/web/api/rooms") {
@@ -90,7 +136,7 @@ const server = createServer(async (req, res) => {
     const room = url.searchParams.get("room");
     const path = url.searchParams.get("path");
     const rev = fileRev.get(room + "/" + path) || 0;
-    return json(res, { ok: true, file: { path, content: "# " + path + "\n\nMock body rev " + rev + " for **" + path + "**.\n\n- one\n- two\n\n```mermaid\nflowchart LR\n  Agent --> Bashroom\n  Bashroom --> Document\n```\n\n```ascii\nagent ---> shared document\n```\n", etag: "e1-r" + rev, version: 3 + rev, size_bytes: 123, updated_at: "2026-07-01T00:00:00Z", is_binary: false } });
+    return json(res, { ok: true, file: { path, content: "# " + path + "\n\nMock body rev " + rev + " for **" + path + "**.\n\n- one\n- two\n\n```mermaid\nflowchart LR\n  Agent --> Bashroom\n  Bashroom --> Document\n```\n\n```ascii\nagent ---> shared document\n```\n", etag: "rt1:1:" + (7 + rev), version: "rt1:1:" + (7 + rev), size_bytes: 123, updated_at: "2026-07-28T15:42:00.000Z", is_binary: false, custom_metadata: { authority: "roomtext-v1", epoch: "1", revision: String(7 + rev) } } });
   }
   // Mirrors prod: /s/<slug> edit links serve the same SPA with an injected
   // capability grant (single-document share mode, no sidebar).

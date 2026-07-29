@@ -19,6 +19,9 @@ const html = webCollaborativeShareHtml({ slug: "test-slug", role: "edit", nonce:
 const match = html.match(/<script nonce="test-nonce">([\s\S]*?)<\/script>\s*<\/body>/);
 if (!match) throw new Error("collaboration inline script not found");
 new Function(match[1]);
+if (!match[1].includes('This document is empty.')) {
+  throw new Error("collaboration empty-document rendering missing");
+}
 
 // The anonymous View page's scripts live inside src/index.ts rather than the
 // collaboration factory. Extract just those two pure string factories via

@@ -40,5 +40,20 @@ if (js.includes('if (msg.actor === String(state.handle || "")) return;')) {
   console.error("same-account collaboration frames are still discarded");
   process.exit(1);
 }
+for (const required of [
+  'historySnapshot.content',
+  'base_version: currentFile.version || currentFile.etag || ""',
+  'Restoring creates a new version. Your current content remains in history.',
+  'This version already matches current',
+  'if (historySnapshot && historyKey === key) return;',
+  'codemirrorView.placeholder("This document is empty — type to write it.")',
+  'const isMarker = raw.endsWith("/")',
+  'nested ? "Empty folder." : "Empty room."',
+]) {
+  if (!js.includes(required)) {
+    console.error("version history safety wiring missing: " + required);
+    process.exit(1);
+  }
+}
 writeFileSync(process.argv[3], js);
 console.log("extracted", js.length, "chars (faithful template evaluation)");

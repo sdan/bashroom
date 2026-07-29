@@ -363,6 +363,12 @@ const WEB_INDEX_HTML = `<!doctype html>
      segmented control's width under the cursor. */
   #preview-btn > span { display: inline-block; min-width: 7ch; text-align: center; }
   .share-wrap { position: relative; }
+  /* Version history is page provenance, not another editing mode. The quiet
+     ellipsis keeps the document bar simple; the drawer overlays the canvas so
+     opening history never narrows or reflows the writing column. */
+  .history-trigger { min-width: 38px; padding: 0 10px; font-size: 18px; font-weight: 600; letter-spacing: 1px; line-height: 1; }
+  .history-trigger > span { display: inline-block; transform: translateY(-2px); }
+  .history-trigger.active { color: var(--link); background: var(--active); }
   .share-menu {
     position: absolute; top: calc(100% + 8px); right: 0; z-index: 50;
     width: 268px; padding: 4px; border-radius: 10px;
@@ -383,6 +389,107 @@ const WEB_INDEX_HTML = `<!doctype html>
   .share-option strong { align-self: end; font-size: 12.5px; font-weight: 600; }
   .share-option small { align-self: start; color: var(--ink-faint); font-size: 10.5px; line-height: 1.3; text-wrap: pretty; }
   :root[data-theme="dark"] .share-menu { box-shadow: 0 0 0 1px rgba(255,255,255,.1), 0 10px 30px rgba(0,0,0,.28); }
+
+  /* ── Version history ────────────────────────────────────────────────
+     Desktop: a 360px overlay under the sticky document bar. Mobile: the
+     same surface takes the viewport, preserving one interaction model. */
+  .history-scrim {
+    position: fixed; inset: 52px 0 0 var(--side-w); z-index: 39;
+    background: rgba(0,0,0,.08); cursor: default;
+  }
+  .history-drawer {
+    position: fixed; inset: 52px 0 0 auto; z-index: 40; width: 360px;
+    display: flex; flex-direction: column; min-height: 0;
+    color: var(--ink); background: var(--bg);
+    box-shadow: -1px 0 0 rgba(0,0,0,.06), -16px 0 40px -30px rgba(0,0,0,.4);
+  }
+  :root[data-theme="dark"] .history-drawer {
+    box-shadow: -1px 0 0 rgba(255,255,255,.08), -18px 0 44px -28px rgba(0,0,0,.72);
+  }
+  .history-head {
+    min-height: 58px; padding: 10px 10px 10px 18px;
+    display: flex; align-items: center; gap: 10px;
+    border-bottom: 1px solid var(--rule); flex-shrink: 0;
+  }
+  .history-head-copy { min-width: 0; flex: 1; }
+  .history-head h2 { margin: 0; color: var(--ink); font-size: 14px; line-height: 1.3; font-weight: 650; letter-spacing: -.01em; text-wrap: balance; }
+  .history-head p { margin: 2px 0 0; color: var(--ink-dim); font: 10.5px/1.3 var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .history-close {
+    width: 40px; height: 40px; padding: 0; border: 0; border-radius: 7px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--ink-dim); background: transparent; cursor: pointer;
+    transition-property: color, background-color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
+  }
+  .history-close:hover { color: var(--ink); background: var(--hover); }
+  .history-close:active { scale: .96; }
+  .history-close:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+  .history-close svg { width: 15px; height: 15px; }
+  .history-list { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 8px 18px; }
+  .history-section-label {
+    padding: 10px 10px 5px; color: var(--ink-dim);
+    font: 600 10px/1.3 var(--sans); letter-spacing: .04em; text-transform: uppercase;
+  }
+  .history-row {
+    width: 100%; min-height: 58px; padding: 8px 10px; border: 0; border-radius: 8px;
+    display: grid; grid-template-columns: 10px minmax(0,1fr) auto; grid-template-rows: auto auto;
+    column-gap: 9px; align-items: center; text-align: left;
+    color: var(--ink); background: transparent; cursor: pointer;
+    transition-property: background-color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
+  }
+  .history-row:hover { background: var(--hover); }
+  .history-row:active { scale: .96; }
+  .history-row:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+  .history-row.selected { color: var(--link); background: var(--active); }
+  .history-row.loading { cursor: wait; }
+  .history-row .history-dot { grid-row: 1 / 3; width: 8px; height: 8px; border-radius: 50%; background: var(--history-color, var(--ink-faint)); }
+  .history-row .history-actor { min-width: 0; align-self: end; font-size: 12.5px; line-height: 1.3; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .history-row .history-when { align-self: end; color: var(--ink-dim); font: 10.5px/1.3 var(--mono); font-variant-numeric: tabular-nums; }
+  .history-row .history-meta { grid-column: 2 / 4; align-self: start; color: var(--ink-dim); font-size: 10.5px; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .history-row.selected .history-when, .history-row.selected .history-meta { color: color-mix(in srgb, var(--link) 72%, var(--ink-faint)); }
+  .history-empty, .history-error { margin: 8px; padding: 18px 14px; border-radius: 8px; color: var(--ink-dim); background: var(--side); font-size: 12px; line-height: 1.5; text-wrap: pretty; }
+  .history-error { color: #b73b30; }
+  .history-skeleton { padding: 4px 10px; }
+  .history-skeleton .sk { display: block; height: 10px; margin: 14px 0; }
+  .history-skeleton .sk:nth-child(1) { width: 52%; }
+  .history-skeleton .sk:nth-child(2) { width: 74%; }
+  .history-skeleton .sk:nth-child(3) { width: 61%; }
+  .history-foot { padding: 12px 16px 14px; border-top: 1px solid var(--rule); flex-shrink: 0; }
+  .history-foot p { margin: 0 0 10px; color: var(--ink-dim); font-size: 10.5px; line-height: 1.4; text-wrap: pretty; }
+  .history-restore {
+    width: 100%; min-height: 40px; padding: 0 14px; border: 0; border-radius: 7px;
+    color: var(--bg); background: var(--ink); font: 600 12.5px/1 var(--sans); cursor: pointer;
+    transition-property: opacity, scale; transition-duration: 140ms; transition-timing-function: ease-out;
+  }
+  .history-restore:active:not(:disabled) { scale: .96; }
+  .history-restore:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  .history-restore:disabled { cursor: not-allowed; opacity: .42; }
+  .history-view-strip {
+    position: sticky; top: 52px; z-index: 28; min-height: 42px; padding: 7px 20px;
+    display: flex; align-items: center; justify-content: center; gap: 12px;
+    color: var(--ink-dim); background: color-mix(in srgb, var(--active) 78%, var(--bg));
+    border-bottom: 1px solid color-mix(in srgb, var(--link) 16%, var(--rule));
+    font-size: 12px; text-align: center;
+  }
+  .history-view-strip strong { color: var(--ink); font-weight: 600; }
+  .history-return {
+    min-height: 28px; padding: 0 9px; border: 0; border-radius: 6px;
+    color: var(--link); background: color-mix(in srgb, var(--bg) 68%, transparent);
+    font: 600 11.5px/1 var(--sans); cursor: pointer;
+    transition-property: background-color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
+  }
+  .history-return:hover { background: var(--bg); }
+  .history-return:active { scale: .96; }
+  .history-return:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  @media (max-width: 720px) {
+    .history-scrim { display: none; }
+    .history-drawer { inset: 0; width: 100vw; z-index: 80; box-shadow: none; }
+    .history-head { min-height: 56px; padding-top: max(8px, env(safe-area-inset-top)); }
+    .history-foot { padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+    .history-view-strip { justify-content: space-between; text-align: left; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .history-close, .history-row, .history-restore, .history-return { transition: none; }
+  }
   /* ── Actor activity panel ──
      Anchored under a clicked presence face/pill, on the share-menu surface
      (same width/padding/shadow tokens). Lives on <body> with fixed inline
@@ -1156,7 +1263,13 @@ const WEB_INDEX_HTML = `<!doctype html>
       // shrinks/hangs "## " and "> " targets .tok-processingInstruction.
       // Built ONCE: the array's identity must be stable across cmRoot
       // re-renders or the extensions prop would churn the editor config.
-      highlightExt: [language.syntaxHighlighting(lezerHighlight.classHighlighter)],
+      // placeholder() only paints while the buffer is empty, so it can live
+      // in the always-on array — 0-byte documents get a visible empty state
+      // instead of a blank pane, and it vanishes on the first keystroke.
+      highlightExt: [
+        language.syntaxHighlighting(lezerHighlight.classHighlighter),
+        codemirrorView.placeholder("This document is empty — type to write it."),
+      ],
     };
     return cmMod;
   }
@@ -1257,6 +1370,291 @@ const WEB_INDEX_HTML = `<!doctype html>
   let saveTimer = 0;
   let saveState = "";        // "" | "dirty" | "saving" | "saved" | "conflict" | "error"
   let conflictTheirs = null; // server's file from a 412, awaiting user choice
+
+  // ─── Version history ───
+  // History is intentionally document-scoped and transient: switching files
+  // drops the timeline and historical snapshot instead of letting provenance
+  // from one page leak into another. The server remains the authority for
+  // both the list and snapshot bytes.
+  let historyKey = "";
+  let historyOpen = false;
+  let historyStatus = "";       // "" | "loading" | "ready" | "error"
+  let historyError = "";
+  let historyVersions = [];
+  let historyCurrent = null;
+  let historyTruncated = false;
+  let historySnapshot = null;    // selected historical version + content
+  let historyPreviewKey = "";   // epoch:revision currently being fetched
+  let historyRestoreState = ""; // "" | "restoring" | "error" | "conflict"
+  let historyRestoreError = "";
+  let historySeq = 0;            // invalidates stale list/version responses
+
+  function roomTextHistoryAvailable(file) {
+    return Boolean(!share && file && !file.is_binary
+      && file.custom_metadata && file.custom_metadata.authority === "roomtext-v1");
+  }
+
+  function resetHistory(nextKey = "") {
+    historySeq += 1;
+    historyKey = nextKey;
+    historyOpen = false;
+    historyStatus = "";
+    historyError = "";
+    historyVersions = [];
+    historyCurrent = null;
+    historyTruncated = false;
+    historySnapshot = null;
+    historyPreviewKey = "";
+    historyRestoreState = "";
+    historyRestoreError = "";
+  }
+
+  function historyItemKey(item) {
+    return String(item && item.epoch || "") + ":" + String(item && item.revision || "");
+  }
+
+  function historyMs(value) {
+    if (typeof value === "number") return value;
+    const parsed = Date.parse(String(value || ""));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function historyAbsolute(value) {
+    const ms = historyMs(value);
+    if (!ms) return "Saved version";
+    try {
+      return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(ms);
+    } catch (_) { return new Date(ms).toLocaleString(); }
+  }
+
+  function historyGroup(value) {
+    const ms = historyMs(value);
+    if (!ms) return "Earlier";
+    const d = new Date(ms);
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const day = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    if (day === start) return "Today";
+    if (day === start - 86400000) return "Yesterday";
+    try { return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" }).format(d); }
+    catch (_) { return d.toLocaleDateString(); }
+  }
+
+  function historyActor(item) {
+    const source = String(item && item.source || "");
+    const raw = String(item && item.actor || "").trim();
+    if (raw && !raw.startsWith("web:") && !raw.startsWith("mcp:")) return raw;
+    if (source === "web") return state.handle || "You";
+    if (source === "mcp") return "Agent";
+    return raw.replace(/^(web|mcp):/, "") || "Unknown editor";
+  }
+
+  function historySource(item) {
+    const source = String(item && item.source || "").toLowerCase();
+    if (source === "web") return "Web edit";
+    if (source === "mcp") return "Agent edit";
+    if (source === "mixed") return "Multiple editors";
+    return "Saved version";
+  }
+
+  function historyDraftUnsettled() {
+    return editDraft !== lastSaved
+      || saveState === "dirty" || saveState === "saving" || saveState === "conflict" || saveState === "error";
+  }
+
+  function historyRestoreBlocked() {
+    return !historySnapshot || historyRestoreState === "restoring" || historyRestoreState === "conflict"
+      || editDraft !== lastSaved
+      || saveState === "dirty" || saveState === "saving" || saveState === "conflict" || saveState === "error";
+  }
+
+  function historyListHtml() {
+    if (historyStatus === "loading") {
+      return '<div class="history-skeleton" aria-label="Loading version history"><span class="sk"></span><span class="sk"></span><span class="sk"></span></div>';
+    }
+    if (historyStatus === "error") {
+      return '<div class="history-error">' + escHtml(historyError || "Version history could not be loaded.") + '</div>';
+    }
+    if (!historyVersions.length) {
+      return '<div class="history-empty">Earlier checkpoints will appear here after this page changes.</div>';
+    }
+    let out = "";
+    let lastGroup = "";
+    for (const item of historyVersions) {
+      const current = Boolean(item.current);
+      const group = current ? "Current" : historyGroup(item.created_at);
+      if (group !== lastGroup) {
+        out += '<div class="history-section-label">' + escHtml(group) + '</div>';
+        lastGroup = group;
+      }
+      const key = historyItemKey(item);
+      const selected = current ? !historySnapshot : Boolean(historySnapshot && historyItemKey(historySnapshot) === key);
+      const loading = historyPreviewKey === key;
+      const actor = current ? (historyActor(item) || "Current version") : historyActor(item);
+      const when = current ? "Now" : (historyMs(item.created_at) ? timeAgo(historyMs(item.created_at)) : "Earlier");
+      const meta = current ? "Latest saved version" : historySource(item);
+      out += '<button class="history-row' + (selected ? " selected" : "") + (loading ? " loading" : "") + '" type="button" '
+        + (current ? 'data-history-current="1"' : 'data-history-version="' + escHtml(key) + '"')
+        + ' style="--history-color:' + actorColor(actor) + '" aria-pressed="' + (selected ? "true" : "false") + '">'
+        + '<span class="history-dot" aria-hidden="true"></span>'
+        + '<span class="history-actor">' + escHtml(actor) + '</span>'
+        + '<span class="history-when" title="' + escHtml(historyAbsolute(item.created_at)) + '">' + escHtml(when) + '</span>'
+        + '<span class="history-meta">' + escHtml(loading ? "Loading preview…" : meta) + '</span>'
+        + '</button>';
+    }
+    if (historyRestoreError && !historySnapshot) out += '<div class="history-error">' + escHtml(historyRestoreError) + '</div>';
+    if (historyTruncated) out += '<div class="history-empty">Showing the latest 30 saved versions.</div>';
+    return out;
+  }
+
+  function historyDrawerHtml(path) {
+    if (!historyOpen) return "";
+    const selected = historySnapshot;
+    const blocked = historyRestoreBlocked();
+    const foot = selected
+      ? '<div class="history-foot">'
+        + (historyRestoreError ? '<div class="history-error">' + escHtml(historyRestoreError) + '</div>' : '')
+        + '<p>' + (blocked && saveState === "conflict"
+          ? "Resolve the current editing conflict before restoring."
+          : "Restoring creates a new version. Your current content remains in history.") + '</p>'
+        + '<button class="history-restore" id="history-restore" type="button"' + (blocked ? " disabled" : "") + '>'
+        + (historyRestoreState === "restoring" ? "Restoring…" : "Restore this version") + '</button></div>'
+      : "";
+    return '<div class="history-scrim" id="history-scrim" aria-hidden="true"></div>'
+      + '<section class="history-drawer" id="history-drawer" role="dialog" aria-modal="false" aria-labelledby="history-title">'
+      + '<div class="history-head"><div class="history-head-copy"><h2 id="history-title">Version history</h2><p>' + escHtml(path || "") + '</p></div>'
+      + '<button class="history-close" id="history-close" type="button" aria-label="Close version history">'
+      + '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></div>'
+      + '<div class="history-list">' + historyListHtml() + '</div>' + foot + '</section>';
+  }
+
+  async function loadHistory(room, path) {
+    const key = fileKey(room, path);
+    const seq = ++historySeq;
+    const alreadyLoading = historyStatus === "loading";
+    historyStatus = "loading";
+    historyError = "";
+    if (!alreadyLoading) render();
+    try {
+      const data = await api("/web/api/file/history?room=" + encodeURIComponent(room) + "&path=" + encodeURIComponent(path) + "&limit=30");
+      if (seq !== historySeq || key !== fileKey(state.activeRoom, state.activePath)) return;
+      if (!data || data.ok === false) throw new Error((data && data.error) || "history_failed");
+      historyCurrent = data.current || null;
+      const seen = new Set();
+      const items = [];
+      for (const value of Array.isArray(data.versions) ? data.versions : []) {
+        if (!value || value.epoch == null || value.revision == null) continue;
+        const item = { ...value };
+        const itemKey = historyItemKey(item);
+        if (seen.has(itemKey)) continue;
+        seen.add(itemKey);
+        items.push(item);
+      }
+      if (!items.some((item) => item.current) && historyCurrent) {
+        items.push({
+          ...historyCurrent,
+          current: true,
+          created_at: (files.get(key) || {}).updated_at || "",
+          actor: state.handle || "You",
+          source: "web",
+        });
+      }
+      items.sort((a, b) => Number(Boolean(b.current)) - Number(Boolean(a.current))
+        || historyMs(b.created_at) - historyMs(a.created_at)
+        || Number(b.revision || 0) - Number(a.revision || 0));
+      historyVersions = items;
+      historyTruncated = Boolean(data.truncated);
+      historyStatus = "ready";
+    } catch (e) {
+      if (seq !== historySeq || key !== fileKey(state.activeRoom, state.activePath)) return;
+      const code = String(e && e.message || e);
+      historyError = code === "history_unavailable" ? "Version history is not available for this file." : "Version history could not be loaded.";
+      historyStatus = "error";
+    }
+    render();
+  }
+
+  async function loadHistoryVersion(item) {
+    const room = state.activeRoom, path = state.activePath;
+    const key = fileKey(room, path);
+    const versionKey = historyItemKey(item);
+    const seq = ++historySeq;
+    historyPreviewKey = versionKey;
+    historyRestoreState = "";
+    historyRestoreError = "";
+    render();
+    try {
+      const data = await api("/web/api/file/history/version?room=" + encodeURIComponent(room)
+        + "&path=" + encodeURIComponent(path)
+        + "&epoch=" + encodeURIComponent(item.epoch)
+        + "&revision=" + encodeURIComponent(item.revision));
+      if (seq !== historySeq || key !== fileKey(state.activeRoom, state.activePath)) return;
+      if (!data || data.ok === false || !data.version || typeof data.version.content !== "string") {
+        throw new Error((data && data.error) || "version_failed");
+      }
+      historySnapshot = data.version;
+      historyPreviewKey = "";
+      destroyCm();
+    } catch (e) {
+      if (seq !== historySeq || key !== fileKey(state.activeRoom, state.activePath)) return;
+      historyPreviewKey = "";
+      historyRestoreError = "That saved version could not be opened.";
+    }
+    render();
+  }
+
+  async function restoreHistoryVersion() {
+    const selected = historySnapshot;
+    const room = state.activeRoom, path = state.activePath;
+    const key = fileKey(room, path);
+    const currentFile = files.get(key);
+    if (!selected || !currentFile || historyRestoreBlocked()) return;
+    historyRestoreState = "restoring";
+    historyRestoreError = "";
+    render();
+    try {
+      const res = await fetch("/web/api/file/history/restore", {
+        method: "POST",
+        headers: { authorization: "Bearer " + state.token, "content-type": "application/json" },
+        body: JSON.stringify({
+          room,
+          path,
+          epoch: selected.epoch,
+          revision: selected.revision,
+          base_version: currentFile.version || currentFile.etag || "",
+        }),
+      });
+      const data = await res.json();
+      if (key !== fileKey(state.activeRoom, state.activePath)) return;
+      if (res.status === 412 || (data && data.error === "conflict")) {
+        if (data && data.file) files.set(key, data.file);
+        historyRestoreState = "conflict";
+        historyRestoreError = "The current page changed while you were previewing. Review it, then try again.";
+        render();
+        return;
+      }
+      if (!res.ok || !data || data.ok === false || !data.file) throw new Error((data && data.error) || "restore_failed");
+      files.set(key, data.file);
+      inlineKey = "";
+      editDraft = data.file.content;
+      lastSaved = data.file.content;
+      editBaseEtag = data.file.etag || "";
+      saveState = "saved";
+      historySnapshot = null;
+      historyRestoreState = "";
+      historyVersions = [];
+      historyStatus = "";
+      destroyCm();
+      showToast(data.unchanged ? "This version already matches current" : "Restored as a new version", actorColor(state.handle || "you"));
+      void fetchTree(room);
+      void loadHistory(room, path);
+    } catch (e) {
+      if (key !== fileKey(state.activeRoom, state.activePath)) return;
+      historyRestoreState = "error";
+      historyRestoreError = "This version could not be restored.";
+      render();
+    }
+  }
 
   function setSaveState(s) {
     saveState = s;
@@ -1558,6 +1956,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     // navigation. (A dead CDN just fails fast into the fallback again.)
     if (cmLoadFailed) { cmLoadFailed = false; cmMod = null; }
     pendingScrollY = -1; // navigations start at the top — drop any pending restore
+    if (historyKey && historyKey !== fileKey(room, path)) resetHistory();
     // Leaving a dirty inline doc: push the pending save before rebinding.
     if (inlineKey && (room !== state.activeRoom || path !== state.activePath)) flushAutosave();
     if (editing && (room !== state.activeRoom || path !== state.activePath)) { editing = false; editError = ""; void destroyCm(); }
@@ -1758,6 +2157,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     state.activeRoom = ""; state.activePath = "";
     state.opened = new Set(); state.roomsOpened = new Set();
     trees.clear(); files.clear(); treeInflight.clear(); fileInflight.clear();
+    resetHistory();
     history.replaceState(null, "", "/web"); // drop the deep link on sign-out
     render();
   }
@@ -2009,6 +2409,10 @@ const WEB_INDEX_HTML = `<!doctype html>
       if (!data || data.ok === false || !data.file) return;
       files.set(key, data.file);
       if (room !== state.activeRoom || path !== state.activePath) return; // navigated away — cache only
+      // Keep the selected checkpoint byte-exact while live activity moves the
+      // current head in the background. The fresh file stays cached and will
+      // become the restore CAS base, but must not repaint historical <article>.
+      if (historySnapshot && historyKey === key) return;
       if (inlineKey === key) {
         // Live editor bound to this file: adopt ONLY when the local draft is
         // clean; a dirty draft resolves through the CAS conflict flow instead.
@@ -2616,10 +3020,16 @@ const WEB_INDEX_HTML = `<!doctype html>
   function buildTree(files) {
     const root = { children: new Map() };
     for (const f of files) {
-      const parts = f.path.split("/");
+      const raw = String(f.path || "");
+      // s3fs directory markers ("dir/") carve out an empty folder: keep the
+      // folder node, but never materialize the phantom ""-named file row
+      // the trailing slash would otherwise split into.
+      const isMarker = raw.endsWith("/");
+      const parts = raw.split("/").filter(Boolean);
+      if (!parts.length) continue;
       let cur = root;
       for (let i = 0; i < parts.length; i++) {
-        const isLeaf = i === parts.length - 1;
+        const isLeaf = i === parts.length - 1 && !isMarker;
         const name = parts[i];
         const path = parts.slice(0, i + 1).join("/");
         if (!cur.children.has(name)) cur.children.set(name, { name, path, kind: isLeaf ? "file" : "dir", children: new Map() });
@@ -2767,8 +3177,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     return (n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0) + " MB";
   }
 
-  function renderTree(room, nodes) {
-    if (!nodes.length) return '<li class="empty">Empty room.</li>';
+  function renderTree(room, nodes, nested) {
+    if (!nodes.length) return '<li class="empty">' + (nested ? "Empty folder." : "Empty room.") + '</li>';
     return nodes.map(n => {
       if (n.kind === "dir") {
         const open = state.opened.has(room + ":" + n.path);
@@ -2779,7 +3189,7 @@ const WEB_INDEX_HTML = `<!doctype html>
             <span class="label">\${n.name}</span>
             <span class="row-share" aria-label="Copy public link to this folder" role="button" data-room="\${room}" data-share-dir="\${n.path}">\${ICON.share}</span>
           </div>
-          \${open ? '<ul>' + renderTree(room, n.kids) + '</ul>' : ''}
+          \${open ? '<ul>' + renderTree(room, n.kids, true) + '</ul>' : ''}
         </li>\`;
       }
       const active = (room === state.activeRoom && n.path === state.activePath) ? "active" : "";
@@ -2884,6 +3294,9 @@ const WEB_INDEX_HTML = `<!doctype html>
     const tree = trees.get(state.activeRoom);
     const activeKey = state.activeRoom && state.activePath ? fileKey(state.activeRoom, state.activePath) : "";
     const activeFile = activeKey ? files.get(activeKey) : null;
+    // A timeline belongs to one exact document. Navigation is the hard
+    // boundary: old snapshot bytes must never survive into another editor.
+    if (historyKey && historyKey !== activeKey) resetHistory();
     const treeIsErr = isErrorRecord(tree);
     const activeFileIsErr = isErrorRecord(activeFile);
     const activeFileLoading = state.activeRoom && state.activePath && !activeFile && fileInflight.has(activeKey);
@@ -2893,25 +3306,39 @@ const WEB_INDEX_HTML = `<!doctype html>
     // mode never loads a tree (one granted document, no sidebar): there this
     // must stay false or a failed file fetch would skeleton forever.
     const treeLoading = Boolean(!share && state.activeRoom && !tree && !treeIsErr);
-    // Modeless editing stays primary. Preview is a per-document opt-in used
-    // for renderers (Mermaid today, more allowlisted blocks later).
-    const inlineMode = Boolean(activeFile && !activeFileIsErr && !activeFile.is_binary && !cmLoadFailed);
+    const historyViewing = Boolean(historySnapshot && historyKey === activeKey && typeof historySnapshot.content === "string");
+    // Modeless editing stays primary. A historical snapshot is deliberately
+    // excluded from inlineMode: its bytes are only ever rendered into an
+    // article and can never enter editDraft, CodeMirror, or autosave.
+    const inlineMode = Boolean(activeFile && !activeFileIsErr && !activeFile.is_binary && !cmLoadFailed && !historyViewing);
     const previewing = Boolean(inlineMode && previewKey === activeKey);
     let md = "";
     if (activeFile && !activeFileIsErr && !activeFile.is_binary) {
       // Room markdown is multi-writer input (other members, other agents) and
       // marked passes raw HTML through — sanitize before innerHTML so a
       // hostile file can't run script next to the localStorage token.
-      const renderSource = inlineKey === activeKey ? editDraft : activeFile.content;
-      try { md = DOMPurify.sanitize(marked.parse(renderSource)); }
+      const renderSource = String(historyViewing ? historySnapshot.content : (inlineKey === activeKey ? editDraft : activeFile.content ?? ""));
+      // Preserve the live empty-document contract in both current and
+      // historical read-only canvases. The editor uses its own placeholder.
+      try {
+        md = renderSource.trim()
+          ? DOMPurify.sanitize(marked.parse(renderSource))
+          : '<div class="empty">This document is empty.</div>';
+      }
       catch (e) { md = '<pre>marked error: ' + String(e) + '</pre>'; }
     }
     // File-dependent controls only exist once the body has arrived; the
     // header SHELL renders as soon as a document is addressed, so the 52px
     // sticky bar doesn't pop in after the fetch and shove the content down.
     const docPath = activeFile && !activeFileIsErr ? activeFile.path : state.activePath;
+    const historyAvailable = roomTextHistoryAvailable(activeFile);
+    const historyActionHtml = historyAvailable
+      ? \`<button class="doc-action history-trigger\${historyOpen ? " active" : ""}" id="history-btn" data-tip="Version history" type="button" aria-label="Version history" aria-haspopup="dialog" aria-expanded="\${historyOpen ? "true" : "false"}"><span aria-hidden="true">•••</span></button>\`
+      : "";
     const docActionsHtml = activeFile && !activeFileIsErr
-      ? \`<div class="doc-actions">
+      ? (historyViewing
+        ? \`<div class="doc-actions">\${historyActionHtml}</div>\`
+        : \`<div class="doc-actions">
               \${activeFile.is_binary ? "" : \`<button class="doc-action" id="copy-md" data-tip="Copy Markdown source" type="button">
                 <span class="icon-stack">\${ICON.copy}\${ICON.check}\${ICON.cross}</span>
                 <span class="label-stack">
@@ -2936,7 +3363,8 @@ const WEB_INDEX_HTML = `<!doctype html>
                   <button class="share-option" type="button" role="menuitem" data-share-role="edit"><span class="share-role-icon">✎</span><strong>Edit link</strong><small>Sign-in required · edit and comment</small></button>
                 </div>
               </div>
-          </div>\`
+              \${historyActionHtml}
+          </div>\`)
       : "";
     const documentHeader = (activeFile && !activeFileIsErr) || activeFileLoading || treeLoading
       ? \`<header class="doc-header">
@@ -2951,6 +3379,9 @@ const WEB_INDEX_HTML = `<!doctype html>
           </div>
           \${docActionsHtml}
         </header>\`
+      : "";
+    const historyStrip = historyViewing
+      ? \`<div class="history-view-strip" role="status"><span>Viewing <strong>\${escHtml(historyAbsolute(historySnapshot.created_at))}</strong> · read-only</span><button class="history-return" id="history-return" type="button">Back to current</button></div>\`
       : "";
     // In-flight loads (treeLoading / activeFileLoading) never reach this —
     // they render the skeleton document below instead of a message.
@@ -2985,6 +3416,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     const body = activeFile && !activeFileIsErr
       ? (activeFile.is_binary
           ? '<div class="empty">Binary file. Use the Bashroom shell to inspect it.</div>'
+          : historyViewing ? '<article class="history-preview">' + md + '</article>'
           : inlineMode ? (previewing ? '<article>' + md + '</article>' : inlineHtml)
           : (editing ? editorHtml : '<article>' + md + '</article>'))
       : (treeLoading || activeFileLoading) ? skeletonDocHtml()
@@ -3020,11 +3452,13 @@ const WEB_INDEX_HTML = `<!doctype html>
         </div>
       </aside>
       \${documentHeader}
+      \${historyStrip}
       <main>
         <div class="page">
           \${body}
         </div>
       </main>
+      \${historyDrawerHtml(docPath)}
     \`;
     // Same document re-rendered (background fetch, presence, toggle): put the
     // reader back where they were. The rAF restore works because the inline
@@ -3110,6 +3544,62 @@ const WEB_INDEX_HTML = `<!doctype html>
         }
       };
     }
+    // ─── Version history wiring ───
+    // Opening the drawer may trigger an autosave, but browsing an old
+    // checkpoint is refused until that save settles. This is the guard that
+    // keeps a local draft from being hidden or rebound as historical bytes.
+    const historyBtn = document.getElementById("history-btn");
+    const closeHistory = (returnFocus = true) => {
+      historyOpen = false;
+      render();
+      if (returnFocus) document.getElementById("history-btn")?.focus();
+    };
+    if (historyBtn && activeKey) {
+      historyBtn.onclick = (event) => {
+        event.stopPropagation();
+        if (historyOpen) { closeHistory(); return; }
+        flushAutosave();
+        if (historyKey !== activeKey) resetHistory(activeKey);
+        historyOpen = true;
+        historyStatus = "loading";
+        historyError = "";
+        historyRestoreError = "";
+        render();
+        document.getElementById("history-close")?.focus();
+        void loadHistory(state.activeRoom, state.activePath);
+      };
+    }
+    const historyClose = document.getElementById("history-close");
+    if (historyClose) historyClose.onclick = () => closeHistory();
+    const historyScrim = document.getElementById("history-scrim");
+    if (historyScrim) historyScrim.onclick = () => closeHistory();
+    const showCurrentHistory = () => {
+      historySeq += 1;
+      historySnapshot = null;
+      historyPreviewKey = "";
+      historyRestoreState = "";
+      historyRestoreError = "";
+      destroyCm();
+      render();
+      document.querySelector("[data-history-current]")?.focus();
+    };
+    const historyCurrentRow = document.querySelector("[data-history-current]");
+    if (historyCurrentRow) historyCurrentRow.onclick = showCurrentHistory;
+    document.querySelectorAll("[data-history-version]").forEach((row) => {
+      row.onclick = () => {
+        if (historyDraftUnsettled()) {
+          flushAutosave();
+          showToast("Finish saving before previewing an older version", actorColor(state.handle || "you"));
+          return;
+        }
+        const item = historyVersions.find((value) => historyItemKey(value) === row.getAttribute("data-history-version"));
+        if (item) void loadHistoryVersion(item);
+      };
+    });
+    const historyReturn = document.getElementById("history-return");
+    if (historyReturn) historyReturn.onclick = showCurrentHistory;
+    const historyRestore = document.getElementById("history-restore");
+    if (historyRestore) historyRestore.onclick = () => void restoreHistoryVersion();
     // ─── Inline (modeless) editor wiring ───
     if (inlineMode) {
       const key = fileKey(state.activeRoom, state.activePath);
@@ -3342,6 +3832,13 @@ const WEB_INDEX_HTML = `<!doctype html>
 
   // ⌘K / Ctrl-K focuses the cross-room search from anywhere in the app.
   window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && historyOpen) {
+      e.preventDefault();
+      historyOpen = false;
+      render();
+      document.getElementById("history-btn")?.focus();
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
       const si = document.getElementById("room-search");
       if (si) { e.preventDefault(); si.focus(); si.select(); }
@@ -3352,6 +3849,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     flushAutosave();
     pendingScrollY = -1; // back/forward is a navigation — no stale restore
     const s = stateFromUrl();
+    const nextHistoryKey = s && s.room && s.path ? fileKey(s.room, s.path) : "";
+    if (historyKey && historyKey !== nextHistoryKey) resetHistory();
     state.activeRoom = s ? s.room : "";
     state.activePath = s ? s.path : "";
     if (state.activeRoom) {

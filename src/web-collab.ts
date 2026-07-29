@@ -417,7 +417,12 @@ export function webCollaborativeShareHtml({ slug, role, nonce }: CollaborativeSh
     var seq = ++state.renderSeq;
     var article = document.getElementById("doc"); if (!article) return;
     var text = String(source == null ? "" : source);
-    article.innerHTML = DOMPurify.sanitize(marked.parse(text));
+    // Empty documents render an explicit empty state instead of a blank
+    // page. The placeholder has no source origin, so selection-commenting is
+    // refused until the next non-empty render restores source alignment.
+    article.innerHTML = text.trim()
+      ? DOMPurify.sanitize(marked.parse(text))
+      : '<div class="empty">This document is empty.</div>';
     await enhanceDiagrams(article);
     if (seq !== state.renderSeq) return false;
     // Align AFTER enhanceDiagrams on purpose: mermaid replaces code text

@@ -15,13 +15,14 @@ import {
   RoomTextStore,
   decideRoomTextPublication,
   isRetryableRoomTextFailure,
+  parseRoomTextPublication,
   type OpenRoomTextResult,
   type PushRoomTextInput,
   type PushRoomTextSuccess,
   type RoomTextFailure,
   type RoomTextMirrorState,
 } from "./room-text-store";
-import { decodeRoomText, roomTextUpdateToken, type RoomTextAnchor } from "./room-text";
+import { ROOM_TEXT_MAX_BYTES, decodeRoomText, roomTextUpdateToken, type RoomTextAnchor } from "./room-text";
 import type {
   RoomTextBroadcastUpdate,
   RoomTextClientFrame,
@@ -48,6 +49,11 @@ const PRIMARY_META_AUTHORITY = "br-authority";
 const PRIMARY_META_EPOCH = "br-epoch";
 const PRIMARY_META_REVISION = "br-revision";
 const PRIMARY_META_SHA256 = "br-sha256";
+
+const HISTORY_META_CLIENT_ID = "br-history-client";
+const HISTORY_META_SOURCE = "br-history-source";
+const HISTORY_META_SIZE = "br-history-size";
+const HISTORY_SCAN_MAX_OBJECTS = 10_000;
 
 const ROOM_TEXT_FRAME_TYPES: ReadonlySet<string> = new Set(["connect", "push", "ping"]);
 
@@ -733,19 +739,34 @@ export class RoomHubText {
     const artifactKey = `${historyPrefix}/${artifact.epoch}@${artifact.revision}`;
     const headKey = `${historyPrefix}/HEAD`;
 
+    // Read the exact publication boundary once. The same object/etag later
+    // guards the HEAD CAS; its revision also limits provenance to edits made
+    // since the previous visible checkpoint rather than the cumulative
+    // retained update chain carried inside every artifact.
+    const currentHead = await this.r2.get(headKey);
+    const currentJson = currentHead ? await currentHead.text() : null;
+    const currentPublication = currentJson === null ? null : parseRoomTextPublication(currentJson);
+    const provenanceFloor = currentPublication?.epoch === artifact.epoch
+      ? currentPublication.revision
+      : -1;
+
     // Artifacts are immutable once written: create-only PUT via the Headers
     // If-None-Match form (NEVER onlyIf.etagDoesNotMatch:'*', which miniflare
     // had reversed — workers-sdk#6411). A null result means an earlier fire
     // already made this exact artifact durable; that is success, not failure.
+    const provenance = historyProvenance(artifact.composed_changes_json, provenanceFloor);
     await this.r2.put(artifactKey, serializeShadowArtifact(artifact), {
       onlyIf: new Headers({ "If-None-Match": "*" }),
+      customMetadata: {
+        ...(provenance.clientId ? { [HISTORY_META_CLIENT_ID]: provenance.clientId } : {}),
+        [HISTORY_META_SOURCE]: provenance.source,
+        [HISTORY_META_SIZE]: String(artifact.snapshot_bytes.byteLength),
+      },
     });
 
     // Monotonic publication guard, decided at WRITE time against the exact
     // HEAD body just read, with the CAS paired to that same read — the
     // graduated fix for the 458/1000 flush-regression schedules.
-    const currentHead = await this.r2.get(headKey);
-    const currentJson = currentHead ? await currentHead.text() : null;
     const decision = decideRoomTextPublication(currentJson, { epoch: manifest.epoch, revision: manifest.revision });
     if (decision === "unreadable") return { fileId, ok: false, error: "HEAD_UNREADABLE" };
     let headFlip: "flipped" | "already-visible" | "stale-skip";
@@ -791,6 +812,235 @@ export function roomTextShadowKey(userId: string, room: string, suffix: string):
   return `roomtext-shadow/users/${userId}/${room}/${suffix}`;
 }
 const shadowKey = roomTextShadowKey;
+
+export type RoomTextHistorySource = "web" | "mcp" | "mixed" | "unknown";
+
+export type RoomTextHistoryVersion = {
+  epoch: number;
+  revision: number;
+  version: string;
+  created_at: string;
+  client_id: string;
+  source: RoomTextHistorySource;
+  size_bytes: number | null;
+};
+
+export type RoomTextHistoryArtifact = RoomTextHistoryVersion & {
+  fileId: string;
+  path: string;
+  content: string;
+};
+
+export type RoomTextHistoryListResult =
+  | { ok: true; versions: RoomTextHistoryVersion[] }
+  | { ok: false; error: "HISTORY_TOO_LARGE" | "HISTORY_UNAVAILABLE" };
+
+export type RoomTextHistoryReadResult =
+  | { ok: true; artifact: RoomTextHistoryArtifact }
+  | { ok: false; error: "NOT_FOUND" | "INVALID_ARTIFACT" | "HISTORY_UNAVAILABLE" };
+
+/** Exact R2 prefix for one file's immutable checkpoint objects. */
+export function roomTextHistoryPrefix(userId: string, room: string, fileId: string): string {
+  return roomTextShadowKey(userId, room, `.history/${fileId}/`);
+}
+
+/** Exact R2 key for one immutable `{epoch, revision}` checkpoint. */
+export function roomTextHistoryArtifactKey(
+  userId: string,
+  room: string,
+  fileId: string,
+  epoch: number,
+  revision: number,
+): string {
+  return `${roomTextHistoryPrefix(userId, room, fileId)}${epoch}@${revision}`;
+}
+
+/** Strictly parse the identity suffix; HEAD and malformed siblings are ignored. */
+export function parseRoomTextHistoryIdentity(value: string): { epoch: number; revision: number } | null {
+  const match = /^([1-9][0-9]*)@(0|[1-9][0-9]*)$/.exec(value);
+  if (!match) return null;
+  const epoch = Number(match[1]);
+  const revision = Number(match[2]);
+  return Number.isSafeInteger(epoch) && Number.isSafeInteger(revision)
+    ? { epoch, revision }
+    : null;
+}
+
+/** Product-safe provenance derived from the engine's stable client id. */
+export function roomTextHistorySource(clientId: string): RoomTextHistorySource {
+  if (clientId.startsWith("web:")) return "web";
+  if (clientId.startsWith("mcp:")) return "mcp";
+  return "unknown";
+}
+
+function historyProvenance(
+  composedChangesJson: string,
+  afterRevision = -1,
+): { clientId: string; source: RoomTextHistorySource } {
+  try {
+    const entries = JSON.parse(composedChangesJson);
+    if (!Array.isArray(entries)) return { clientId: "", source: "unknown" };
+    const clientIds = new Set<string>();
+    const sources = new Set<RoomTextHistorySource>();
+    for (const entry of entries) {
+      if (!entry || typeof entry.clientId !== "string"
+        || !Number.isSafeInteger(entry.revision) || entry.revision <= afterRevision) continue;
+      const clientId = String(entry.clientId);
+      clientIds.add(clientId);
+      sources.add(roomTextHistorySource(clientId));
+    }
+    if (sources.size > 1 || clientIds.size > 1) return { clientId: "", source: "mixed" };
+    const source = sources.values().next().value as RoomTextHistorySource | undefined;
+    return {
+      // Multiple writers through the same surface are not one attributable
+      // actor. Keep the durable source, but withhold an invented identity.
+      clientId: clientIds.size === 1 ? [...clientIds][0] : "",
+      source: source || "unknown",
+    };
+  } catch (_) {
+    return { clientId: "", source: "unknown" };
+  }
+}
+
+/**
+ * List immutable artifacts, then sort numerically. R2 lists lexicographically
+ * (`1@10` before `1@2`), so callers must never expose its raw order as a
+ * timeline. We fail closed rather than silently return the wrong "latest"
+ * checkpoint if a file ever exceeds the bounded MVP scan.
+ */
+export async function listRoomTextHistoryArtifacts(
+  r2: R2Bucket,
+  userId: string,
+  room: string,
+  fileId: string,
+): Promise<RoomTextHistoryListResult> {
+  const prefix = roomTextHistoryPrefix(userId, room, fileId);
+  const versions: RoomTextHistoryVersion[] = [];
+  let cursor: string | undefined;
+  let scanned = 0;
+  try {
+    do {
+      const remaining = HISTORY_SCAN_MAX_OBJECTS - scanned;
+      if (remaining <= 0) return { ok: false, error: "HISTORY_TOO_LARGE" };
+      const page = await r2.list({
+        prefix,
+        cursor,
+        limit: Math.min(1_000, remaining),
+        include: ["customMetadata"],
+      });
+      scanned += page.objects.length;
+      for (const object of page.objects) {
+        const identity = parseRoomTextHistoryIdentity(object.key.slice(prefix.length));
+        if (!identity) continue;
+        const custom = object.customMetadata || {};
+        const clientId = typeof custom[HISTORY_META_CLIENT_ID] === "string"
+          ? custom[HISTORY_META_CLIENT_ID]
+          : "";
+        const storedSource = custom[HISTORY_META_SOURCE];
+        const source = storedSource === "web" || storedSource === "mcp" || storedSource === "mixed"
+          ? storedSource
+          : roomTextHistorySource(clientId);
+        const size = Number(custom[HISTORY_META_SIZE]);
+        versions.push({
+          ...identity,
+          version: roomTextVersionToken(identity.epoch, identity.revision),
+          created_at: object.uploaded.toISOString(),
+          client_id: clientId,
+          source,
+          size_bytes: Number.isSafeInteger(size) && size >= 0 ? size : null,
+        });
+      }
+      if (page.truncated && scanned >= HISTORY_SCAN_MAX_OBJECTS) {
+        return { ok: false, error: "HISTORY_TOO_LARGE" };
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  } catch (_) {
+    return { ok: false, error: "HISTORY_UNAVAILABLE" };
+  }
+  versions.sort((left, right) => right.epoch - left.epoch || right.revision - left.revision);
+  return { ok: true, versions };
+}
+
+/** Read and validate one immutable artifact before exposing its bytes. */
+export async function readRoomTextHistoryArtifact(
+  r2: R2Bucket,
+  userId: string,
+  room: string,
+  fileId: string,
+  epoch: number,
+  revision: number,
+): Promise<RoomTextHistoryReadResult> {
+  if (!Number.isSafeInteger(epoch) || epoch < 1 || !Number.isSafeInteger(revision) || revision < 0) {
+    return { ok: false, error: "INVALID_ARTIFACT" };
+  }
+  let object: R2ObjectBody | null;
+  try {
+    object = await r2.get(roomTextHistoryArtifactKey(userId, room, fileId, epoch, revision));
+  } catch (_) {
+    return { ok: false, error: "HISTORY_UNAVAILABLE" };
+  }
+  if (!object) return { ok: false, error: "NOT_FOUND" };
+  try {
+    const value = JSON.parse(await object.text()) as Record<string, unknown>;
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.fileId !== fileId || value.path !== fileId
+      || value.epoch !== epoch || value.revision !== revision
+      || typeof value.snapshot_b64 !== "string"
+      || typeof value.composed_changes_json !== "string") {
+      return { ok: false, error: "INVALID_ARTIFACT" };
+    }
+    const bytes = strictBase64(String(value.snapshot_b64));
+    if (!bytes || bytes.byteLength > ROOM_TEXT_MAX_BYTES) {
+      return { ok: false, error: "INVALID_ARTIFACT" };
+    }
+    // decodeRoomText is fatal UTF-8 and rejects malformed historical bytes.
+    const content = decodeRoomText(bytes).toString();
+    const bodyProvenance = historyProvenance(String(value.composed_changes_json));
+    const custom = object.customMetadata || {};
+    const clientId = typeof custom[HISTORY_META_CLIENT_ID] === "string"
+      ? custom[HISTORY_META_CLIENT_ID]
+      : bodyProvenance.clientId;
+    const storedSource = custom[HISTORY_META_SOURCE];
+    const source = storedSource === "web" || storedSource === "mcp" || storedSource === "mixed"
+      ? storedSource
+      : custom[HISTORY_META_CLIENT_ID]
+        ? roomTextHistorySource(clientId)
+        : bodyProvenance.source;
+    return {
+      ok: true,
+      artifact: {
+        fileId,
+        path: fileId,
+        epoch,
+        revision,
+        version: roomTextVersionToken(epoch, revision),
+        created_at: object.uploaded.toISOString(),
+        client_id: clientId,
+        source,
+        size_bytes: bytes.byteLength,
+        content,
+      },
+    };
+  } catch (_) {
+    return { ok: false, error: "INVALID_ARTIFACT" };
+  }
+}
+
+function strictBase64(value: string): Uint8Array | null {
+  if (value.length % 4 !== 0
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    return null;
+  }
+  try {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return bytes;
+  } catch (_) {
+    return null;
+  }
+}
 
 /** Shadow artifact body: manifest fields + base64 snapshot, one JSON doc. */
 function serializeShadowArtifact(artifact: {

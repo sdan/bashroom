@@ -17,8 +17,9 @@ real Linux shell. The product stays deliberately narrow:
 - MCP is the primary agent interface. The web app and CLI use the same Worker
   authorization and storage paths.
 
-Bashroom is not a git host or a general offline-first filesystem. Activity
-`history` is audit data, not file-version recovery.
+Bashroom is not a git host or a general offline-first filesystem. Room
+activity `history` remains an audit feed; file recovery is the separate,
+page-scoped RoomText checkpoint contract below.
 
 ## End-to-end shape
 
@@ -117,6 +118,28 @@ critical section. A non-storage `await` is a DO yield point.
 After the SQLite commit, the host conditionally publishes the exact head to
 R2. A lost response is safe: the caller retries the same `(client_id,
 request_id, intent_hash)` and receives the original accepted result.
+
+## Version history
+
+Eligible RoomText files expose account-member-only checkpoint history:
+
+- `GET /web/api/file/history` lists the latest immutable `{epoch, revision}`
+  checkpoints plus the current head when it has not flushed yet.
+- `GET /web/api/file/history/version` validates and reads one exact immutable
+  R2 artifact. The artifact identity and path must match the request, base64
+  must be canonical, and its snapshot must be valid bounded UTF-8.
+- `POST /web/api/file/history/restore` requires room write scope and the
+  current `base_version`. It applies historical bytes through the ordinary
+  RoomText replacement path, so restore is a new monotonic revision rather
+  than a rewind. A concurrent head change returns `412 conflict`.
+
+Checkpoint bodies live at
+`roomtext-shadow/users/<user>/<room>/.history/<file>/<epoch>@<revision>`.
+Create-only writes make them immutable. R2 object metadata records byte size
+and coarse provenance (`web`, `mcp`, `mixed`, or `unknown`); it never invents
+an exact actor when a checkpoint coalesced edits or lacks durable identity.
+Share capabilities cannot read history because an older snapshot may contain
+material intentionally removed before the current page was shared.
 
 ## Write contracts
 
@@ -258,7 +281,8 @@ R2 divergence.
 - RoomText has no production rename/delete or atomic multi-file mutation API.
   `/rooms` is therefore read-only rather than pretending POSIX writes are safe.
 - Oversized Markdown and non-Markdown files remain R2-owned and do not receive
-  collaborative ChangeSet merging.
+  collaborative ChangeSet merging or version history.
 - No cross-account canonical shared-room identity.
 - Ranged reads use byte offsets; page at UTF-8 boundaries.
-- Activity history is not version restore.
+- Version history is bounded to the newest 100 checkpoints per response; the
+  current UI has no deep pagination or named versions.

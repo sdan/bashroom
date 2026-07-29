@@ -23,6 +23,12 @@ import {
   RoomHubText,
   ROOM_TEXT_INBOUND_FRAME_MAX_CHARS,
   isRoomTextClientFrameType,
+  listRoomTextHistoryArtifacts,
+  parseRoomTextHistoryIdentity,
+  parseRoomTextVersionToken,
+  readRoomTextHistoryArtifact,
+  roomTextVersionToken,
+  type RoomTextHistoryVersion,
   type RoomTextPrimaryFile,
   type RoomTextPrimaryEditInput,
   type RoomTextPrimaryImportInput,
@@ -337,6 +343,13 @@ export class AccountDO extends DurableObject<Env> {
         PRIMARY KEY (day, route)
       );
     `);
+    const usageCols = this.ctx.storage.sql
+      .exec<{ name: string }>("SELECT name FROM pragma_table_info('daily_usage')")
+      .toArray()
+      .map((row) => row.name);
+    if (!usageCols.includes("output_bytes")) {
+      this.ctx.storage.sql.exec("ALTER TABLE daily_usage ADD COLUMN output_bytes INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   async syncAccount(input: {
@@ -522,6 +535,68 @@ export class AccountDO extends DurableObject<Env> {
     );
   }
 
+  // Egress is recorded separately from authorizeAndCharge() because the
+  // response size isn't known until the handler has produced output. The
+  // caller dispatches this after building the response and intentionally
+  // swallows accounting errors. Adds to the same (day, route) row, upserting
+  // one if the charge somehow didn't (defensive).
+  async recordEgress(route: string, outputBytes: number): Promise<{ ok: true }> {
+    const now = new Date();
+    const day = now.toISOString().slice(0, 10);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO daily_usage (day, route, request_count, input_bytes, write_bytes, output_bytes, updated_at)
+       VALUES (?, ?, 0, 0, 0, ?, ?)
+       ON CONFLICT(day, route) DO UPDATE SET
+         output_bytes = daily_usage.output_bytes + excluded.output_bytes,
+         updated_at = excluded.updated_at`,
+      day,
+      route || "unknown",
+      Math.max(0, Math.floor(outputBytes)),
+      now.toISOString(),
+    );
+    return { ok: true };
+  }
+
+  // Per-account usage rollup. Returns this account's daily_usage summed by
+  // route plus a grand total, for the offline `npm run usage` script's
+  // fan-out. Pure read; no auth here — the Registry gate + admin token guard
+  // who can trigger the fan-out that calls this.
+  async usageSummary(): Promise<AccountUsageSummary> {
+    const profile = this.profile();
+    const rows = this.ctx.storage.sql
+      .exec<UsageRouteTotals>(
+        `SELECT route,
+                SUM(request_count) AS requests,
+                SUM(input_bytes)   AS in_bytes,
+                SUM(output_bytes)  AS out_bytes,
+                SUM(write_bytes)   AS write_bytes
+           FROM daily_usage GROUP BY route ORDER BY requests DESC`,
+      )
+      .toArray();
+    const totals = rows.reduce(
+      (acc, row) => ({
+        requests: acc.requests + (row.requests || 0),
+        in_bytes: acc.in_bytes + (row.in_bytes || 0),
+        out_bytes: acc.out_bytes + (row.out_bytes || 0),
+        write_bytes: acc.write_bytes + (row.write_bytes || 0),
+      }),
+      { requests: 0, in_bytes: 0, out_bytes: 0, write_bytes: 0 },
+    );
+    return {
+      user_id: profile?.user_id || "",
+      handle: profile?.handle || "",
+      active: totals.requests > 0,
+      totals,
+      by_route: rows.map((row) => ({
+        route: row.route,
+        requests: row.requests || 0,
+        in_bytes: row.in_bytes || 0,
+        out_bytes: row.out_bytes || 0,
+        write_bytes: row.write_bytes || 0,
+      })),
+    };
+  }
+
   private checkBucket(key: string, maxCredits: number, creditsPerMs: number, cost = 1): AccountWire | null {
     const now = Date.now();
     const existing = this.ctx.storage.sql
@@ -546,6 +621,32 @@ export class AccountDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec("UPDATE rate_buckets SET credits = ?, updated_at = ? WHERE key = ?", credits - cost, now, key);
     return null;
   }
+}
+
+type UsageTotals = {
+  requests: number;
+  in_bytes: number;
+  out_bytes: number;
+  write_bytes: number;
+};
+
+type UsageRouteTotals = UsageTotals & { route: string };
+
+type AccountUsageSummary = {
+  user_id: string;
+  handle: string;
+  active: boolean;
+  totals: UsageTotals;
+  by_route: UsageRouteTotals[];
+};
+
+function addTotals(left: UsageTotals, right: UsageTotals): UsageTotals {
+  return {
+    requests: left.requests + right.requests,
+    in_bytes: left.in_bytes + right.in_bytes,
+    out_bytes: left.out_bytes + right.out_bytes,
+    write_bytes: left.write_bytes + right.write_bytes,
+  };
 }
 
 
@@ -668,6 +769,8 @@ const WRITE_TOKEN_CAPACITY = 300;
 const WRITE_TOKEN_REFILL = 10 / MINUTE_MS;
 const GLOBAL_OPS_CAPACITY = 50_000;
 const GLOBAL_OPS_REFILL = 50_000 / DAY_MS;
+const FANOUT_CONCURRENCY = 6;
+const FANOUT_TIMEOUT_MS = 5_000;
 const LAST_SEEN_WRITE_INTERVAL_MS = 5 * MINUTE_MS;
 // Registry cleanup-alarm cadence + per-table TTLs for the sweep.
 const CLEANUP_INTERVAL_MS = HOUR_MS;
@@ -1601,6 +1704,81 @@ export class Registry extends DurableObject<Env> {
     return this.verifyAccountTokenHash(await sha256(token), ip);
   }
 
+  // Fleet usage rollup. Reads the `users` roster (this is why a global total
+  // is even possible — DOs can't be enumerated, only addressed by name), then
+  // fans out to each account's AccountDO.usageSummary().
+  //
+  // Bounded to FANOUT_CONCURRENCY in flight — the pingpong fleet read (see
+  // workers/HANDOFF-fleet-readmodel.md) proved a naive Promise.all over N
+  // per-tenant DOs hits the 6-simultaneous-connections-per-invocation ceiling
+  // and 1101s ~50% of the time. allSettled + per-DO timeout means one slow or
+  // dead shard drops to skipped_accounts instead of failing the whole report;
+  // the caller surfaces skipped_accounts so totals never silently under-report.
+  async globalUsage(): Promise<{
+    generated_at: string;
+    total_accounts: number;
+    active_accounts: number;
+    skipped_accounts: number;
+    totals: UsageTotals;
+    by_route: UsageRouteTotals[];
+    accounts: AccountUsageSummary[];
+  }> {
+    const roster = this.ctx.storage.sql
+      .exec<{ user_id: string; handle: string; github_login: string | null }>(
+        "SELECT user_id, handle, github_login FROM users ORDER BY created_at ASC",
+      )
+      .toArray()
+      .filter((row) => row.user_id);
+    const accounts: AccountUsageSummary[] = [];
+    let skipped = 0;
+    for (let index = 0; index < roster.length; index += FANOUT_CONCURRENCY) {
+      const batch = roster.slice(index, index + FANOUT_CONCURRENCY);
+      const settled = await Promise.allSettled(
+        batch.map((user) => {
+          const stub = this.env.ACCOUNTS.getByName(accountObjectName(user.user_id));
+          return Promise.race([
+            stub.usageSummary(),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error("usage_timeout")), FANOUT_TIMEOUT_MS)),
+          ]);
+        }),
+      );
+      settled.forEach((result, batchIndex) => {
+        const user = batch[batchIndex];
+        if (result.status === "fulfilled" && result.value) {
+          accounts.push({
+            ...result.value,
+            user_id: user.user_id,
+            handle: result.value.handle || user.handle || user.github_login || "",
+          });
+        } else {
+          skipped += 1;
+        }
+      });
+    }
+    const zero: UsageTotals = { requests: 0, in_bytes: 0, out_bytes: 0, write_bytes: 0 };
+    const totals = accounts.reduce((acc, account) => addTotals(acc, account.totals), { ...zero });
+    const routeMap = new Map<string, UsageTotals>();
+    for (const account of accounts) {
+      for (const route of account.by_route) {
+        const current = routeMap.get(route.route) || { ...zero };
+        routeMap.set(route.route, addTotals(current, route));
+      }
+    }
+    const by_route = [...routeMap.entries()]
+      .map(([route, totalsForRoute]) => ({ route, ...totalsForRoute }))
+      .sort((left, right) => right.requests - left.requests);
+    return {
+      generated_at: new Date().toISOString(),
+      total_accounts: roster.length,
+      active_accounts: accounts.filter((account) => account.active).length,
+      skipped_accounts: skipped,
+      totals,
+      by_route,
+      accounts,
+    };
+  }
+
   private verifyAccountTokenHash(tokenHash: string, ip: string): AccountAuth {
     const ipLimited = this.checkBucket(`verify:ip:${ip}`, VERIFY_IP_CAPACITY, VERIFY_IP_REFILL);
     if (ipLimited) return ipLimited;
@@ -2003,6 +2181,18 @@ function roomsMentioned(command: string): string[] {
 async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
 
+  if (url.pathname === "/internal-usage" && request.method === "GET") {
+    if (!env.BASHROOM_ADMIN_TOKEN || !await adminTokenOk(request, env)) {
+      return json({ ok: false, error: "not_found" }, 404);
+    }
+    const stub = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
+    const usage = await stub.globalUsage();
+    if (usage.skipped_accounts > 0) {
+      console.warn(`[usage] ${usage.skipped_accounts}/${usage.total_accounts} accounts skipped (timeout/error) — totals under-report`);
+    }
+    return json({ ok: true, usage });
+  }
+
     if (url.pathname === "/mcp") {
       const token = bearerToken(request);
       // MCP OAuth discovery trigger: an unauthenticated request gets a 401
@@ -2343,6 +2533,161 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       if (!opened.ok) return json(opened, authorityErrorStatus(opened.error));
       if (!opened.file) return json({ ok: false, error: "not_found" }, 404);
       return json({ ok: true, file: opened.file });
+    }
+
+    // Page-scoped RoomText checkpoint history. This is deliberately separate
+    // from /account/room-history, which is an audit feed and cannot recover
+    // bytes. Share slugs are not accepted: immutable versions can contain
+    // material that a later edit intentionally removed from the shared page.
+    if (url.pathname === "/web/api/file/history" && request.method === "GET") {
+      const room = parseOptionalWiki(url.searchParams.get("room"));
+      const path = url.searchParams.get("path") || "";
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      if (!path) return json({ ok: false, error: "path_required" }, 400);
+      const access = await authorizeWebHistory(env, request, room, path, false);
+      if (!access.ok) return access.response;
+      const listed = await listRoomTextHistoryArtifacts(env.ROOMS_R2, access.userId, room, access.path);
+      if (!listed.ok) {
+        return json(
+          { ok: false, error: listed.error.toLowerCase() },
+          listed.error === "HISTORY_TOO_LARGE" ? 409 : 503,
+        );
+      }
+      const current = {
+        epoch: access.epoch,
+        revision: access.revision,
+        version: roomTextVersionToken(access.epoch, access.revision),
+      };
+      // Immutable PUT precedes the HEAD flip, so a crash can briefly leave an
+      // orphan artifact. Never expose an identity newer than the authoritative
+      // RoomText head even if such an object exists in R2.
+      const merged = listed.versions.filter((version) =>
+        version.epoch < access.epoch
+        || (version.epoch === access.epoch && version.revision <= access.revision));
+      const currentIndex = merged.findIndex(
+        (version) => version.epoch === access.epoch && version.revision === access.revision,
+      );
+      if (currentIndex < 0) {
+        merged.push({
+          ...current,
+          created_at: access.file.updated_at,
+          client_id: "",
+          source: "unknown",
+          size_bytes: access.file.size_bytes,
+        });
+      } else {
+        // The authoritative head knows the exact byte count even when an old
+        // artifact predates history custom metadata.
+        merged[currentIndex] = { ...merged[currentIndex], size_bytes: access.file.size_bytes };
+      }
+      merged.sort((left, right) => right.epoch - left.epoch || right.revision - left.revision);
+      const limit = Math.max(1, clampInt(Number(url.searchParams.get("limit")), 30, 100));
+      return json({
+        ok: true,
+        current,
+        versions: merged.slice(0, limit).map((version) => publicHistoryVersion(version, access)),
+        truncated: merged.length > limit,
+      });
+    }
+
+    if (url.pathname === "/web/api/file/history/version" && request.method === "GET") {
+      const room = parseOptionalWiki(url.searchParams.get("room"));
+      const path = url.searchParams.get("path") || "";
+      const identity = parseRoomTextHistoryIdentity(
+        `${url.searchParams.get("epoch") || ""}@${url.searchParams.get("revision") || ""}`,
+      );
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      if (!path) return json({ ok: false, error: "path_required" }, 400);
+      if (!identity) return json({ ok: false, error: "invalid_version" }, 400);
+      const access = await authorizeWebHistory(env, request, room, path, false);
+      if (!access.ok) return access.response;
+      if (identity.epoch > access.epoch
+        || (identity.epoch === access.epoch && identity.revision > access.revision)) {
+        return json({ ok: false, error: "version_not_found" }, 404);
+      }
+      if (identity.epoch === access.epoch && identity.revision === access.revision) {
+        const current: RoomTextHistoryVersion = {
+          ...identity,
+          version: roomTextVersionToken(identity.epoch, identity.revision),
+          created_at: access.file.updated_at,
+          client_id: "",
+          source: "unknown",
+          size_bytes: access.file.size_bytes,
+        };
+        return json({
+          ok: true,
+          version: { ...publicHistoryVersion(current, access), content: access.file.content },
+        });
+      }
+      const read = await readRoomTextHistoryArtifact(
+        env.ROOMS_R2, access.userId, room, access.path, identity.epoch, identity.revision,
+      );
+      if (!read.ok) return historyReadError(read.error);
+      return json({
+        ok: true,
+        version: { ...publicHistoryVersion(read.artifact, access), content: read.artifact.content },
+      });
+    }
+
+    if (url.pathname === "/web/api/file/history/restore" && request.method === "POST") {
+      const input = await readJson(request);
+      const room = parseOptionalWiki(String(input.room || ""));
+      const path = String(input.path || "");
+      const identity = parseRoomTextHistoryIdentity(`${String(input.epoch ?? "")}@${String(input.revision ?? "")}`);
+      const baseVersion = typeof input.base_version === "string" ? input.base_version : "";
+      if (!room) return json({ ok: false, error: "room_required" }, 400);
+      if (!path) return json({ ok: false, error: "path_required" }, 400);
+      if (!identity) return json({ ok: false, error: "invalid_version" }, 400);
+      if (!baseVersion) return json({ ok: false, error: "base_version_required" }, 400);
+      const access = await authorizeWebHistory(env, request, room, path, true);
+      if (!access.ok) return access.response;
+      const base = parseRoomTextVersionToken(baseVersion);
+      if (!base) return json({ ok: false, error: "invalid_base_version" }, 400);
+      if (identity.epoch > access.epoch
+        || (identity.epoch === access.epoch && identity.revision > access.revision)) {
+        return json({ ok: false, error: "version_not_found" }, 404);
+      }
+      if (identity.epoch === access.epoch && identity.revision === access.revision) {
+        return json({ ok: false, error: "already_current" }, 409);
+      }
+      const read = await readRoomTextHistoryArtifact(
+        env.ROOMS_R2, access.userId, room, access.path, identity.epoch, identity.revision,
+      );
+      if (!read.ok) return historyReadError(read.error);
+      const restored = await replaceAuthoritativeText(
+        env,
+        access.userId,
+        room,
+        access.path,
+        read.artifact.content,
+        baseVersion,
+        `web:${access.userId}`,
+      );
+      if (!restored.ok) return json(restored, writeErrorStatus(restored.error));
+      const changed = restored.file.version !== access.file.version;
+      if (changed) {
+        pokeRoomHub(ctx, env, access.userId, room, access.handle || "you", access.path, "web", restored.file.etag);
+        defer(ctx, registry(env, "/audit-append", {
+          user_id: access.userId,
+          room,
+          actor: access.handle || "you",
+          kind: "write",
+          path: access.path,
+          command: `history:restore:${read.artifact.version}`,
+          exit_code: 0,
+        }));
+      }
+      return json({
+        ok: true,
+        file: restored.file,
+        restored_from: {
+          epoch: read.artifact.epoch,
+          revision: read.artifact.revision,
+          version: read.artifact.version,
+        },
+        ...(restored.replayed ? { replayed: true } : {}),
+        ...(!changed && !restored.replayed ? { unchanged: true } : {}),
+      });
     }
 
     // Raw byte download of one file — used by `bashroom export` so binary
@@ -3055,6 +3400,11 @@ function publicBaseUrl(env: Env, request: Request): string {
   return `${url.protocol}//${url.host}`;
 }
 
+function recordEgress(env: Env, userId: string, route: string, outputBytes: number): void {
+  if (!userId || outputBytes <= 0) return;
+  env.ACCOUNTS.getByName(accountObjectName(userId)).recordEgress(route, outputBytes).catch(() => undefined);
+}
+
 // v2 entrypoint. Resolves user_id through the per-user AccountDO when the
 // token is routeable, then delegates to runShellV2 (sandbox + R2). Legacy
 // tokens fall back to Registry during migration.
@@ -3069,6 +3419,7 @@ async function runShell(env: Env, ctx: ExecutionContext, headerToken: string, ip
     return { stdout: "", stderr: "bashroom: no account\n", exitCode: 1, changed: 0, changed_paths: [] };
   }
   const result = await runShellV2(env, ctx, userId, command, stdin, account.rooms || []);
+  recordEgress(env, userId, "mcp.exec", utf8ByteLength(result.stdout) + utf8ByteLength(result.stderr));
   // Presence: room-level touch for every room the command names. path=""
   // means "activity in this room" (readers refresh the tree, not a file);
   // heuristic until R2 event notifications provide per-file precision.
@@ -3701,12 +4052,14 @@ async function mcpRead(env: Env, token: string, ip: string, path: string, offset
 
     const length = Math.min(limit, encoded.byteLength - start);
     const content = new TextDecoder().decode(encoded.subarray(start, start + length));
+    const bytesReturned = utf8ByteLength(content);
+    recordEgress(env, roomAuth.userId, "mcp.read", bytesReturned);
     return {
       ok: true,
       file: { ...metadata, is_binary: false },
       offset: start,
       max_bytes: limit,
-      bytes_returned: utf8ByteLength(content),
+      bytes_returned: bytesReturned,
       truncated: start + length < encoded.byteLength,
       content,
     };
@@ -4101,6 +4454,21 @@ function bearerToken(request: Request): string {
   return header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
 }
 
+async function adminTokenOk(request: Request, env: Env): Promise<boolean> {
+  const provided = bearerToken(request);
+  if (!provided) return false;
+  const [left, right] = await Promise.all([
+    sha256(provided),
+    sha256(env.BASHROOM_ADMIN_TOKEN || ""),
+  ]);
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
 // ─── R2 helpers ─────────────────────────────────────────────────────────
 // All keys are users/<user_id>/<room>/<path>. These helpers own the
 // prefix layout so callers never construct the key string themselves.
@@ -4191,9 +4559,10 @@ function r2FileFromPut(object: R2Object, userId: string, room: string, content: 
 // ─── Public share serving ───────────────────────────────────────────────
 // GET /s/<slug>[/<path...>] — role-link entrypoint. View links are anonymous
 // and may expose a subtree; Comment/Edit links are exact-file shells whose
-// content stays behind account-authenticated JSON APIs. Unknown slug and
-// empty directory both 404 identically so the route doesn't leak which slugs
-// exist.
+// content stays behind account-authenticated JSON APIs. Unknown slugs 404;
+// a resolved slug with an empty subtree renders an explicit empty state at
+// its root, while unknown subpaths under a valid slug still 404 so garbage
+// paths never read as "empty folders".
 async function replaceAuthoritativeText(
   env: Env,
   userId: string,
@@ -4479,7 +4848,12 @@ async function servePublicShare(env: Env, request: Request, url: URL, ctx: Execu
     .filter((p) => p && !p.endsWith("/")) // skip s3fs directory-marker objects
     .map((p) => p.slice(dirPrefix.length))
     .sort();
-  if (!entries.length) return publicShareNotFound();
+  // A resolved slug whose subtree is empty is a live share, not a dead link —
+  // render an honest empty state at the share root. Unknown subpaths under a
+  // valid slug still 404: a garbage path is "not found", not "empty". The
+  // root case reveals only that the slug exists, which /share-resolve's IP
+  // rate limit and ~80-bit slugs already price in.
+  if (!entries.length && rest) return publicShareNotFound();
   // Hrefs stay relative to the slug root: /s/<slug>/<path-beyond-prefix>.
   const hrefBase = `/s/${encodeURIComponent(slug)}` + (rest ? `/${rest.split("/").map(encodeURIComponent).join("/")}` : "");
   // script-src covers exactly one inline script: the shell's theme boot.
@@ -4578,7 +4952,13 @@ function publicRichMarkdownScript(initialMarkdown: string): string {
   window.bashroomRenderMarkdown = async function(source,caret,actor){
     var seq = ++renderSeq;
     var article = document.getElementById("doc"); if (!article) return;
-    article.innerHTML = DOMPurify.sanitize(marked.parse(source || ""));
+    var text = String(source == null ? "" : source);
+    article.innerHTML = text.trim()
+      ? DOMPurify.sanitize(marked.parse(text))
+      : '<div class="empty">This document is empty.</div>';
+    // The placeholder needs no diagram enhancement and must never receive a
+    // remote caret — a live draft that empties the doc stops here.
+    if (!text.trim()) return;
     await enhance(article);
     if (seq === renderSeq && actor) placeCursor(article,source,caret,actor);
   };
@@ -4657,9 +5037,12 @@ function publicIndexHtml(room: string, target: string, hrefBase: string, entries
   const rows = entries
     .map((entry) => `<li><a href="${hrefBase}/${entry.split("/").map(encodeURIComponent).join("/")}">${escapeHtml(entry)}</a></li>`)
     .join("\n");
+  const listing = entries.length
+    ? `<ul class="index">${rows}</ul>`
+    : `<div class="empty">This share is live but empty — nothing has been written here yet.</div>`;
   const body = `
   <div class="file-meta"><span>${escapeHtml(room)}${target ? "/" + escapeHtml(target) : ""}/</span></div>
-  <ul class="index">${rows}</ul>`;
+  ${listing}`;
   return publicShellHtml(`${room}${target ? "/" + target : ""}/`, body, nonce);
 }
 
@@ -4999,6 +5382,106 @@ async function authoritativeFile(
     return { ok: false, error: imported.error, ...(imported.message ? { message: imported.message } : {}) };
   }
   return { ok: false, error: "source_busy", message: "the R2 source changed repeatedly during migration" };
+}
+
+type WebHistoryAccess = {
+  ok: true;
+  userId: string;
+  handle: string;
+  path: string;
+  file: R2File;
+  epoch: number;
+  revision: number;
+};
+
+/**
+ * One shared access fence for list/read/restore. Historical bytes are account-
+ * member only even when the current page has a share link: a checkpoint may
+ * contain content intentionally removed before that link was created.
+ */
+async function authorizeWebHistory(
+  env: Env,
+  request: Request,
+  room: string,
+  rawPath: string,
+  write: boolean,
+): Promise<WebHistoryAccess | { ok: false; response: Response }> {
+  const path = sanitizeFilePath(rawPath);
+  const account = await authorizeAccount(env, bearerToken(request), clientIp(request), {
+    route: write ? "web.file.history.restore" : "web.file.history",
+    includeRooms: true,
+  });
+  if (!account.ok) {
+    return { ok: false, response: json({ ok: false, error: account.error || "unauthorized" }, 401) };
+  }
+  const userId = String(account.user_id || "");
+  const membership = (account.rooms || []).find((entry) => entry.room === room);
+  if (!userId || !membership || !hasScope(membership.scopes, "read")) {
+    return { ok: false, response: json({ ok: false, error: "forbidden" }, 403) };
+  }
+  if (write && !hasScope(membership.scopes, "write")) {
+    return { ok: false, response: json({ ok: false, error: "read_only" }, 403) };
+  }
+  const opened = await authoritativeFile(env, userId, room, path);
+  if (!opened.ok) {
+    return { ok: false, response: json(opened, authorityErrorStatus(opened.error)) };
+  }
+  if (!opened.file) {
+    return { ok: false, response: json({ ok: false, error: "not_found" }, 404) };
+  }
+  if (opened.authority !== "roomtext") {
+    return { ok: false, response: json({ ok: false, error: "history_unavailable" }, 409) };
+  }
+  const identity = parseRoomTextVersionToken(opened.file.version);
+  if (!identity) {
+    return { ok: false, response: json({ ok: false, error: "invalid_authoritative_version" }, 409) };
+  }
+  return {
+    ok: true,
+    userId,
+    handle: String(account.handle || "you"),
+    path,
+    file: opened.file,
+    ...identity,
+  };
+}
+
+function publicHistoryVersion(version: RoomTextHistoryVersion, access: WebHistoryAccess): {
+  epoch: number;
+  revision: number;
+  version: string;
+  created_at: string;
+  actor: string;
+  source: RoomTextHistoryVersion["source"];
+  size_bytes: number | null;
+  current: boolean;
+} {
+  const current = version.epoch === access.epoch && version.revision === access.revision;
+  let actor = "Saved version";
+  // MCP records a durable source, not the exact agent identity. Never map it
+  // to the room's current membership actor; that would invent provenance.
+  if (version.source === "mcp") actor = "Agent";
+  else if (version.source === "mixed") actor = "Multiple editors";
+  else if (version.source === "web") {
+    actor = version.client_id === `web:${access.userId}` ? access.handle || "You" : "Collaborator";
+  } else if (version.revision === 0) actor = "Initial version";
+  else if (current) actor = "Current";
+  return {
+    epoch: version.epoch,
+    revision: version.revision,
+    version: version.version,
+    created_at: version.created_at,
+    actor,
+    source: version.source,
+    size_bytes: version.size_bytes,
+    current,
+  };
+}
+
+function historyReadError(error: "NOT_FOUND" | "INVALID_ARTIFACT" | "HISTORY_UNAVAILABLE"): Response {
+  if (error === "NOT_FOUND") return json({ ok: false, error: "version_not_found" }, 404);
+  if (error === "INVALID_ARTIFACT") return json({ ok: false, error: "invalid_history_artifact" }, 409);
+  return json({ ok: false, error: "history_unavailable" }, 503);
 }
 
 async function r2File(env: Env, userId: string, room: string, path: string): Promise<R2File | null> {

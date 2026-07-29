@@ -421,7 +421,7 @@ try {
     orderingFile, 0, "janitor-client", "revision-1", [{ from: 1, to: 1, insert: "b" }],
   ))).revision, 1);
   assert.equal((await post(`/checkpoint?file=${orderingFile}`)).revision, 1);
-  assert.deepEqual(await post("/janitor/gate/arm"), { ok: true, id: "default", state: "armed" });
+  assert.deepEqual(await post("/janitor/gate/arm"), { ok: true, state: "armed" });
   const olderFire = post(`/janitor/fire?file=${orderingFile}`);
   await waitFor(async () => (await get("/janitor/gate")).state === "paused", "older janitor never paused");
 
@@ -435,7 +435,7 @@ try {
   const beforeReleaseObjects = (await get("/janitor/r2")).objects;
   assert.equal(manifestAt(beforeReleaseObjects, orderingHeadKey).revision, 2);
 
-  assert.deepEqual(await post("/janitor/gate/release"), { ok: true, id: "default", state: "released" });
+  assert.deepEqual(await post("/janitor/gate/release"), { ok: true, state: "released" });
   const olderResult = await olderFire;
   assert.deepEqual(
     { ok: olderResult.ok, revision: olderResult.revision, headFlip: olderResult.headFlip },
