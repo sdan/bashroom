@@ -25,6 +25,7 @@ describe("private self profile", () => {
     expect(html).toContain("Distinct file paths changed each day. Repeated saves and retries collapse to one file per day.");
     expect(html).toContain('role="img" aria-label="');
     expect(html).toContain('grid-template-columns: repeat(var(--profile-weeks, 54), 10px)');
+    expect(html).toContain('newProfileCalendar.scrollLeft = profileCalendarScroll === null');
     expect(html).toContain('<span class="profile-day level-');
     expect(html).not.toContain('<button class="profile-day');
   });

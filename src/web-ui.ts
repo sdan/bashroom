@@ -4145,6 +4145,11 @@ const WEB_INDEX_HTML = `<!doctype html>
     const prevAside = app.querySelector("aside");
     const sidebarScroll = prevAside ? prevAside.scrollTop : null;
     const anchor = sidebarAnchor(prevAside);
+    // The activity grid overflows on phones. A fresh profile should reveal
+    // the present (the right edge), while background rerenders must preserve
+    // wherever the user has deliberately scrolled in the year.
+    const prevProfileCalendar = app.querySelector(".profile-calendar-wrap");
+    const profileCalendarScroll = prevProfileCalendar ? prevProfileCalendar.scrollLeft : null;
     // The innerHTML wipe would silently blur + blank the search input; carry
     // its focus across the swap (the value re-paints from searchQuery).
     const ae = document.activeElement;
@@ -4382,6 +4387,14 @@ const WEB_INDEX_HTML = `<!doctype html>
       } else {
         applySidebarAnchor(newAside, anchor, sidebarScroll);
       }
+    }
+    const newProfileCalendar = app.querySelector(".profile-calendar-wrap");
+    if (newProfileCalendar) {
+      requestAnimationFrame(() => {
+        newProfileCalendar.scrollLeft = profileCalendarScroll === null
+          ? newProfileCalendar.scrollWidth
+          : profileCalendarScroll;
+      });
     }
     const lo = document.getElementById("logout"); if (lo) lo.onclick = logout;
     const profileOpen = document.getElementById("profile-open");
