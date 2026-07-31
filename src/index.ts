@@ -19,6 +19,11 @@ import { webIndexHtml } from "./web-ui";
 import { webLandingHtml } from "./web-landing";
 import { webDeviceHtml, webDeviceResultHtml } from "./web-device";
 import { decodeWriteContent, isSafeOAuthRedirectUri, type WriteEncoding } from "./security";
+import {
+  profileActivityWindow,
+  summarizeProfileActivity,
+  type ProfileActivityRow,
+} from "./profile-stats";
 import { DocumentCollab, parseShareRole, type ShareRole } from "./document-collab";
 import { webCollaborativeShareHtml } from "./web-collab";
 import {
@@ -750,6 +755,21 @@ type AccountWire = {
   retry_after_seconds?: number;
 };
 
+type ProfileSummaryWire =
+  | {
+      ok: true;
+      handle: string;
+      github_login: string | null;
+      joined_at: string;
+      room_count: number;
+      active_days: number;
+      current_streak: number;
+      longest_streak: number;
+      last_change_at: string | null;
+      activity: ProfileActivityRow[];
+    }
+  | { ok: false; error: string };
+
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MAX_COMMAND_CHARS = 32_000;
@@ -987,6 +1007,9 @@ export class Registry extends DurableObject<Env> {
     `);
     this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS audit_room_idx ON audit(room, id DESC)`);
     this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS audit_user_idx ON audit(user_id, id DESC)`);
+    // The private profile reads one user's trailing UTC activity window.
+    // Keep that range query indexed independently from the id-ordered audit UI.
+    this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS audit_user_ts_idx ON audit(user_id, ts)`);
   }
 
   // Arm the hourly cleanup alarm if one isn't already pending. Called after
@@ -1104,6 +1127,13 @@ export class Registry extends DurableObject<Env> {
       const user = this.userById(userId);
       if (!user) return json({ ok: false, error: "unknown_user" }, 401);
       return json({ ok: true, user_id: userId, handle: user.handle, rooms: this.accountRooms(userId) });
+    }
+
+    // Trusted Worker-only profile read. The public route authenticates first
+    // and supplies that exact user id; this returns aggregates only, never raw
+    // audit paths, commands, or internal identity ids.
+    if (request.method === "POST" && url.pathname === "/internal-profile-summary") {
+      return json(this.profileSummary(String(body.user_id || "")));
     }
 
     if (request.method === "POST" && url.pathname === "/internal-room-create") {
@@ -1843,6 +1873,62 @@ export class Registry extends DurableObject<Env> {
       }));
   }
 
+  private profileSummary(userId: string): ProfileSummaryWire {
+    if (!userId) return { ok: false, error: "unknown_user" };
+    const profile = this.ctx.storage.sql
+      .exec<{ handle: string; github_login: string | null; created_at: string }>(
+        "SELECT handle, github_login, created_at FROM users WHERE user_id = ?",
+        userId,
+      )
+      .toArray()[0];
+    if (!profile) return { ok: false, error: "unknown_user" };
+
+    const roomCount = this.ctx.storage.sql
+      .exec<{ room_count: number }>("SELECT COUNT(*) AS room_count FROM user_rooms WHERE user_id = ?", userId)
+      .one().room_count;
+    const now = new Date();
+    const { startDay, endExclusiveDay } = profileActivityWindow(now);
+    const activityRows = this.ctx.storage.sql
+      .exec<ProfileActivityRow>(
+        `SELECT substr(ts, 1, 10) AS day,
+                COUNT(DISTINCT length(room) || ':' || room || path) AS changed_files
+           FROM audit
+          WHERE user_id = ?
+            AND kind IN ('write', 'shared_write')
+            AND path IS NOT NULL
+            AND ts >= ? AND ts < ?
+          GROUP BY substr(ts, 1, 10)
+          ORDER BY day`,
+        userId,
+        startDay,
+        endExclusiveDay,
+      )
+      .toArray();
+    const lastChange = this.ctx.storage.sql
+      .exec<{ last_change_at: string | null }>(
+        `SELECT MAX(ts) AS last_change_at
+           FROM audit
+          WHERE user_id = ?
+            AND kind IN ('write', 'shared_write')
+            AND path IS NOT NULL
+            AND ts < ?`,
+        userId,
+        endExclusiveDay,
+      )
+      .one().last_change_at;
+    const activity = summarizeProfileActivity(activityRows, now);
+
+    return {
+      ok: true,
+      handle: profile.handle,
+      github_login: profile.github_login,
+      joined_at: profile.created_at,
+      room_count: roomCount,
+      ...activity,
+      last_change_at: lastChange,
+    };
+  }
+
   private auditAppend(row: { userId: string; room: string; actor: string; kind: string; path: string | null; command: string | null; exitCode: number | null }): Record<string, unknown> {
     // user_id and kind required. room is empty string for shell execs that
     // don't target a specific room — sanitizeWiki would reject "" so we
@@ -1856,7 +1942,10 @@ export class Registry extends DurableObject<Env> {
       row.room ? sanitizeWiki(row.room) : "",
       sanitizeActor(row.actor),
       row.kind,
-      row.path ? compact(row.path) : null,
+      // File identity is byte-for-byte meaningful: "a  b.md" and "a b.md"
+      // are distinct valid paths. Commands are prose and may be compacted;
+      // paths must only pass through the canonical file-path validator.
+      row.path ? sanitizeFilePath(row.path) : null,
       row.command ? compact(row.command) : null,
       row.exitCode,
     );
@@ -2539,6 +2628,50 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       const activeRoom = requested && memberRooms.some((row) => row.room === requested) ? requested : "";
       const tree = activeRoom && userId ? await r2Tree(env, userId, activeRoom) : null;
       return json({ ...account, active: activeRoom || null, tree });
+    }
+
+    if (url.pathname === "/web/api/profile" && request.method === "GET") {
+      const noStore = { "cache-control": "private, no-store" };
+      try {
+        const account = await authorizeAccount(env, bearerToken(request), clientIp(request), { route: "web.profile" });
+        if (account.ok === false) {
+          const status = account.error === "rate_limited" ? 429 : 401;
+          return json({ ok: false, error: account.error || "unauthorized" }, status, noStore);
+        }
+        const userId = String(account.user_id || "");
+        if (!userId) return json({ ok: false, error: "unauthorized" }, 401, noStore);
+
+        const [profile, objects] = await Promise.all([
+          registry(env, "/internal-profile-summary", { user_id: userId }) as Promise<ProfileSummaryWire>,
+          r2List(env, userId),
+        ]);
+        if (!profile.ok) return json({ ok: false, error: "profile_unavailable" }, 503, noStore);
+
+        let fileCount = 0;
+        let storageBytes = 0;
+        for (const object of objects) {
+          if (object.key.endsWith("/")) continue;
+          fileCount += 1;
+          storageBytes += object.size;
+        }
+        return json({
+          ok: true,
+          handle: profile.handle,
+          github_login: profile.github_login,
+          joined_at: profile.joined_at,
+          room_count: profile.room_count,
+          file_count: fileCount,
+          storage_bytes: storageBytes,
+          active_days: profile.active_days,
+          current_streak: profile.current_streak,
+          longest_streak: profile.longest_streak,
+          last_change_at: profile.last_change_at,
+          activity: profile.activity,
+        }, 200, noStore);
+      } catch (error) {
+        console.error("profile exception:", error);
+        return json({ ok: false, error: "profile_unavailable" }, 500, noStore);
+      }
     }
 
     if (url.pathname === "/web/api/tree" && request.method === "GET") {

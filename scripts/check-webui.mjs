@@ -55,5 +55,29 @@ for (const required of [
     process.exit(1);
   }
 }
+for (const required of [
+  'api("/web/api/profile")',
+  'function profileHandleFromUrl()',
+  'profileSurface = true',
+  'disconnectPresence();',
+  'Durable changes in your rooms',
+  'aria-current="page"',
+  'id="profile-back"',
+  'id="logout" type="button"',
+  'role="img" aria-label="',
+]) {
+  if (!js.includes(required)) {
+    console.error("private profile wiring missing: " + required);
+    process.exit(1);
+  }
+}
+if (js.includes('<button class="profile-day')) {
+  console.error("profile calendar cells must not enter the tab order");
+  process.exit(1);
+}
+if (!src.includes("grid-template-columns: repeat(var(--profile-weeks, 54), 10px)")) {
+  console.error("profile calendar no longer renders its complete trailing-day grid");
+  process.exit(1);
+}
 writeFileSync(process.argv[3], js);
 console.log("extracted", js.length, "chars (faithful template evaluation)");

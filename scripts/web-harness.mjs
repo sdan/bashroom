@@ -52,6 +52,18 @@ const HISTORY = [
   { epoch: 1, revision: 3, version: "rt1:1:3", created_at: "2026-07-27T23:12:00.000Z", actor: "Agent", source: "mcp", size_bytes: 122, current: false },
 ];
 
+// Keep the profile fixture relative to today so visual checks always exercise
+// the current-week streak instead of slowly drifting into an empty calendar.
+const profileActivity = [];
+for (let daysAgo = 0; daysAgo < 371; daysAgo += 1) {
+  if (daysAgo < 4 || daysAgo % 13 === 0 || daysAgo % 29 === 5) {
+    const day = new Date();
+    day.setHours(0, 0, 0, 0);
+    day.setDate(day.getDate() - daysAgo);
+    profileActivity.push({ day: day.toISOString().slice(0, 10), changed_files: daysAgo < 4 ? 2 + daysAgo : 1 + (daysAgo % 11) });
+  }
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   if (url.pathname === "/test/emit" && req.method === "POST") {
@@ -113,6 +125,22 @@ const server = createServer(async (req, res) => {
     });
   }
   if (url.pathname === "/web/api/put-count") return json(res, { putCount });
+  if (url.pathname === "/web/api/profile") {
+    return json(res, {
+      ok: true,
+      handle: "sdan",
+      github_login: "sdan",
+      joined_at: "2023-03-06T16:00:00.000Z",
+      room_count: ROOMS.length,
+      file_count: ROOMS.reduce((sum, room) => sum + treeFor(room).length, 0),
+      storage_bytes: 28743168,
+      active_days: profileActivity.length,
+      current_streak: 4,
+      longest_streak: 12,
+      last_change_at: new Date().toISOString(),
+      activity: profileActivity,
+    });
+  }
   if (url.pathname === "/web/api/rooms") {
     const active = url.searchParams.get("active") || "";
     treeDelay = 0;

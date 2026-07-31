@@ -19,6 +19,6 @@ describe("offline feature guide", () => {
   });
 
   it("never appears in capability-share mode", () => {
-    expect(html).toContain("if (!state.token || share) { hideFeatureTour(); return; }");
+    expect(html).toContain("if (!state.token || share || profileSurface) { hideFeatureTour(); return; }");
   });
 });

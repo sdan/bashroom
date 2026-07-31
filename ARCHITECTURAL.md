@@ -143,6 +143,30 @@ an exact actor when a checkpoint coalesced edits or lacks durable identity.
 Share capabilities cannot read history because an older snapshot may contain
 material intentionally removed before the current page was shared.
 
+## Private self profile
+
+`/@<handle>` is an authenticated self-view inside the existing web shell, not
+a public profile. Clicking the sidebar handle opens it; selecting a room file
+returns to the editor. Opening the profile flushes any pending autosave, leaves
+room presence, and never mounts historical or current file bytes into the
+profile surface.
+
+`GET /web/api/profile` composes two existing authorities without creating a
+third analytics store:
+
+- Registry supplies the canonical handle, GitHub login, account creation time,
+  room count, and aggregate daily audit rows.
+- One paginated `users/<user_id>/` R2 listing supplies current file count and
+  stored bytes. RoomText history remains under `roomtext-shadow/`, so recovery
+  artifacts cannot inflate the file total.
+
+Activity means distinct paths with a recorded `write` or `shared_write` audit
+event, grouped by UTC day. It is a best-effort product signal: audit appends are
+deferred, and collaborator changes in an owner's room belong to that owner's
+account history. The endpoint returns only counts and dates—never user ids,
+paths, commands, or raw audit rows—and is always `Cache-Control: no-store`.
+Public profiles would require a separate opt-in privacy contract.
+
 ## Write contracts
 
 The Worker exposes ten MCP tools. The two mutation shapes are intentionally

@@ -262,9 +262,17 @@ const WEB_INDEX_HTML = `<!doctype html>
 
   /* Footer — 10px vertical matches the brand row's top spacing for visual symmetry. */
   .footer { margin-top: auto; padding: 10px 14px; font-size: 13px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; border-top: 1px solid var(--rule); }
-  .footer .handle { color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .footer .logout { cursor: pointer; color: var(--ink-faint); flex-shrink: 0; }
-  .footer .logout:hover { color: var(--link); }
+  .footer .handle, .footer .logout {
+    min-height: 40px; padding: 0; border: 0; background: transparent;
+    display: inline-flex; align-items: center; font: inherit; cursor: pointer;
+    transition-property: color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
+  }
+  .footer .handle { min-width: 0; color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .footer .handle[aria-current="page"] { color: var(--link); }
+  .footer .logout { color: var(--ink-faint); flex-shrink: 0; }
+  .footer .handle:hover, .footer .logout:hover { color: var(--link); }
+  .footer .handle:active, .footer .logout:active { scale: .96; }
+  .footer .handle:focus-visible, .footer .logout:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 4px; }
   .footer .offline-actions { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; }
   .footer .offline-action {
     border: 0; min-height: 40px; padding: 0 3px; background: transparent; color: var(--ink-faint);
@@ -1010,6 +1018,98 @@ const WEB_INDEX_HTML = `<!doctype html>
   .result-folder:hover { color: var(--link); background: var(--hover); }
   .result.nested { margin-left: 18px; }
 
+  /* ── Private self profile ───────────────────────────────────────────
+     A destination, not a dashboard: identity + four durable facts + one
+     calendar. Desktop keeps the room rail for continuity. Mobile makes this
+     single surface full-screen and supplies its own route back to the last
+     document, without attempting a second mobile room-navigation system. */
+  .profile-main { padding-top: 0; }
+  .profile-main .page { max-width: 900px; }
+  .profile-mobile-bar { display: none; }
+  .profile-page { padding: 72px 0 120px; }
+  .profile-identity { display: flex; align-items: center; gap: 16px; }
+  .profile-avatar {
+    position: relative; width: 58px; height: 58px; flex-shrink: 0; overflow: hidden;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 13px; color: var(--bg); background: var(--ink);
+    font: 650 20px/1 var(--sans); text-transform: uppercase;
+    outline: 1px solid rgba(0,0,0,.1); outline-offset: -1px;
+  }
+  .profile-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  :root[data-theme="dark"] .profile-avatar { outline-color: rgba(255,255,255,.1); }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .profile-avatar { outline-color: rgba(255,255,255,.1); }
+  }
+  .profile-name { min-width: 0; }
+  .profile-name h1 { margin: 0; color: var(--ink); font: 650 24px/1.2 var(--sans); letter-spacing: -.025em; text-wrap: balance; }
+  .profile-name p { margin: 5px 0 0; color: var(--ink-dim); font-size: 13px; line-height: 1.45; text-wrap: pretty; }
+  .profile-facts { display: flex; flex-wrap: wrap; gap: 5px 16px; margin: 24px 0 0; color: var(--ink-faint); font-size: 12px; }
+  .profile-facts span { white-space: nowrap; }
+  .profile-stats {
+    display: grid; grid-template-columns: repeat(4, minmax(0,1fr));
+    margin: 52px 0 48px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+  }
+  .profile-stat { min-width: 0; padding: 19px 20px 20px 0; }
+  .profile-stat + .profile-stat { padding-left: 20px; border-left: 1px solid var(--rule); }
+  .profile-stat-label { display: block; margin-bottom: 8px; color: var(--ink-faint); font: 600 10.5px/1.2 var(--sans); letter-spacing: .04em; text-transform: uppercase; }
+  .profile-stat-value { display: block; color: var(--ink); font: 500 26px/1.1 var(--sans); letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+  .profile-stat-detail { display: block; min-height: 1.3em; margin-top: 5px; color: var(--ink-faint); font-size: 11px; line-height: 1.3; }
+  .profile-activity-head { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+  .profile-activity-head h2 { margin: 0; color: var(--ink); font: 620 15px/1.3 var(--sans); letter-spacing: -.01em; text-wrap: balance; }
+  .profile-activity-head p { margin: 3px 0 0; color: var(--ink-faint); font-size: 11.5px; line-height: 1.4; text-wrap: pretty; }
+  .profile-calendar-wrap { overflow-x: auto; padding: 0 0 8px; scrollbar-width: thin; }
+  .profile-calendar-layout { width: max-content; min-width: 100%; display: grid; grid-template-columns: 22px auto; grid-template-rows: 16px auto; gap: 5px 8px; }
+  .profile-months { grid-column: 2; display: grid; grid-template-columns: repeat(var(--profile-weeks, 54), 10px); gap: 3px; color: var(--ink-faint); font: 10px/1 var(--sans); }
+  .profile-months span { white-space: nowrap; overflow: visible; }
+  .profile-weekdays { grid-row: 2; display: grid; grid-template-rows: repeat(7, 10px); gap: 3px; color: var(--ink-faint); font: 9.5px/10px var(--sans); }
+  .profile-weekdays span:nth-child(1) { grid-row: 2; }
+  .profile-weekdays span:nth-child(2) { grid-row: 4; }
+  .profile-weekdays span:nth-child(3) { grid-row: 6; }
+  .profile-calendar {
+    grid-column: 2; grid-row: 2; display: grid; grid-auto-flow: column;
+    grid-template-rows: repeat(7, 10px); grid-template-columns: repeat(var(--profile-weeks, 54), 10px); gap: 3px;
+  }
+  .profile-day { width: 10px; height: 10px; border-radius: 3px; background: var(--hover); }
+  .profile-day.level-1 { background: color-mix(in srgb, var(--link) 30%, var(--hover)); }
+  .profile-day.level-2 { background: color-mix(in srgb, var(--link) 52%, var(--hover)); }
+  .profile-day.level-3 { background: color-mix(in srgb, var(--link) 76%, var(--hover)); }
+  .profile-day.level-4 { background: var(--link); }
+  .profile-day.future { background: transparent; }
+  .profile-legend { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; color: var(--ink-faint); font-size: 10px; }
+  .profile-legend .profile-day { display: inline-block; }
+  .profile-message { padding: 28px 0; border-top: 1px solid var(--rule); color: var(--ink-dim); font-size: 13px; line-height: 1.5; text-wrap: pretty; }
+  .profile-message strong { display: block; margin-bottom: 4px; color: var(--ink); font-weight: 600; }
+  .profile-retry, .profile-back {
+    min-height: 40px; padding: 0; border: 0; background: transparent; color: var(--link);
+    font: 600 12.5px/1 var(--sans); cursor: pointer;
+    transition-property: color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
+  }
+  .profile-retry:active, .profile-back:active { scale: .96; }
+  .profile-retry:focus-visible, .profile-back:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 4px; }
+  .profile-loading .sk { display: block; }
+  .profile-loading .profile-loading-stats { display: grid; grid-template-columns: repeat(4,1fr); gap: 20px; margin: 52px 0 48px; padding: 22px 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+  .profile-loading .profile-loading-stats .sk { width: 68%; height: 24px; }
+  .profile-loading .profile-loading-calendar .sk { width: 100%; height: 105px; }
+
+  @media (max-width: 720px) {
+    body.profile-view { padding-left: 0; }
+    body.profile-view aside { display: none; }
+    body.profile-view main { padding: 0 20px 96px; }
+    .profile-mobile-bar {
+      min-height: 52px; margin: 0 -20px 8px; padding: max(6px, env(safe-area-inset-top)) 20px 6px;
+      display: flex; align-items: center; border-bottom: 1px solid var(--rule);
+    }
+    .profile-page { padding-top: 36px; }
+    .profile-stats { grid-template-columns: repeat(2, minmax(0,1fr)); }
+    .profile-stat:nth-child(3) { padding-left: 0; border-left: 0; border-top: 1px solid var(--rule); }
+    .profile-stat:nth-child(4) { border-top: 1px solid var(--rule); }
+    .profile-activity-head { align-items: start; flex-direction: column; }
+    .profile-calendar-wrap { margin-right: -20px; padding-right: 20px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .footer .handle, .footer .logout, .profile-retry, .profile-back { transition: none; }
+  }
+
   /* Login */
   .login { padding: 24px; max-width: 460px; margin: 72px auto; }
   .login h1 { font-weight: 600; font-size: 24px; letter-spacing: -0.01em; margin: 0 0 8px; }
@@ -1114,6 +1214,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     state.activePath = String(share.path || "");
     document.documentElement.classList.add("share-mode");
   }
+  let profileRouteHandle = share ? "" : profileHandleFromUrl();
+  let profileSurface = Boolean(profileRouteHandle);
 
   // trees holds lightweight R2 metadata for expanded rooms; files holds only
   // bodies the user actually opened (in-memory only — bodies are too big and
@@ -1401,7 +1503,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   function scheduleFeatureTour() {
     cancelAnimationFrame(tourFrame);
     tourFrame = requestAnimationFrame(() => {
-      if (!state.token || share) { hideFeatureTour(); return; }
+      if (!state.token || share || profileSurface) { hideFeatureTour(); return; }
       const seen = readTourSeen();
       const step = TOUR_STEPS.find((candidate) => !seen[candidate.id] && tourTarget(candidate));
       if (!step) { hideFeatureTour(); return; }
@@ -1501,6 +1603,9 @@ const WEB_INDEX_HTML = `<!doctype html>
       state.token = "";
       state.loginError = "Token rejected by server. Run 'bashroom login' to mint a fresh one, then paste it again.";
       localStorage.removeItem(TOKEN_KEY);
+      clearProfileCache();
+      profileSurface = false;
+      profileRouteHandle = "";
       // The presence socket was authorized at upgrade and never re-checked —
       // tear it down with the token, or it survives the login screen and the
       // NEXT account's session could adopt the old account's room hub.
@@ -1551,11 +1656,14 @@ const WEB_INDEX_HTML = `<!doctype html>
     persist();
     // Reflect the settled selection in the address bar without adding a history
     // entry — covers bare /web (auto-picked room) and stale-room fallback.
-    syncUrl(true);
-    ensureActiveFile();
-    connectPresence(state.activeRoom);
+    if (!profileSurface) {
+      syncUrl(true);
+      ensureActiveFile();
+      connectPresence(state.activeRoom);
+    }
     roomsLoading = false;
     render(); // paint everything we have so far
+    if (profileSurface) void loadProfile();
 
     // Revalidate every other expanded room (cached trees paint immediately;
     // the fetch refreshes them silently). The active room came bundled fresh.
@@ -1839,6 +1947,23 @@ const WEB_INDEX_HTML = `<!doctype html>
   let historyRestoreError = "";
   let historySeq = 0;            // invalidates stale list/version responses
 
+  // The profile is authenticated account context, never another file mode.
+  // Keep its data transient so signing out or switching tokens cannot leave a
+  // previous account's identity or activity behind in browser persistence.
+  let profileStatus = "";       // "" | "loading" | "ready" | "offline" | "error"
+  let profileError = "";
+  let profileData = null;
+  let profileSeq = 0;
+  let profileLoadedAt = 0;
+
+  function clearProfileCache() {
+    profileSeq += 1;
+    profileStatus = "";
+    profileError = "";
+    profileData = null;
+    profileLoadedAt = 0;
+  }
+
   function roomTextHistoryAvailable(file) {
     return Boolean(!share && file && !file.is_binary
       && file.custom_metadata && file.custom_metadata.authority === "roomtext-v1");
@@ -1857,6 +1982,51 @@ const WEB_INDEX_HTML = `<!doctype html>
     historyPreviewKey = "";
     historyRestoreState = "";
     historyRestoreError = "";
+  }
+
+  async function loadProfile(force = false) {
+    if (share || !profileSurface || !state.token) return;
+    const cachedHandle = String(profileData && profileData.handle || "");
+    const cacheMatchesRoute = !profileRouteHandle || !cachedHandle
+      || profileRouteHandle.toLowerCase() === cachedHandle.toLowerCase();
+    if (!cacheMatchesRoute) clearProfileCache();
+    if (!force && profileStatus === "loading") return;
+    if (!force && profileData && profileStatus === "ready" && Date.now() - profileLoadedAt < 30000) return;
+    if (!navigator.onLine) {
+      profileStatus = profileData ? "ready" : "offline";
+      profileError = profileData ? "" : "Connect to load account activity. Your prepared rooms remain available offline.";
+      render();
+      return;
+    }
+    const seq = ++profileSeq;
+    profileStatus = "loading";
+    profileError = "";
+    render();
+    try {
+      const data = await api("/web/api/profile");
+      if (seq !== profileSeq || !profileSurface) return;
+      if (!data || data.ok === false) throw new Error((data && data.error) || "profile_failed");
+      const actual = String(data.handle || "");
+      if (profileRouteHandle && actual && profileRouteHandle.toLowerCase() !== actual.toLowerCase()) {
+        profileData = null;
+        profileLoadedAt = 0;
+        profileStatus = "error";
+        profileError = "This private profile is available only at @" + actual + ".";
+        render();
+        return;
+      }
+      profileData = data;
+      profileStatus = "ready";
+      profileLoadedAt = Date.now();
+      render();
+    } catch (error) {
+      if (seq !== profileSeq || !profileSurface) return;
+      profileStatus = navigator.onLine ? "error" : "offline";
+      profileError = navigator.onLine
+        ? "Profile activity could not be loaded. Your rooms and editor are unaffected."
+        : "Connect to load account activity. Your prepared rooms remain available offline.";
+      render();
+    }
   }
 
   function historyItemKey(item) {
@@ -2438,6 +2608,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     // the read-only fallback — give the live editor another try on every
     // navigation. (A dead CDN just fails fast into the fallback again.)
     if (cmLoadFailed) { cmLoadFailed = false; cmMod = null; }
+    profileSurface = false;
+    profileRouteHandle = "";
     pendingScrollY = -1; // navigations start at the top — drop any pending restore
     if (historyKey && historyKey !== fileKey(room, path)) resetHistory();
     // Leaving a dirty inline doc: push the pending save before rebinding.
@@ -2544,9 +2716,20 @@ const WEB_INDEX_HTML = `<!doctype html>
     return "/" + room + "/" + path;
   }
 
+  // /@handle is an authenticated, private account surface. Parse it before
+  // the generic room/path route so a profile can never masquerade as a room.
+  function profileHandleFromUrl() {
+    if (!location.pathname.startsWith("/@")) return "";
+    let raw = location.pathname.slice(2);
+    if (raw.endsWith("/")) raw = raw.slice(0, -1);
+    if (!raw || raw.includes("/")) return "";
+    try { return decodeURIComponent(raw); } catch (_) { return ""; }
+  }
+
   // Parse location.pathname back into { room, path }. Returns null for the
   // bare /web entry point (no room selected) so boot falls back to defaults.
   function stateFromUrl() {
+    if (profileHandleFromUrl()) return null;
     const raw = decodeURIComponent(location.pathname).replace(/^\\/+/, "");
     if (!raw || raw === "web" || raw === "web/") return null;
     const slash = raw.indexOf("/");
@@ -2563,6 +2746,34 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (next === location.pathname) return;
     if (replace) history.replaceState(null, "", next);
     else history.pushState(null, "", next);
+  }
+
+  function openProfile() {
+    if (share || !state.handle) return;
+    flushAutosave();
+    resetHistory();
+    pendingScrollY = -1;
+    profileSurface = true;
+    profileRouteHandle = String(state.handle);
+    disconnectPresence();
+    const next = "/@" + encodeURIComponent(profileRouteHandle);
+    if (location.pathname !== next) history.pushState(null, "", next);
+    window.scrollTo(0, 0);
+    render();
+    void loadProfile();
+  }
+
+  function returnToDocument(replace = false) {
+    if (!profileSurface) return;
+    profileSeq += 1;
+    profileSurface = false;
+    profileRouteHandle = "";
+    pendingScrollY = -1;
+    syncUrl(replace);
+    if (state.activeRoom && state.activePath) ensureActiveFile();
+    connectPresence(state.activeRoom);
+    window.scrollTo(0, 0);
+    render();
   }
 
   // A link is "internal" if it points at another file/folder in the same room
@@ -2642,6 +2853,13 @@ const WEB_INDEX_HTML = `<!doctype html>
     state.opened = new Set(); state.roomsOpened = new Set();
     trees.clear(); files.clear(); treeInflight.clear(); fileInflight.clear();
     resetHistory();
+    profileSeq += 1;
+    profileSurface = false;
+    profileRouteHandle = "";
+    profileStatus = "";
+    profileError = "";
+    profileData = null;
+    profileLoadedAt = 0;
     offlineReceipt = null;
     if (offline && tokenToPurge) void offline.purge(tokenToPurge);
     history.replaceState(null, "", "/web"); // drop the deep link on sign-out
@@ -3691,6 +3909,143 @@ const WEB_INDEX_HTML = `<!doctype html>
     return (n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0) + " MB";
   }
 
+  function profileTimestamp(value) {
+    if (typeof value === "number") return value < 100000000000 ? value * 1000 : value;
+    const parsed = Date.parse(String(value || ""));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function profileDate(value) {
+    const ms = profileTimestamp(value);
+    if (!ms) return "";
+    try {
+      return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(ms);
+    } catch (_) { return ""; }
+  }
+
+  function profileNumber(value) {
+    try { return new Intl.NumberFormat().format(Math.max(0, Number(value) || 0)); }
+    catch (_) { return String(Math.max(0, Number(value) || 0)); }
+  }
+
+  function profileStorage(value) {
+    const n = Math.max(0, Number(value) || 0);
+    if (n < 1024 * 1024 * 1024) return formatBytes(n);
+    if (n < 1024 * 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(n < 10 * 1024 * 1024 * 1024 ? 1 : 0) + " GB";
+    return (n / (1024 * 1024 * 1024 * 1024)).toFixed(1) + " TB";
+  }
+
+  function profileIdentityHtml(data) {
+    const handle = String((data && data.handle) || state.handle || profileRouteHandle || "you");
+    const github = String((data && data.github_login) || handle);
+    const initial = handle.replace(/^@/, "").slice(0, 1) || "B";
+    const joined = profileDate(data && data.joined_at);
+    const changedMs = profileTimestamp(data && data.last_change_at);
+    const facts = [];
+    if (joined) facts.push("<span>Joined " + escHtml(joined) + "</span>");
+    if (changedMs) facts.push("<span>Last change " + escHtml(timeAgo(changedMs)) + "</span>");
+    if (data && data.storage_bytes != null) facts.push("<span>" + escHtml(profileStorage(data.storage_bytes)) + " stored</span>");
+    const avatarUrl = "https://github.com/" + encodeURIComponent(github.replace(/^@/, "")) + ".png?size=116";
+    return '<div class="profile-identity">'
+      + '<span class="profile-avatar" aria-hidden="true">' + escHtml(initial)
+      + '<img src="' + escHtml(avatarUrl) + '" alt="" loading="eager" referrerpolicy="no-referrer" onerror="this.remove()"></span>'
+      + '<div class="profile-name"><h1>@' + escHtml(handle.replace(/^@/, "")) + '</h1><p>Your private Bashroom</p></div>'
+      + '</div>'
+      + (facts.length ? '<div class="profile-facts">' + facts.join("") + '</div>' : "");
+  }
+
+  function profileStatsHtml(data) {
+    const stats = [
+      ["Rooms", data.room_count, ""],
+      ["Files", data.file_count, ""],
+      ["Active days", data.active_days, ""],
+      ["Current streak", data.current_streak, "Best " + profileNumber(data.longest_streak) + "-day run"],
+    ];
+    return '<div class="profile-stats">' + stats.map((item) =>
+      '<div class="profile-stat"><span class="profile-stat-label">' + item[0] + '</span>'
+      + '<span class="profile-stat-value">' + profileNumber(item[1]) + '</span>'
+      + '<span class="profile-stat-detail">' + escHtml(item[2]) + '</span></div>'
+    ).join("") + '</div>';
+  }
+
+  function profileDayKey(date) {
+    return date.toISOString().slice(0, 10);
+  }
+
+  function profileCalendarHtml(data) {
+    const counts = new Map();
+    for (const item of Array.isArray(data.activity) ? data.activity : []) {
+      const day = String(item && item.day || "");
+      if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(day)) continue;
+      counts.set(day, Math.max(0, Number(item.changed_files) || 0));
+    }
+    const dayMs = 24 * 60 * 60 * 1000;
+    const now = new Date();
+    const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    // The API returns a trailing 371-day window. Preserve every returned day:
+    // a Sunday-aligned 53-column grid would silently discard up to six of the
+    // oldest days whenever the current week is incomplete.
+    const start = new Date(today.getTime() - 370 * dayMs);
+    const leadingDays = start.getUTCDay();
+    const weekCount = Math.ceil((leadingDays + 371) / 7);
+    const cells = [];
+    const monthStarts = [];
+    let visibleActiveDays = 0;
+    for (let index = 0; index < 371; index += 1) {
+      const date = new Date(start.getTime() + index * dayMs);
+      const week = Math.floor((leadingDays + index) / 7);
+      const weekday = date.getUTCDay();
+      if (index === 0 || date.getUTCDate() === 1) monthStarts.push({ week, date });
+      const key = profileDayKey(date);
+      const count = counts.get(key) || 0;
+      if (count) visibleActiveDays += 1;
+      const level = count === 0 ? 0 : count <= 1 ? 1 : count <= 3 ? 2 : count <= 7 ? 3 : 4;
+      const title = key + " · " + profileNumber(count) + (count === 1 ? " file changed" : " files changed");
+      cells.push('<span class="profile-day level-' + level + '" style="grid-column:' + (week + 1) + ';grid-row:' + (weekday + 1) + '" title="' + escHtml(title) + '" aria-hidden="true"></span>');
+    }
+    // Suppress a clipped partial-month label when the next full month begins
+    // fewer than three columns later (for example "Jul Aug" one week apart).
+    const months = monthStarts.filter((item, index) => {
+      const next = monthStarts[index + 1];
+      return !next || next.week - item.week >= 3;
+    }).map((item) => {
+      const label = new Intl.DateTimeFormat(undefined, { month: "short", timeZone: "UTC" }).format(item.date);
+      return '<span style="grid-column:' + (item.week + 1) + '">' + escHtml(label) + '</span>';
+    });
+    const aria = "Durable changes in your rooms. " + profileNumber(visibleActiveDays) + " active days in the last 371 days.";
+    const gridStyle = "--profile-weeks:" + weekCount;
+    return '<div class="profile-calendar-wrap"><div class="profile-calendar-layout" style="' + gridStyle + '" role="img" aria-label="' + escHtml(aria) + '">'
+      + '<div class="profile-months" style="' + gridStyle + '" aria-hidden="true">' + months.join("") + '</div>'
+      + '<div class="profile-weekdays" aria-hidden="true"><span>M</span><span>W</span><span>F</span></div>'
+      + '<div class="profile-calendar" style="' + gridStyle + '">' + cells.join("") + '</div>'
+      + '</div></div>';
+  }
+
+  function profileContentHtml() {
+    if (profileStatus === "loading" && !profileData) {
+      return '<section class="profile-page profile-loading" aria-busy="true">'
+        + profileIdentityHtml(null)
+        + '<div class="profile-loading-stats" aria-hidden="true"><span class="sk"></span><span class="sk"></span><span class="sk"></span><span class="sk"></span></div>'
+        + '<div class="profile-loading-calendar" aria-hidden="true"><span class="sk"></span></div>'
+        + '</section>';
+    }
+    if (!profileData) {
+      const offlineState = profileStatus === "offline";
+      return '<section class="profile-page">' + profileIdentityHtml(null)
+        + '<div class="profile-message" role="status"><strong>' + (offlineState ? "Activity unavailable offline" : "Couldn't load profile") + '</strong>'
+        + escHtml(profileError || "Try again in a moment.")
+        + (offlineState ? "" : '<br><button class="profile-retry" id="profile-retry" type="button">Try again</button>')
+        + '</div></section>';
+    }
+    return '<section class="profile-page">' + profileIdentityHtml(profileData)
+      + profileStatsHtml(profileData)
+      + '<section aria-labelledby="profile-activity-title"><div class="profile-activity-head"><div>'
+      + '<h2 id="profile-activity-title">Durable changes in your rooms</h2>'
+      + '<p>Distinct file paths changed each day. Repeated saves and retries collapse to one file per day.</p></div>'
+      + '<div class="profile-legend" aria-hidden="true"><span>Less</span><span class="profile-day"></span><span class="profile-day level-1"></span><span class="profile-day level-2"></span><span class="profile-day level-3"></span><span class="profile-day level-4"></span><span>More</span></div></div>'
+      + profileCalendarHtml(profileData) + '</section></section>';
+  }
+
   function renderTree(room, nodes, nested) {
     if (!nodes.length) return '<li class="empty">' + (nested ? "Empty folder." : "Empty room.") + '</li>';
     return nodes.map(n => {
@@ -3719,6 +4074,7 @@ const WEB_INDEX_HTML = `<!doctype html>
 
   function renderLogin() {
     document.body.classList.add("login-view");
+    document.body.classList.remove("profile-view");
     app.innerHTML = \`
       <div class="login">
         <h1>Bashroom</h1>
@@ -3743,6 +4099,7 @@ const WEB_INDEX_HTML = `<!doctype html>
         return;
       }
       state.loginError = "";
+      clearProfileCache();
       localStorage.setItem(TOKEN_KEY, v);
       state.token = v;
       // login-view stays on <body> until the app shell actually paints
@@ -3775,6 +4132,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   function render() {
     if (!state.token) return renderLogin();
     document.body.classList.remove("login-view");
+    document.body.classList.toggle("profile-view", profileSurface);
     // The innerHTML wipe below detaches the actor panel's trigger — an open
     // panel would float unanchored, so it closes with the DOM it points at.
     closeActorPanel(false);
@@ -3819,12 +4177,12 @@ const WEB_INDEX_HTML = `<!doctype html>
     // narrating "Loading…" in an empty state that then reflows away. Share
     // mode never loads a tree (one granted document, no sidebar): there this
     // must stay false or a failed file fetch would skeleton forever.
-    const treeLoading = Boolean(!share && state.activeRoom && !tree && !treeIsErr);
-    const historyViewing = Boolean(historySnapshot && historyKey === activeKey && typeof historySnapshot.content === "string");
+    const treeLoading = Boolean(!profileSurface && !share && state.activeRoom && !tree && !treeIsErr);
+    const historyViewing = Boolean(!profileSurface && historySnapshot && historyKey === activeKey && typeof historySnapshot.content === "string");
     // Modeless editing stays primary. A historical snapshot is deliberately
     // excluded from inlineMode: its bytes are only ever rendered into an
     // article and can never enter editDraft, CodeMirror, or autosave.
-    const inlineMode = Boolean(activeFile && !activeFileIsErr && !activeFile.is_binary && !cmLoadFailed && !historyViewing);
+    const inlineMode = Boolean(!profileSurface && activeFile && !activeFileIsErr && !activeFile.is_binary && !cmLoadFailed && !historyViewing);
     const previewing = Boolean(inlineMode && previewKey === activeKey);
     let md = "";
     if (activeFile && !activeFileIsErr && !activeFile.is_binary) {
@@ -3880,7 +4238,7 @@ const WEB_INDEX_HTML = `<!doctype html>
               \${historyActionHtml}
           </div>\`)
       : "";
-    const documentHeader = (activeFile && !activeFileIsErr) || activeFileLoading || treeLoading
+    const documentHeader = !profileSurface && ((activeFile && !activeFileIsErr) || activeFileLoading || treeLoading)
       ? \`<header class="doc-header">
           <div class="doc-location" title="\${escHtml(state.activeRoom + (docPath ? "/" + docPath : ""))}">
             <span class="doc-room">\${escHtml(state.activeRoom)}</span>
@@ -3894,7 +4252,7 @@ const WEB_INDEX_HTML = `<!doctype html>
           \${docActionsHtml}
         </header>\`
       : "";
-    const historyStrip = historyViewing
+    const historyStrip = !profileSurface && historyViewing
       ? \`<div class="history-view-strip" role="status"><span>Viewing <strong>\${escHtml(historyAbsolute(historySnapshot.created_at))}</strong> · read-only</span><button class="history-return" id="history-return" type="button">Back to current</button></div>\`
       : "";
     // In-flight loads (treeLoading / activeFileLoading) never reach this —
@@ -3927,7 +4285,8 @@ const WEB_INDEX_HTML = `<!doctype html>
       + '<article id="cm-ph">' + md + '</article>' + conflictBar;
     // The doc bar renders OUTSIDE .page (full pane width, sticky at top:0);
     // body is only what flows in the 820px article column.
-    const body = activeFile && !activeFileIsErr
+    const body = profileSurface ? profileContentHtml()
+      : activeFile && !activeFileIsErr
       ? (activeFile.is_binary
           ? '<div class="empty">Binary file. Use the Bashroom shell to inspect it.</div>'
           : historyViewing ? '<article class="history-preview">' + md + '</article>'
@@ -3962,13 +4321,13 @@ const WEB_INDEX_HTML = `<!doctype html>
         <div class="search-box"><input id="room-search" type="search" placeholder="Search all rooms  ⌘K" autocomplete="off" spellcheck="false" /></div>
         <div id="sections">\${sidebarSectionsHtml()}</div>
         <div class="footer">
-          <span class="handle">\${state.handle ? '@' + state.handle : ''}</span>
+          <button class="handle" id="profile-open" type="button" aria-label="Open your profile"\${profileSurface ? ' aria-current="page"' : ''}>@\${escHtml(state.handle || "")}</button>
           <span class="offline-actions">
             <button class="offline-action\${offlineReceipt ? " ready" : ""}" id="offline-sync" type="button" title="Download every room, linked page, and PDF for offline use">\${offlineButtonLabel()}</button>
             <button class="offline-action" id="offline-export" type="button" title="Export one printable HTML archive"\${offlineReceipt ? "" : " hidden"}>Export</button>
             <button class="offline-action" id="offline-install" type="button" title="Install Bashroom on this device"\${installIsAvailable() ? "" : " hidden"}>Install</button>
           </span>
-          <span class="logout" id="logout">Sign out</span>
+          <button class="logout" id="logout" type="button">Sign out</button>
           <div class="offline-progress" id="offline-progress" hidden>
             <span class="offline-progress-label" id="offline-progress-label">Planning your offline library</span>
             <span class="offline-progress-count" id="offline-progress-count">Discovering…</span>
@@ -3980,19 +4339,20 @@ const WEB_INDEX_HTML = `<!doctype html>
       </aside>
       \${documentHeader}
       \${historyStrip}
-      <main>
+      <main class="\${profileSurface ? "profile-main" : ""}">
+        \${profileSurface ? '<div class="profile-mobile-bar"><button class="profile-back" id="profile-back" type="button">← Back to rooms</button></div>' : ""}
         <div class="page">
           \${body}
         </div>
       </main>
-      \${historyDrawerHtml(docPath)}
+      \${profileSurface ? "" : historyDrawerHtml(docPath)}
     \`;
     // Same document re-rendered (background fetch, presence, toggle): put the
     // reader back where they were. The rAF restore works because the inline
     // placeholder/article preserves page height across the wipe; the pending
     // value covers the async editor mount settling after that.
-    render._docKey = activeKey;
-    if (prevDocKey && prevDocKey === activeKey && docScrollY) {
+    render._docKey = profileSurface ? "" : activeKey;
+    if (!profileSurface && prevDocKey && prevDocKey === activeKey && docScrollY) {
       if (inlineMode && !previewing) pendingScrollY = docScrollY;
       requestAnimationFrame(() => window.scrollTo(0, docScrollY));
     }
@@ -4024,6 +4384,12 @@ const WEB_INDEX_HTML = `<!doctype html>
       }
     }
     const lo = document.getElementById("logout"); if (lo) lo.onclick = logout;
+    const profileOpen = document.getElementById("profile-open");
+    if (profileOpen) profileOpen.onclick = openProfile;
+    const profileBack = document.getElementById("profile-back");
+    if (profileBack) profileBack.onclick = () => returnToDocument(true);
+    const profileRetry = document.getElementById("profile-retry");
+    if (profileRetry) profileRetry.onclick = () => { void loadProfile(true); };
     const offlineSync = document.getElementById("offline-sync");
     if (offlineSync) offlineSync.onclick = () => {
       markFeatureTourStep("offline-sync", false);
@@ -4353,7 +4719,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   // should open exactly what's in the address bar, not the last-viewed file.
   // Capability mode is the exception — /s/<slug> is not a room/path URL; the
   // injected grant already fixed the document.
-  const fromUrl = share ? null : stateFromUrl();
+  const fromUrl = share || profileSurface ? null : stateFromUrl();
   if (fromUrl) {
     state.activeRoom = fromUrl.room;
     state.activePath = fromUrl.path;
@@ -4390,6 +4756,7 @@ const WEB_INDEX_HTML = `<!doctype html>
       return;
     }
     if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+      if (profileSurface) return;
       const si = document.getElementById("room-search");
       if (si) { e.preventDefault(); si.focus(); si.select(); }
     }
@@ -4398,6 +4765,19 @@ const WEB_INDEX_HTML = `<!doctype html>
   window.addEventListener("popstate", () => {
     flushAutosave();
     pendingScrollY = -1; // back/forward is a navigation — no stale restore
+    const nextProfileHandle = profileHandleFromUrl();
+    if (nextProfileHandle) {
+      resetHistory();
+      profileSurface = true;
+      profileRouteHandle = nextProfileHandle;
+      disconnectPresence();
+      render();
+      void loadProfile();
+      return;
+    }
+    profileSeq += 1;
+    profileSurface = false;
+    profileRouteHandle = "";
     const s = stateFromUrl();
     const nextHistoryKey = s && s.room && s.path ? fileKey(s.room, s.path) : "";
     if (historyKey && historyKey !== nextHistoryKey) resetHistory();
@@ -4428,20 +4808,25 @@ const WEB_INDEX_HTML = `<!doctype html>
     } else if (state.token) {
       hydrateFromCache();
       await hydrateOfflineSnapshot();
-      if (state.rooms.length) { ensureActiveFile(); connectPresence(state.activeRoom); }
+      if (!profileSurface && state.rooms.length) { ensureActiveFile(); connectPresence(state.activeRoom); }
       roomsLoading = !state.rooms.length;
       render();
       loadRooms().catch(() => { roomsLoading = false; render(); });
+      if (profileSurface) void loadProfile();
       if (navigator.onLine) setTimeout(() => { void syncOfflineOutbox(); }, 0);
     } else {
       render();
     }
     // Warm the editor graph while online. Prepare-for-flight separately walks
     // and caches the complete ESM dependency graph for a cold offline boot.
-    if (state.token || share) setTimeout(() => { loadCm().catch(() => {}); }, 0);
+    if ((state.token && !profileSurface) || share) setTimeout(() => { loadCm().catch(() => {}); }, 0);
   }
   void boot();
-  window.addEventListener("online", () => { updateOfflineControls(); void syncOfflineOutbox(); });
+  window.addEventListener("online", () => {
+    updateOfflineControls();
+    void syncOfflineOutbox();
+    if (profileSurface && (profileStatus === "offline" || profileStatus === "error")) void loadProfile(true);
+  });
   window.addEventListener("offline", updateOfflineControls);
   window.addEventListener("resize", () => { if (activeTourStepId) scheduleFeatureTour(); });
   window.addEventListener("scroll", () => { if (activeTourStepId) scheduleFeatureTour(); }, true);

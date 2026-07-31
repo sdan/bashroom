@@ -166,6 +166,11 @@ spacing. Use Preview in the private editor to render these richer blocks.
 
 Two panes, Notion-shape: sidebar plus content. Single inline HTML served from the worker — no build, no framework.
 
+Click your `@handle` in the sidebar to open the private self profile at
+`/@<handle>`. It summarizes current rooms/files, stored bytes, and a year of
+best-effort durable-change activity. The view is account-authenticated and
+returns aggregate counts only; it is not a public profile or billing report.
+
 ### Offline / plane mode
 
 Click **Offline** in the web sidebar before departure. Bashroom downloads the
