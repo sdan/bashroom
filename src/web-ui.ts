@@ -1,10 +1,9 @@
 // Bashroom web UI — a logged-in read view over /rooms.
 //
 // Two regions: a fixed-position sidebar pinned to the viewport left edge, and
-// the page body offset to clear it. No flex, no grid, no media queries —
-// absolute positioning is the only sizing model that doesn't fight nested
-// scroll containers across browsers. Single inline HTML, vanilla JS, marked
-// from CDN. No build step.
+// the page body offset to clear it. Below 720px the same sidebar becomes a
+// full-screen navigation surface so the document keeps the whole viewport.
+// Single inline HTML, vanilla JS, marked from CDN. No build step.
 //
 // Auth: bearer token in localStorage (key `bashroom.token`). Endpoints:
 //   GET /web/api/rooms?active=X   -> { rooms: [...], tree?: [{ path, updated_at, size_bytes }] }
@@ -82,8 +81,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     --rule: #ebeae6;
     --guide: #e3e2dd;
     --link: #4f3bd0;
-    --folder: #d8a23a;
-    --md: #1ca1c7;
+    --folder: #8a857a;
     --mono: ui-monospace, "SF Mono", "Menlo", "Consolas", monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
     --side-w: 260px;
@@ -107,8 +105,7 @@ const WEB_INDEX_HTML = `<!doctype html>
       --rule: #2a2a2a;
       --guide: #303030;
       --link: #c8a8ff;
-      --folder: #ffd452;
-      --md: #08c0ef;
+      --folder: #aaa59b;
       --actor-you: #8fc09a;
       --actor-claude: #e8a68f;
       --actor-codex: #9cc0e8;
@@ -126,8 +123,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     --rule: #2a2a2a;
     --guide: #303030;
     --link: #c8a8ff;
-    --folder: #ffd452;
-    --md: #08c0ef;
+    --folder: #aaa59b;
     --actor-you: #8fc09a;
     --actor-claude: #e8a68f;
     --actor-codex: #9cc0e8;
@@ -229,36 +225,100 @@ const WEB_INDEX_HTML = `<!doctype html>
   :root[data-theme="light"] .brand .theme-toggle .ic-moon { display: inline; }
   :root[data-theme="light"] .brand .theme-toggle .ic-sun { display: none; }
 
-  /* Room sections */
-  .section { padding: 2px 6px; }
-  .room-head { display: flex; align-items: center; gap: 2px; padding: 4px 6px; cursor: pointer; border-radius: 4px; color: var(--ink-dim); }
-  .room-head:hover { background: var(--hover); color: var(--ink); }
-  .room-head .chev { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; color: var(--ink-faint); transition: transform 120ms ease; flex-shrink: 0; }
-  .room-head .chev.open { transform: rotate(90deg); }
-  .room-head .name { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  /* Room sections + tree — one compact row grammar. The state/cache model is
+     intentionally untouched; this layer only owns hierarchy and interaction. */
+  .section { padding: 1px 6px; }
+  .section.open { padding-bottom: 6px; }
+  .room-line, .tree-line { position: relative; min-width: 0; }
+  .room-line { margin: 0 2px; }
+  .tree-line { margin: 0 4px; }
+  .room-head, .tree .row {
+    width: 100%; border: 0; border-radius: 5px; background: transparent;
+    color: var(--ink-dim); cursor: pointer; text-align: left;
+    font-family: var(--sans); user-select: none; -webkit-appearance: none; appearance: none;
+  }
+  .room-head {
+    min-height: 32px; padding: 0 8px;
+    display: grid; grid-template-columns: 16px minmax(0,1fr); align-items: center; gap: 6px;
+  }
+  .room-head:hover, .room-line:hover .room-head, .tree-line:hover .row { background: var(--hover); color: var(--ink); }
+  .room-head[aria-expanded="true"] { color: var(--ink); }
+  .room-head:focus-visible, .tree .row:focus-visible, .tree-retry:focus-visible {
+    outline: 2px solid var(--link); outline-offset: -2px;
+  }
+  .room-head .chev, .tree .chev {
+    width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;
+    color: var(--ink-faint); transition: transform 120ms ease; flex-shrink: 0;
+  }
+  .room-head .chev.open, .tree .chev.open { transform: rotate(90deg); }
+  .room-head .name {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 14px; font-weight: 600; letter-spacing: -.005em;
+  }
 
-  /* Tree */
   .tree { list-style: none; margin: 0; padding: 0 0 4px; }
   .tree li { position: relative; }
   .tree ul { list-style: none; margin: 0; padding-left: 18px; position: relative; }
-  .tree ul::before { content: ""; position: absolute; left: 7px; top: 0; bottom: 0; border-left: 1px solid var(--guide); }
-  .tree .row {
-    display: flex; align-items: center; gap: 4px;
-    padding: 3px 6px; margin: 0 6px;
-    cursor: pointer; color: var(--ink-dim);
-    border-radius: 4px; user-select: none;
-    min-height: 26px;
+  .tree ul::before {
+    content: ""; position: absolute; left: 7px; top: 0; bottom: 15px;
+    border-left: 1px solid var(--guide);
   }
-  .tree .row:hover { background: var(--hover); color: var(--ink); }
-  .tree .row.active { background: var(--active); color: var(--link); }
+  .tree .row {
+    min-height: 30px; padding: 0 8px;
+    display: grid; grid-template-columns: 16px 16px minmax(0,1fr); align-items: center; gap: 6px;
+    font-size: 13.5px;
+  }
+  .tree .row.file-row .icon { grid-column: 2; }
+  .tree .row.file-row .label { grid-column: 3; }
+  .tree .row.folder-row .label { font-weight: 500; }
+  .tree .row.active { background: var(--active); color: var(--link); font-weight: 500; }
   .tree .row.active .icon { color: var(--link); }
-  .tree .chev { width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; color: var(--ink-faint); transition: transform 120ms ease; }
-  .tree .chev.open { transform: rotate(90deg); }
-  .tree .chev.hidden { visibility: hidden; }
-  .tree .icon { width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; color: var(--ink-faint); }
+  .tree .icon {
+    width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+    color: var(--ink-faint);
+  }
   .tree .icon.folder { color: var(--folder); }
-  .tree .icon.md { color: var(--md); }
-  .tree .label { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tree .icon .folder-open { display: none; }
+  .tree .row[aria-expanded="true"] .folder-closed { display: none; }
+  .tree .row[aria-expanded="true"] .folder-open { display: block; }
+  .tree .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Context actions overlay the trailing edge instead of permanently stealing
+     filename width. Keyboard focus reveals the same affordances as hover. */
+  .row-actions {
+    position: absolute; z-index: 2; right: 4px; top: 50%; transform: translateY(-50%);
+    display: inline-flex; align-items: center; padding-left: 14px;
+    opacity: 0; visibility: hidden; pointer-events: none;
+    background: linear-gradient(90deg, transparent, var(--side) 14px);
+  }
+  .room-line:hover .row-actions, .tree-line:hover .row-actions,
+  .room-line:focus-within .row-actions, .tree-line:focus-within .row-actions {
+    opacity: 1; visibility: visible; pointer-events: auto;
+  }
+  .room-line:hover .row-actions, .tree-line:hover .row-actions {
+    background: linear-gradient(90deg, transparent, var(--hover) 14px);
+  }
+  .tree-line:has(.row.active) .row-actions {
+    background: linear-gradient(90deg, transparent, var(--active) 14px);
+  }
+  .row-share {
+    width: 28px; height: 28px; padding: 0; border: 0; border-radius: 5px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--ink-faint); background: transparent; cursor: pointer;
+    transition-property: color, background-color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
+  }
+  .row-share:hover { color: var(--link); background: var(--active); }
+  .row-share:active { scale: .96; }
+  .row-share:focus-visible { color: var(--link); outline: 2px solid var(--link); outline-offset: -2px; }
+  .row-share.copied { color: var(--link); }
+  .row-share svg { width: 13px; height: 13px; }
+
+  .tree-retry {
+    min-height: 30px; margin: 2px 12px 5px; padding: 0; border: 0; background: transparent;
+    color: var(--link); cursor: pointer; font: 500 12.5px/1 var(--sans);
+  }
+
+  .mobile-tree-toggle, .mobile-tree-close { display: none; }
 
   /* Footer — 10px vertical matches the brand row's top spacing for visual symmetry. */
   .footer { margin-top: auto; padding: 10px 14px; font-size: 13px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; border-top: 1px solid var(--rule); }
@@ -730,19 +790,9 @@ const WEB_INDEX_HTML = `<!doctype html>
   .edit-actions .edit-error { font-size: 12px; color: #d4493b; }
   .edit-actions .hint { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); margin-left: auto; }
 
-  /* Share affordance on tree rows — hidden until hover so the tree stays
-     quiet. Click copies a public link to that directory (the room head
-     variant shares the room root). visibility (not display) so the icon's
-     18px box is ALWAYS in the layout — the icon is taller than the text
-     line, and popping it in on hover used to grow the row ~1px and shift
-     every row below it. Hover must never change layout. */
-  .tree .row .row-share, .room-head .row-share { display: inline-flex; visibility: hidden; margin-left: auto; width: 18px; height: 18px; align-items: center; justify-content: center; color: var(--ink-faint); border-radius: 4px; flex-shrink: 0; }
-  .tree .row:hover .row-share, .room-head:hover .row-share { visibility: visible; }
-  .row-share:hover { color: var(--link); background: var(--active); }
-  .row-share.copied { color: var(--link); }
-  /* Reserve the widest label's width so Share→copied→Share never shifts. */
+  /* Reserve the widest document-share label so Share→copied→Share
+     never shifts the document bar. Tree actions use the overlay lane above. */
   .share-lbl { display: inline-block; min-width: 6ch; }
-  .row-share svg { width: 12px; height: 12px; }
 
   article { font-size: 16px; line-height: 1.6; color: var(--ink); }
   article h1, article h2, article h3, article h4 { font-weight: 600; line-height: 1.3; margin-top: 1.6em; margin-bottom: 0.4em; letter-spacing: -0.01em; text-wrap: balance; }
@@ -1004,19 +1054,24 @@ const WEB_INDEX_HTML = `<!doctype html>
   .search-box input:focus { border-color: var(--link); }
   .search-box input::placeholder { color: var(--ink-faint); }
   .search-room { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-faint); padding: 10px 14px 2px; }
-  .result { padding: 5px 8px; margin: 0 6px; border-radius: 4px; cursor: pointer; }
+  .result {
+    display: block; width: calc(100% - 12px); padding: 5px 8px; margin: 0 6px;
+    border: 0; border-radius: 4px; background: transparent; cursor: pointer; text-align: left; font-family: var(--sans);
+  }
   .result:hover { background: var(--hover); }
+  .result:focus-visible, .result-folder:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
   .result-path { font-size: 12.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .result-line { color: var(--ink-faint); }
   .result-preview { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
   .result-preview b { color: var(--link); font-weight: 600; }
   .result-folder {
+    display: block; width: calc(100% - 12px); border: 0; background: transparent; text-align: left;
     font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
     padding: 6px 8px 1px; margin: 0 6px; cursor: pointer; border-radius: 4px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .result-folder:hover { color: var(--link); background: var(--hover); }
-  .result.nested { margin-left: 18px; }
+  .result.nested { width: calc(100% - 24px); margin-left: 18px; }
 
   /* ── Private self profile ───────────────────────────────────────────
      A destination, not a dashboard: identity + four durable facts + one
@@ -1110,6 +1165,55 @@ const WEB_INDEX_HTML = `<!doctype html>
     .footer .handle, .footer .logout, .profile-retry, .profile-back { transition: none; }
   }
 
+  /* The desktop rail cannot share a 376px phone viewport with a readable
+     document. On small screens it becomes a full-screen navigation surface;
+     the document bar is the single route back into it. */
+  @media (max-width: 720px) {
+    body:not(.login-view) { padding-left: 0; }
+    body.tree-open { overflow: hidden; }
+    aside {
+      z-index: 70; width: 100vw; max-width: none;
+      padding-top: max(10px, env(safe-area-inset-top));
+      padding-bottom: env(safe-area-inset-bottom);
+      overscroll-behavior: contain;
+      transform: translateX(-100%); visibility: hidden; pointer-events: none;
+      transition: transform 180ms cubic-bezier(.2,0,0,1), visibility 0s linear 180ms;
+    }
+    body.tree-open aside {
+      transform: translateX(0); visibility: visible; pointer-events: auto;
+      transition-delay: 0s;
+    }
+    main { padding: 24px 20px 96px; }
+    .doc-header { gap: 8px; padding: 6px 10px; }
+    .doc-activity { display: none; }
+    .doc-location { min-width: 48px; }
+    .doc-location .doc-room, .doc-location .doc-separator { display: none; }
+    #copy-md, #share-btn { width: 40px; padding-inline: 0; }
+    #copy-md .label-stack, #share-btn .share-lbl { display: none; }
+    #preview-btn { padding-inline: 9px; }
+    #preview-btn > span { min-width: 0; font-size: 11px; }
+    .mobile-tree-toggle, .mobile-tree-close {
+      width: 40px; height: 40px; padding: 0; border: 0; border-radius: 7px;
+      display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+      color: var(--ink-dim); background: transparent; cursor: pointer;
+      transition-property: color, background-color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
+    }
+    .mobile-tree-close[hidden] { display: none; }
+    .mobile-tree-toggle:hover, .mobile-tree-close:hover { color: var(--ink); background: var(--hover); }
+    .mobile-tree-toggle:active, .mobile-tree-close:active { scale: .96; }
+    .mobile-tree-toggle:focus-visible, .mobile-tree-close:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+    .mobile-tree-toggle svg, .mobile-tree-close svg { width: 17px; height: 17px; }
+    .room-head, .tree .row { min-height: 40px; }
+    .row-share { width: 40px; height: 40px; }
+    .result { min-height: 40px; display: flex; flex-direction: column; justify-content: center; }
+    .result-folder, .tree-retry { min-height: 40px; display: flex; align-items: center; }
+    .row-actions { right: 0; }
+    .footer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    aside, .room-head .chev, .tree .chev, .row-share, .mobile-tree-toggle, .mobile-tree-close { transition: none; }
+  }
+
   /* Login */
   .login { padding: 24px; max-width: 460px; margin: 72px auto; }
   .login h1 { font-weight: 600; font-size: 24px; letter-spacing: -0.01em; margin: 0 0 8px; }
@@ -1180,9 +1284,10 @@ const WEB_INDEX_HTML = `<!doctype html>
 
   const ICON = {
     chev: '<svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 2 8 6 4 10"/></svg>',
-    folder: '<svg viewBox="0 0 14 14" width="14" height="14" fill="currentColor"><path d="M1.5 3.5a1 1 0 0 1 1-1h3l1.2 1.2h4.8a1 1 0 0 1 1 1V11a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"/></svg>',
-    md: '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.5 2.5h9v9h-9z"/><path d="M4.5 9V5l1.5 2L7.5 5v4M10 5v4M8.5 7.5 10 9l1.5-1.5"/></svg>',
+    folder: '<svg class="folder-closed" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><path d="M1.75 4.25c0-.83.67-1.5 1.5-1.5h3l1.35 1.5h5.15c.83 0 1.5.67 1.5 1.5v6c0 .83-.67 1.5-1.5 1.5h-9.5c-.83 0-1.5-.67-1.5-1.5z"/></svg><svg class="folder-open" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><path d="M1.75 5V4.25c0-.83.67-1.5 1.5-1.5h3l1.35 1.5h5.15c.83 0 1.5.67 1.5 1.5V6"/><path d="M2.4 6.25h12.1l-1.45 5.8c-.17.7-.8 1.2-1.52 1.2H3.55c-.73 0-1.36-.5-1.53-1.21L.75 7.75c-.2-.76.38-1.5 1.17-1.5z"/></svg>',
     file: '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3 1.5h5l3 3V12a.5.5 0 0 1-.5.5h-7.5a.5.5 0 0 1-.5-.5V2a.5.5 0 0 1 .5-.5z"/><path d="M8 1.5v3h3"/></svg>',
+    sidebar: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2" width="13" height="12" rx="2"/><path d="M5.25 2v12M7.75 5h4M7.75 8h4M7.75 11h2.5"/></svg>',
+    close: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/></svg>',
     copy: '<svg class="ic-copy" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="8" height="8" rx="1.4"/><path d="M10 4V2.5a.5.5 0 0 0-.5-.5H2.5a.5.5 0 0 0-.5.5v7a.5.5 0 0 0 .5.5H4"/></svg>',
     check: '<svg class="ic-check" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 7.5 6 10.5 11.5 4.5"/></svg>',
     cross: '<svg class="ic-fail" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>',
@@ -1203,6 +1308,48 @@ const WEB_INDEX_HTML = `<!doctype html>
   };
   state.opened = state.opened instanceof Set ? state.opened : new Set(state.opened || []);
   state.roomsOpened = state.roomsOpened instanceof Set ? state.roomsOpened : new Set(state.roomsOpened || []);
+
+  const mobileTreeMedia = window.matchMedia
+    ? window.matchMedia("(max-width: 720px)")
+    : { matches: false };
+  // On a fresh phone launch the tree is the useful first surface. Deep links
+  // and remembered documents open directly into the page instead.
+  let mobileTreeOpen = !state.activePath;
+
+  function mobileTreeShouldBeOpen() {
+    // A phone with no selected document has no header trigger to reopen the
+    // drawer, so the tree is forced open until a file becomes the main surface.
+    return Boolean(mobileTreeMedia.matches && !profileSurface && !share && (mobileTreeOpen || !state.activePath));
+  }
+
+  function syncMobileTreeSurface(returnFocus) {
+    const mobile = Boolean(mobileTreeMedia.matches);
+    // Profile and capability links deliberately have no sidebar. Keep the
+    // drawer predicate centralized here so a rerender cannot make their only
+    // visible surface inert (notably a fresh phone visit with no saved file).
+    const open = mobileTreeShouldBeOpen();
+    document.body.classList.toggle("tree-open", open);
+    const aside = app.querySelector("aside");
+    const main = app.querySelector("main");
+    const header = app.querySelector(".doc-header");
+    const trigger = document.getElementById("mobile-tree-toggle");
+    if (aside) {
+      aside.toggleAttribute("inert", mobile && !open);
+      aside.setAttribute("aria-hidden", mobile && !open ? "true" : "false");
+    }
+    if (main) main.toggleAttribute("inert", open);
+    if (header) header.toggleAttribute("inert", open);
+    if (trigger) trigger.setAttribute("aria-expanded", open ? "true" : "false");
+    if (returnFocus && !open) requestAnimationFrame(() => document.getElementById("mobile-tree-toggle")?.focus());
+  }
+
+  function setMobileTreeOpen(open, returnFocus) {
+    mobileTreeOpen = Boolean(open);
+    syncMobileTreeSurface(Boolean(returnFocus));
+    if (mobileTreeShouldBeOpen() && state.activePath) {
+      requestAnimationFrame(() => document.getElementById("mobile-tree-close")?.focus());
+    }
+  }
 
   // Capability mode: /s/<slug> edit links serve this SAME SPA with a grant
   // injected by the worker (window.BASHROOM_SHARE = {slug, room, path, role}).
@@ -2616,6 +2763,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (inlineKey && (room !== state.activeRoom || path !== state.activePath)) flushAutosave();
     if (editing && (room !== state.activeRoom || path !== state.activePath)) { editing = false; editError = ""; void destroyCm(); }
     state.activeRoom = room; state.activePath = path;
+    mobileTreeOpen = false;
     revealActiveFile(); // expand room + ancestor folders so the row is visible
     persist();
     syncUrl(false); // push a history entry so back/forward walks file history
@@ -2643,11 +2791,13 @@ const WEB_INDEX_HTML = `<!doctype html>
       if (html === null) { nextAnchorKey = ["dir", room, dir]; render(); return; }
       li.querySelectorAll(":scope > ul").forEach(u => u.remove()); // interrupted-close leftovers
       if (chev) chev.classList.add("open");
-      li.insertAdjacentHTML("beforeend", "<ul>" + html + "</ul>");
+      row.setAttribute("aria-expanded", "true");
+      li.insertAdjacentHTML("beforeend", '<ul aria-label="Folder contents">' + html + "</ul>");
       wireSidebar(); // new rows need handlers; reassignment is idempotent
       animateOpen(li.querySelector(":scope > ul"));
     } else {
       if (chev) chev.classList.remove("open");
+      row.setAttribute("aria-expanded", "false");
       const ul = li.querySelector(":scope > ul");
       if (ul) animateClose(ul, () => ul.remove());
     }
@@ -2682,7 +2832,9 @@ const WEB_INDEX_HTML = `<!doctype html>
       state.roomsOpened.delete(room);
       persist();
       if (!section) { nextAnchorKey = ["room", room]; render(); return; }
+      section.classList.remove("open");
       if (chev) chev.classList.remove("open");
+      if (head) head.setAttribute("aria-expanded", "false");
       const ul = section.querySelector(":scope > ul.tree");
       if (ul) animateClose(ul, () => ul.remove());
       return;
@@ -2693,9 +2845,11 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (!treeInflight.has(room)) void fetchTree(room);
     persist();
     if (!section) { nextAnchorKey = ["room", room]; render(); return; }
+    section.classList.add("open");
     if (chev) chev.classList.add("open");
+    if (head) head.setAttribute("aria-expanded", "true");
     section.querySelectorAll(":scope > ul.tree").forEach(u => u.remove());
-    section.insertAdjacentHTML("beforeend", '<ul class="tree">' + roomTreeInnerHtml(room) + '</ul>');
+    section.insertAdjacentHTML("beforeend", '<ul class="tree" aria-label="Files in ' + escHtml(room) + '">' + roomTreeInnerHtml(room) + '</ul>');
     wireSidebar();
     animateOpen(section.querySelector(":scope > ul.tree"));
   }
@@ -2756,6 +2910,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     profileSurface = true;
     profileRouteHandle = String(state.handle);
     disconnectPresence();
+    mobileTreeOpen = false;
     const next = "/@" + encodeURIComponent(profileRouteHandle);
     if (location.pathname !== next) history.pushState(null, "", next);
     window.scrollTo(0, 0);
@@ -2767,6 +2922,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (!profileSurface) return;
     profileSeq += 1;
     profileSurface = false;
+    // This control says “Back to rooms”; restore that exact surface on phones.
+    mobileTreeOpen = Boolean(mobileTreeMedia.matches);
     profileRouteHandle = "";
     pendingScrollY = -1;
     syncUrl(replace);
@@ -2975,9 +3132,9 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (fileHits.length) {
       html += '<div class="search-room">files</div>';
       for (const h of fileHits) {
-        html += '<div class="result" data-room="' + escHtml(h.room) + '" data-file="' + escHtml(h.path) + '">'
+        html += '<button class="result" type="button" data-room="' + escHtml(h.room) + '" data-file="' + escHtml(h.path) + '">'
           + '<div class="result-path">' + highlightMatch(h.path, q) + '<span class="result-line"> · ' + escHtml(h.room) + '</span></div>'
-          + '</div>';
+          + '</button>';
       }
     }
     if (searchError) return html + '<div class="empty">Search failed: ' + escHtml(searchError) + '</div>';
@@ -2993,12 +3150,12 @@ const WEB_INDEX_HTML = `<!doctype html>
       const base = slash === -1 ? r.path : r.path.slice(slash + 1);
       if (dir !== lastDir) {
         lastDir = dir;
-        if (dir) html += '<div class="result-folder" data-room="' + escHtml(r.room) + '" data-reveal-dir="' + escHtml(dir) + '">' + escHtml(dir) + '/</div>';
+        if (dir) html += '<button class="result-folder" type="button" data-room="' + escHtml(r.room) + '" data-reveal-dir="' + escHtml(dir) + '">' + escHtml(dir) + '/</button>';
       }
-      html += '<div class="result' + (dir ? " nested" : "") + '" data-room="' + escHtml(r.room) + '" data-file="' + escHtml(r.path) + '">'
+      html += '<button class="result' + (dir ? " nested" : "") + '" type="button" data-room="' + escHtml(r.room) + '" data-file="' + escHtml(r.path) + '">'
         + '<div class="result-path">' + escHtml(base) + '<span class="result-line">:' + r.line + '</span></div>'
         + '<div class="result-preview">' + highlightMatch(r.preview, q) + '</div>'
-        + '</div>';
+        + '</button>';
     }
     return html;
   }
@@ -3662,6 +3819,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   // room toggles patch the DOM in place instead of re-rendering the app, so
   // the chevron's CSS transition actually plays, the subtree height-animates
   // over its real measured height (WAAPI), and sidebar scroll is untouched.
+  // Height only: opacity made dense file labels visibly blink on each toggle.
   // Kept fast and subtle (140-160ms ease-out) because toggles are
   // high-frequency; disabled under prefers-reduced-motion.
   const reducedMotion = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : { matches: false };
@@ -3670,7 +3828,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (!ul || reducedMotion.matches || !ul.animate) return;
     ul.style.overflow = "hidden";
     const anim = ul.animate(
-      [{ height: "0px", opacity: 0.4 }, { height: ul.scrollHeight + "px", opacity: 1 }],
+      [{ height: "0px" }, { height: ul.scrollHeight + "px" }],
       { duration: 160, easing: "cubic-bezier(0.25, 1, 0.5, 1)" },
     );
     anim.onfinish = anim.oncancel = () => { ul.style.overflow = ""; };
@@ -3679,7 +3837,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (!ul || reducedMotion.matches || !ul.animate) { if (ul) done(); return; }
     ul.style.overflow = "hidden";
     const anim = ul.animate(
-      [{ height: ul.getBoundingClientRect().height + "px", opacity: 1 }, { height: "0px", opacity: 0.4 }],
+      [{ height: ul.getBoundingClientRect().height + "px" }, { height: "0px" }],
       { duration: 140, easing: "cubic-bezier(0.4, 0, 0.2, 1)" },
     );
     anim.onfinish = anim.oncancel = done;
@@ -3811,7 +3969,9 @@ const WEB_INDEX_HTML = `<!doctype html>
   function roomTreeInnerHtml(room) {
     const roomTree = trees.get(room);
     if (Array.isArray(roomTree)) return renderTree(room, buildTree(roomTree));
-    if (isErrorRecord(roomTree)) return '<li class="empty">Couldn\\'t load. <span class="retry-link">Click room to retry.</span></li>';
+    if (isErrorRecord(roomTree)) {
+      return '<li class="empty"><button class="tree-retry" type="button" data-retry-room="' + escHtml(room) + '">Couldn\\'t load · Retry</button></li>';
+    }
     return skeletonTreeHtml();
   }
 
@@ -3822,24 +3982,94 @@ const WEB_INDEX_HTML = `<!doctype html>
       ? state.rooms.map(r => {
           const open = state.roomsOpened.has(r.room);
           const treeHtml = open ? roomTreeInnerHtml(r.room) : "";
-          return \`<div class="section">
-            <div class="room-head" data-room-toggle="\${r.room}">
-              <span class="chev \${open ? 'open' : ''}">\${ICON.chev}</span>
-              <span class="name">\${r.room}</span>
-              <span class="row-share" aria-label="Copy agent prompt — paste into any agent to point it at this room" role="button" data-room="\${r.room}" data-agent-prompt="1">\${ICON.agent}</span>
-              <span class="row-share" aria-label="Copy public link to this room" role="button" data-room="\${r.room}" data-share-dir="">\${ICON.share}</span>
+          const safeRoom = escHtml(r.room);
+          return \`<div class="section\${open ? " open" : ""}">
+            <div class="room-line">
+              <button class="room-head" type="button" data-room-toggle="\${safeRoom}" aria-label="\${safeRoom}" aria-expanded="\${open ? "true" : "false"}">
+                <span class="chev \${open ? 'open' : ''}" aria-hidden="true">\${ICON.chev}</span>
+                <span class="name">\${safeRoom}</span>
+              </button>
+              <span class="row-actions">
+                <button class="row-share" type="button" aria-label="Copy agent prompt for \${safeRoom}" data-room="\${safeRoom}" data-agent-prompt="1">\${ICON.agent}</button>
+                <button class="row-share" type="button" aria-label="Copy public link to \${safeRoom}" data-room="\${safeRoom}" data-share-dir="">\${ICON.share}</button>
+              </span>
             </div>
-            \${open ? '<ul class="tree">' + treeHtml + '</ul>' : ''}
+            \${open ? '<ul class="tree" aria-label="Files in ' + safeRoom + '">' + treeHtml + '</ul>' : ''}
           </div>\`;
         }).join("")
       : roomsLoading ? skeletonRoomsHtml()
       : '<div class="empty">No rooms. Use <code>bashroom room create</code>.</div>';
   }
 
+  function sidebarRows(aside) {
+    return aside ? [...aside.querySelectorAll("[data-room-toggle], .row[data-dir], .row[data-file]")] : [];
+  }
+
+  function parentSidebarRow(aside, row) {
+    if (!aside || row.dataset.roomToggle !== undefined) return null;
+    const room = row.dataset.room || "";
+    const path = row.dataset.dir !== undefined ? row.dataset.dir : row.dataset.file || "";
+    const slash = path.lastIndexOf("/");
+    return slash === -1
+      ? findAnchorRow(aside, ["room", room])
+      : findAnchorRow(aside, ["dir", room, path.slice(0, slash)]);
+  }
+
+  // Native buttons provide Enter/Space. Arrow keys add the fast file-tree
+  // traversal people expect without inventing a brittle custom focus model.
+  function handleSidebarRowKey(event, row) {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const aside = row.closest("aside");
+    const rows = sidebarRows(aside);
+    const index = rows.indexOf(row);
+    if (index === -1) return;
+    let target = null;
+    if (event.key === "ArrowDown") target = rows[index + 1] || row;
+    else if (event.key === "ArrowUp") target = rows[index - 1] || row;
+    else if (event.key === "Home") target = rows[0] || row;
+    else if (event.key === "End") target = rows[rows.length - 1] || row;
+    else if (event.key === "ArrowRight" && row.hasAttribute("aria-expanded")) {
+      if (row.getAttribute("aria-expanded") === "false") row.click();
+      else target = rows[index + 1] || row;
+    } else if (event.key === "ArrowLeft") {
+      if (row.getAttribute("aria-expanded") === "true") row.click();
+      else target = parentSidebarRow(aside, row);
+    } else return;
+    event.preventDefault();
+    if (target) target.focus({ preventScroll: true });
+    if (target) target.scrollIntoView({ block: "nearest" });
+  }
+
+  function wireTreeLabelTips(root) {
+    if (!root) return;
+    requestAnimationFrame(() => {
+      for (const label of root.querySelectorAll(".room-head .name, .tree .row .label")) {
+        const row = label.closest(".room-head, .tree .row");
+        if (!row) continue;
+        if (label.scrollWidth > label.clientWidth) {
+          row.dataset.tip = row.dataset.file || row.dataset.dir || row.dataset.roomToggle || label.textContent || "";
+        } else {
+          delete row.dataset.tip;
+        }
+      }
+    });
+  }
+
   function wireSidebar() {
     app.querySelectorAll("[data-room-toggle]").forEach(b => b.onclick = () => toggleRoom(b.dataset.roomToggle));
     app.querySelectorAll(".row[data-file]").forEach(r => r.onclick = () => selectFile(r.dataset.room, r.dataset.file));
     app.querySelectorAll(".row[data-dir]").forEach(r => r.onclick = () => toggleDir(r.dataset.room, r.dataset.dir));
+    app.querySelectorAll("[data-room-toggle], .row[data-dir], .row[data-file]").forEach(row => {
+      row.onkeydown = (event) => handleSidebarRowKey(event, row);
+    });
+    app.querySelectorAll("[data-retry-room]").forEach(button => {
+      button.onclick = () => {
+        const room = button.dataset.retryRoom || "";
+        trees.delete(room);
+        renderSidebar();
+        void fetchTree(room);
+      };
+    });
     // Clicking a result leaves search mode: the tree comes back with the
     // file's ancestor folders expanded (selectFile → revealActiveFile) so
     // you land IN the folder, not on a dead-end results list.
@@ -3878,6 +4108,7 @@ const WEB_INDEX_HTML = `<!doctype html>
         if (ok) flashShare(el, "copied");
       };
     });
+    wireTreeLabelTips(app.querySelector("aside"));
   }
 
   // Repaint ONLY the sidebar's room sections. Background tree fetches used to
@@ -3892,14 +4123,18 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (!sectionsEl) { render(); return; } // no sidebar painted yet — full paint
     const anchor = sidebarAnchor(aside);
     const scroll = aside.scrollTop;
+    const focused = document.activeElement;
+    const focusedKey = focused && focused.matches && focused.matches("[data-room-toggle], .row[data-dir], .row[data-file]")
+      ? rowAnchorKey(focused)
+      : null;
     sectionsEl.innerHTML = sidebarSectionsHtml();
     wireSidebar();
     applySidebarAnchor(aside, anchor, scroll);
+    if (focusedKey) findAnchorRow(aside, focusedKey)?.focus({ preventScroll: true });
   }
 
-  function fileIcon(name) {
-    if (name.endsWith(".md")) return '<span class="icon md">' + ICON.md + '</span>';
-    return '<span class="icon">' + ICON.file + '</span>';
+  function fileIcon() {
+    return '<span class="icon" aria-hidden="true">' + ICON.file + '</span>';
   }
 
   function formatBytes(bytes) {
@@ -4049,32 +4284,39 @@ const WEB_INDEX_HTML = `<!doctype html>
   function renderTree(room, nodes, nested) {
     if (!nodes.length) return '<li class="empty">' + (nested ? "Empty folder." : "Empty room.") + '</li>';
     return nodes.map(n => {
+      const safeRoom = escHtml(room);
+      const safePath = escHtml(n.path);
+      const safeName = escHtml(n.name);
       if (n.kind === "dir") {
         const open = state.opened.has(room + ":" + n.path);
         return \`<li>
-          <div class="row" data-room="\${room}" data-dir="\${n.path}">
-            <span class="chev \${open ? 'open' : ''}">\${ICON.chev}</span>
-            <span class="icon folder">\${ICON.folder}</span>
-            <span class="label">\${n.name}</span>
-            <span class="row-share" aria-label="Copy public link to this folder" role="button" data-room="\${room}" data-share-dir="\${n.path}">\${ICON.share}</span>
+          <div class="tree-line">
+            <button class="row folder-row" type="button" data-room="\${safeRoom}" data-dir="\${safePath}" aria-label="\${safeName}" aria-expanded="\${open ? "true" : "false"}">
+              <span class="chev \${open ? 'open' : ''}" aria-hidden="true">\${ICON.chev}</span>
+              <span class="icon folder" aria-hidden="true">\${ICON.folder}</span>
+              <span class="label">\${safeName}</span>
+            </button>
+            <span class="row-actions"><button class="row-share" type="button" aria-label="Copy public link to \${safePath}" data-room="\${safeRoom}" data-share-dir="\${safePath}">\${ICON.share}</button></span>
           </div>
-          \${open ? '<ul>' + renderTree(room, n.kids, true) + '</ul>' : ''}
+          \${open ? '<ul aria-label="Contents of ' + safeName + '">' + renderTree(room, n.kids, true) + '</ul>' : ''}
         </li>\`;
       }
       const active = (room === state.activeRoom && n.path === state.activePath) ? "active" : "";
       return \`<li>
-        <div class="row \${active}" data-room="\${room}" data-file="\${n.path}">
-          <span class="chev hidden">\${ICON.chev}</span>
-          \${fileIcon(n.name)}
-          <span class="label">\${n.name}</span>
+        <div class="tree-line">
+        <button class="row file-row \${active}" type="button" data-room="\${safeRoom}" data-file="\${safePath}" aria-label="\${safeName}"\${active ? ' aria-current="page"' : ''}>
+          \${fileIcon()}
+          <span class="label">\${safeName}</span>
+        </button>
         </div>
       </li>\`;
     }).join("");
   }
 
   function renderLogin() {
+    mobileTreeOpen = false;
     document.body.classList.add("login-view");
-    document.body.classList.remove("profile-view");
+    document.body.classList.remove("profile-view", "tree-open");
     app.innerHTML = \`
       <div class="login">
         <h1>Bashroom</h1>
@@ -4133,6 +4375,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (!state.token) return renderLogin();
     document.body.classList.remove("login-view");
     document.body.classList.toggle("profile-view", profileSurface);
+    document.body.classList.toggle("tree-open", mobileTreeShouldBeOpen());
     // The innerHTML wipe below detaches the actor panel's trigger — an open
     // panel would float unanchored, so it closes with the DOM it points at.
     closeActorPanel(false);
@@ -4154,6 +4397,9 @@ const WEB_INDEX_HTML = `<!doctype html>
     // its focus across the swap (the value re-paints from searchQuery).
     const ae = document.activeElement;
     const searchFocused = Boolean(ae && ae.id === "room-search");
+    const focusedSidebarKey = ae && ae.matches && ae.matches("[data-room-toggle], .row[data-dir], .row[data-file]")
+      ? rowAnchorKey(ae)
+      : null;
     // ...and the caret with it — restoring focus at value.length relocated a
     // mid-word caret to the end under background renders.
     const searchSel = searchFocused ? [ae.selectionStart, ae.selectionEnd] : null;
@@ -4202,7 +4448,7 @@ const WEB_INDEX_HTML = `<!doctype html>
           ? DOMPurify.sanitize(marked.parse(renderSource))
           : '<div class="empty">This document is empty.</div>';
       }
-      catch (e) { md = '<pre>marked error: ' + String(e) + '</pre>'; }
+      catch (e) { md = '<pre>marked error: ' + escHtml(String(e)) + '</pre>'; }
     }
     // File-dependent controls only exist once the body has arrived; the
     // header SHELL renders as soon as a document is addressed, so the 52px
@@ -4216,7 +4462,7 @@ const WEB_INDEX_HTML = `<!doctype html>
       ? (historyViewing
         ? \`<div class="doc-actions">\${historyActionHtml}</div>\`
         : \`<div class="doc-actions">
-              \${activeFile.is_binary ? "" : \`<button class="doc-action" id="copy-md" data-tip="Copy Markdown source" type="button">
+              \${activeFile.is_binary ? "" : \`<button class="doc-action" id="copy-md" data-tip="Copy Markdown source" aria-label="Copy Markdown source" type="button">
                 <span class="icon-stack">\${ICON.copy}\${ICON.check}\${ICON.cross}</span>
                 <span class="label-stack">
                   <span class="lb-copy">Copy</span>
@@ -4224,14 +4470,14 @@ const WEB_INDEX_HTML = `<!doctype html>
                   <span class="lb-failed">Failed</span>
                 </span>
               </button>\`}
-              \${inlineMode ? \`<button class="doc-action" id="preview-btn" data-tip="\${previewing ? "Return to editing" : "Render diagrams and Markdown"}" type="button">
+              \${inlineMode ? \`<button class="doc-action" id="preview-btn" data-tip="\${previewing ? "Return to editing" : "Render diagrams and Markdown"}" aria-label="\${previewing ? "Return to editing" : "Preview Markdown"}" type="button">
                 <span>\${previewing ? "Edit" : "Preview"}</span>
               </button>\` : ""}
               \${activeFile.is_binary || editing || inlineMode ? "" : \`<button class="doc-action" id="edit-btn" data-tip="Edit this file" type="button">
                 <span class="icon-stack">\${ICON.pencil}</span><span>Edit</span>
               </button>\`}
               <div class="share-wrap">
-                <button class="doc-action" id="share-btn" data-tip="Create a role-based link" type="button" aria-haspopup="menu" aria-expanded="false">
+                <button class="doc-action" id="share-btn" data-tip="Create a role-based link" aria-label="Share document" type="button" aria-haspopup="menu" aria-expanded="false">
                   <span class="icon-stack">\${ICON.share}</span><span class="share-lbl">Share</span>
                 </button>
                 <div class="share-menu" id="share-menu" role="menu" hidden>
@@ -4243,8 +4489,11 @@ const WEB_INDEX_HTML = `<!doctype html>
               \${historyActionHtml}
           </div>\`)
       : "";
-    const documentHeader = !profileSurface && ((activeFile && !activeFileIsErr) || activeFileLoading || treeLoading)
+    // Keep the navigation bar for addressed-but-missing/error files too. On a
+    // phone it owns the only control that can reopen the room tree.
+    const documentHeader = !profileSurface && (state.activePath || (activeFile && !activeFileIsErr) || activeFileLoading || treeLoading)
       ? \`<header class="doc-header">
+          \${share ? "" : \`<button class="mobile-tree-toggle" id="mobile-tree-toggle" type="button" aria-label="Open rooms" aria-controls="room-sidebar" aria-expanded="false">\${ICON.sidebar}</button>\`}
           <div class="doc-location" title="\${escHtml(state.activeRoom + (docPath ? "/" + docPath : ""))}">
             <span class="doc-room">\${escHtml(state.activeRoom)}</span>
             <span class="doc-separator" aria-hidden="true">/</span>
@@ -4263,10 +4512,10 @@ const WEB_INDEX_HTML = `<!doctype html>
     // In-flight loads (treeLoading / activeFileLoading) never reach this —
     // they render the skeleton document below instead of a message.
     const emptyMsg = !state.activeRoom ? "Pick a room."
-      : treeIsErr ? "Couldn't load <code>" + state.activeRoom + "</code>. Click the room in the sidebar to retry."
+      : treeIsErr ? "Couldn't load <code>" + escHtml(state.activeRoom) + "</code>. Retry from the room tree."
       : !state.activePath ? "Pick a file."
-      : activeFileIsErr ? "Couldn't load <code>" + state.activePath + "</code>."
-      : "File <code>" + state.activePath + "</code> not in <code>" + state.activeRoom + "</code>.";
+      : activeFileIsErr ? "Couldn't load <code>" + escHtml(state.activePath) + "</code>."
+      : "File <code>" + escHtml(state.activePath) + "</code> not in <code>" + escHtml(state.activeRoom) + "</code>.";
     // Fallback (cmLoadFailed) explicit-edit flow: textarea + Save/Cancel.
     const editorHtml = '<div id="cm-mount"></div>'
       + '<textarea class="editor" id="editor" spellcheck="false"></textarea>'
@@ -4301,7 +4550,7 @@ const WEB_INDEX_HTML = `<!doctype html>
       : '<div class="empty">' + emptyMsg + '</div>';
 
     app.innerHTML = \`
-      <aside>
+      <aside id="room-sidebar" aria-label="Rooms">
         <div class="brand">
           <svg class="mark" viewBox="0 0 46 20" aria-hidden="true">
             <g fill="currentColor">
@@ -4322,9 +4571,10 @@ const WEB_INDEX_HTML = `<!doctype html>
             <svg class="ic-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 9.5A5.5 5.5 0 1 1 6.5 3a4.5 4.5 0 0 0 6.5 6.5z"/></svg>
             <svg class="ic-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"/></svg>
           </button>
+          <button class="mobile-tree-close" id="mobile-tree-close" aria-label="Close rooms" type="button"\${state.activePath ? "" : " hidden"}>\${ICON.close}</button>
         </div>
         <div class="search-box"><input id="room-search" type="search" placeholder="Search all rooms  ⌘K" autocomplete="off" spellcheck="false" /></div>
-        <div id="sections">\${sidebarSectionsHtml()}</div>
+        <nav id="sections" aria-label="Rooms and files">\${sidebarSectionsHtml()}</nav>
         <div class="footer">
           <button class="handle" id="profile-open" type="button" aria-label="Open your profile"\${profileSurface ? ' aria-current="page"' : ''}>@\${escHtml(state.handle || "")}</button>
           <span class="offline-actions">
@@ -4362,6 +4612,11 @@ const WEB_INDEX_HTML = `<!doctype html>
       requestAnimationFrame(() => window.scrollTo(0, docScrollY));
     }
     wireSidebar();
+    syncMobileTreeSurface(false);
+    const mobileTreeToggle = document.getElementById("mobile-tree-toggle");
+    if (mobileTreeToggle) mobileTreeToggle.onclick = () => setMobileTreeOpen(true, false);
+    const mobileTreeClose = document.getElementById("mobile-tree-close");
+    if (mobileTreeClose) mobileTreeClose.onclick = () => setMobileTreeOpen(false, true);
 
     // Rewrite + intercept links inside rendered Markdown. marked turns
     // [notes/x.md](notes/x.md) into <a href="notes/x.md"> — a relative URL the
@@ -4386,6 +4641,9 @@ const WEB_INDEX_HTML = `<!doctype html>
         if (activeRow) activeRow.scrollIntoView({ block: "center" });
       } else {
         applySidebarAnchor(newAside, anchor, sidebarScroll);
+      }
+      if (focusedSidebarKey && (!mobileTreeMedia.matches || mobileTreeOpen)) {
+        findAnchorRow(newAside, focusedSidebarKey)?.focus({ preventScroll: true });
       }
     }
     const newProfileCalendar = app.querySelector(".profile-calendar-wrap");
@@ -4738,6 +4996,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     state.activePath = fromUrl.path;
     revealActiveFile(); // expand room + ancestor folders for the deep-linked file
   }
+  mobileTreeOpen = !state.activePath;
 
   // Back/forward: re-hydrate from the URL and repaint. The target room's
   // tree/file data may not be loaded (deep nav across rooms) — fetch on demand.
@@ -4768,10 +5027,22 @@ const WEB_INDEX_HTML = `<!doctype html>
       document.getElementById("history-btn")?.focus();
       return;
     }
+    if (e.defaultPrevented) return;
+    // With no document selected the tree is the only route forward, so Escape
+    // must not dismiss it into an empty surface with no reopen control.
+    if (e.key === "Escape" && mobileTreeShouldBeOpen() && state.activePath) {
+      e.preventDefault();
+      setMobileTreeOpen(false, true);
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
       if (profileSurface) return;
-      const si = document.getElementById("room-search");
-      if (si) { e.preventDefault(); si.focus(); si.select(); }
+      e.preventDefault();
+      if (mobileTreeMedia.matches && !mobileTreeOpen) setMobileTreeOpen(true, false);
+      requestAnimationFrame(() => {
+        const si = document.getElementById("room-search");
+        if (si) { si.focus(); si.select(); }
+      });
     }
   });
 
@@ -4796,6 +5067,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (historyKey && historyKey !== nextHistoryKey) resetHistory();
     state.activeRoom = s ? s.room : "";
     state.activePath = s ? s.path : "";
+    mobileTreeOpen = !state.activePath;
     if (state.activeRoom) {
       revealActiveFile(); // keep the tree in sync with back/forward navigation
       if (!trees.has(state.activeRoom) && !treeInflight.has(state.activeRoom)) void fetchTree(state.activeRoom);
@@ -4841,7 +5113,10 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (profileSurface && (profileStatus === "offline" || profileStatus === "error")) void loadProfile(true);
   });
   window.addEventListener("offline", updateOfflineControls);
-  window.addEventListener("resize", () => { if (activeTourStepId) scheduleFeatureTour(); });
+  window.addEventListener("resize", () => {
+    syncMobileTreeSurface(false);
+    if (activeTourStepId) scheduleFeatureTour();
+  });
   window.addEventListener("scroll", () => { if (activeTourStepId) scheduleFeatureTour(); }, true);
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && activeTourStepId) dismissFeatureTour();

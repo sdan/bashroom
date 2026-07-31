@@ -31,6 +31,13 @@ function treeFor(room) {
   for (let i = 0; i < n; i++) files.push({ path: `notes/${room}-file-${String(i).padStart(2,"0")}.md`, updated_at: "2026-07-01T00:00:00Z", size_bytes: 1000 + i });
   files.push({ path: "index.md", updated_at: "2026-07-01T00:00:00Z", size_bytes: 500 });
   files.push({ path: "AGENTS.md", updated_at: "2026-07-01T00:00:00Z", size_bytes: 500 });
+  if (room === "milkdown-test") {
+    // Tree safety + truncation fixtures: paths are user/agent-controlled and
+    // must remain literal text even when they contain HTML punctuation.
+    files.push({ path: "notes/roomtext-production-canary-with-an-extremely-long-name.md", updated_at: "2026-07-01T00:00:00Z", size_bytes: 500 });
+    files.push({ path: "notes/<img id=tree-xss src=x onerror=window.__treeXss=1>.md", updated_at: "2026-07-01T00:00:00Z", size_bytes: 500 });
+    files.push({ path: "empty/deep/", updated_at: "2026-07-01T00:00:00Z", size_bytes: 0 });
+  }
   if (room === "geospot") {
     for (const f of ["geozero.md","current-plan.md","reading-list.md","README.md"])
       files.push({ path: "notes/" + f, updated_at: "2026-06-03T00:00:00Z", size_bytes: 27000 });
@@ -163,6 +170,10 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/web/api/file") {
     const room = url.searchParams.get("room");
     const path = url.searchParams.get("path");
+    if (path === "notes/__missing__.md") {
+      res.writeHead(404, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "NOT_FOUND" }));
+    }
     const rev = fileRev.get(room + "/" + path) || 0;
     return json(res, { ok: true, file: { path, content: "# " + path + "\n\nMock body rev " + rev + " for **" + path + "**.\n\n- one\n- two\n\n```mermaid\nflowchart LR\n  Agent --> Bashroom\n  Bashroom --> Document\n```\n\n```ascii\nagent ---> shared document\n```\n", etag: "rt1:1:" + (7 + rev), version: "rt1:1:" + (7 + rev), size_bytes: 123, updated_at: "2026-07-28T15:42:00.000Z", is_binary: false, custom_metadata: { authority: "roomtext-v1", epoch: "1", revision: String(7 + rev) } } });
   }

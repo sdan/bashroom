@@ -167,6 +167,20 @@ account history. The endpoint returns only counts and dates—never user ids,
 paths, commands, or raw audit rows—and is always `Cache-Control: no-store`.
 Public profiles would require a separate opt-in privacy contract.
 
+## Web room tree
+
+The room sidebar remains a path-first projection of `/web/api/rooms` and
+`/web/api/tree`; it is not a second filesystem model. Expansion state is kept
+by canonical `room:path` keys, cached metadata paints stale-while-revalidate,
+and selecting a deep link opens its ancestor folders before rendering.
+
+The renderer uses nested disclosure buttons rather than importing a second UI
+runtime. File, folder, and room text is HTML-escaped before the inline SPA
+inserts it. Enter/Space use native button behavior; arrow, Home, and End keys
+move through visible rows. On viewports at or below 720px the same sidebar DOM
+becomes a full-screen navigation surface and selecting a file returns to the
+full-width document. There is no separate mobile tree to synchronize.
+
 ## Write contracts
 
 The Worker exposes ten MCP tools. The two mutation shapes are intentionally
