@@ -24,6 +24,12 @@ const WEB_INDEX_HTML = `<!doctype html>
 <meta name="color-scheme" content="light dark" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Bashroom</title>
+<link rel="manifest" href="/manifest.webmanifest" />
+<meta name="theme-color" content="#37352f" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<link rel="apple-touch-icon" href="/app-icon-192.png" />
 <link rel="preconnect" href="https://pingpong.sdan.io" crossorigin />
 <link rel="dns-prefetch" href="https://pingpong.sdan.io" />
 <script defer src="https://pingpong.sdan.io/client.js" data-site="bashroom.sdan.io" data-presence="true"></script>
@@ -192,6 +198,20 @@ const WEB_INDEX_HTML = `<!doctype html>
     transition: color 140ms ease, background 140ms ease;
     -webkit-appearance: none; appearance: none; position: relative;
   }
+  .brand .tour-replay {
+    background: transparent; border: 0; padding: 0; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--ink-faint); width: 28px; height: 28px; border-radius: 6px;
+    font: 600 14px/1 var(--sans);
+    transition-property: color, background-color, scale;
+    transition-duration: 140ms;
+    transition-timing-function: ease;
+    -webkit-appearance: none; appearance: none; position: relative;
+  }
+  .brand .tour-replay::before { content: ""; position: absolute; inset: -6px; border-radius: 8px; }
+  .brand .tour-replay:hover { color: var(--ink); background: var(--hover); }
+  .brand .tour-replay:active { scale: .96; }
+  .brand .tour-replay:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
   .brand .theme-toggle::before { content: ""; position: absolute; inset: -6px; border-radius: 8px; }
   .brand .theme-toggle:hover { color: var(--ink); background: var(--hover); }
   .brand .theme-toggle svg { width: 16px; height: 16px; display: block; }
@@ -241,10 +261,45 @@ const WEB_INDEX_HTML = `<!doctype html>
   .tree .label { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   /* Footer — 10px vertical matches the brand row's top spacing for visual symmetry. */
-  .footer { margin-top: auto; padding: 10px 14px; font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--rule); }
+  .footer { margin-top: auto; padding: 10px 14px; font-size: 13px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; border-top: 1px solid var(--rule); }
   .footer .handle { color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .footer .logout { cursor: pointer; color: var(--ink-faint); flex-shrink: 0; }
   .footer .logout:hover { color: var(--link); }
+  .footer .offline-actions { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; }
+  .footer .offline-action {
+    border: 0; min-height: 40px; padding: 0 3px; background: transparent; color: var(--ink-faint);
+    font: inherit; cursor: pointer; white-space: nowrap;
+    transition-property: color, scale; transition-duration: 140ms; transition-timing-function: ease;
+  }
+  .footer .offline-action:hover, .footer .offline-action:focus-visible { color: var(--link); outline: none; }
+  .footer .offline-action:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
+  .footer .offline-action:active:not([disabled]) { scale: .96; }
+  .footer .offline-action[disabled] { cursor: wait; color: var(--ink-dim); }
+  .footer .offline-action.ready::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: var(--actor-you); vertical-align: 1px; }
+  .offline-progress {
+    flex: 1 0 100%; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: 5px 10px; color: var(--ink-faint); font: 500 11px/1.2 var(--sans);
+  }
+  .offline-progress[hidden] { display: none; }
+  .offline-progress-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .offline-progress-count { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .offline-progress-track {
+    grid-column: 1 / -1; height: 3px; overflow: hidden; border-radius: 999px;
+    background: var(--rule);
+  }
+  .offline-progress-fill {
+    display: block; width: 100%; height: 100%; border-radius: inherit; background: var(--link);
+    transform: scaleX(var(--offline-progress-value, 0)); transform-origin: left center;
+    transition-property: transform; transition-duration: 180ms; transition-timing-function: ease-out;
+  }
+  .offline-progress.indeterminate .offline-progress-fill {
+    width: 38%; transform: translateX(-120%); transform-origin: center;
+    animation: offline-progress-slide 1.25s ease-in-out infinite;
+  }
+  @keyframes offline-progress-slide {
+    from { transform: translateX(-120%); }
+    to { transform: translateX(320%); }
+  }
 
   /* Document chrome — one bar bolted to the top of the content pane, three
      zones with distinct materials: breadcrumb (sans, the document's name),
@@ -852,6 +907,55 @@ const WEB_INDEX_HTML = `<!doctype html>
     [data-tip]::after { transition-duration: 0ms; }
   }
 
+  /* First-run feature guide. It lives on <body>, outside #app, because the
+     reader intentionally replaces the app subtree on every render. The
+     highlighted target is real and remains clickable; the guide is help,
+     never a modal gate. */
+  .feature-tour {
+    position: fixed; z-index: 80; width: min(320px, calc(100vw - 24px));
+    padding: 16px; border-radius: 14px; background: var(--bg); color: var(--ink);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.08), 0 12px 34px rgba(0,0,0,.16);
+    opacity: 0; transform: translateY(6px); pointer-events: none;
+    transition-property: opacity, transform;
+    transition-duration: 180ms;
+    transition-timing-function: cubic-bezier(.2,0,0,1);
+  }
+  :root[data-theme="dark"] .feature-tour { box-shadow: 0 0 0 1px rgba(255,255,255,.10), 0 12px 34px rgba(0,0,0,.42); }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .feature-tour { box-shadow: 0 0 0 1px rgba(255,255,255,.10), 0 12px 34px rgba(0,0,0,.42); }
+  }
+  .feature-tour.open { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .feature-tour::after {
+    content: ""; position: absolute; left: var(--tour-arrow-x, 24px); width: 10px; height: 10px;
+    background: var(--bg); transform: translateX(-50%) rotate(45deg);
+  }
+  .feature-tour[data-side="top"]::after { bottom: -5px; box-shadow: 1px 1px 0 rgba(0,0,0,.06); }
+  .feature-tour[data-side="bottom"]::after { top: -5px; box-shadow: -1px -1px 0 rgba(0,0,0,.06); }
+  .feature-tour-head { display: grid; grid-template-columns: 1fr 40px; gap: 8px; align-items: start; }
+  .feature-tour-kicker { margin: 0 0 5px; color: var(--link); font: 650 11px/1.2 var(--sans); letter-spacing: .08em; text-transform: uppercase; }
+  .feature-tour h2 { margin: 0; font: 600 17px/1.25 var(--sans); letter-spacing: -.01em; text-wrap: balance; }
+  .feature-tour p { margin: 10px 0 14px; color: var(--ink-dim); font: 13px/1.5 var(--sans); text-wrap: pretty; }
+  .feature-tour-close {
+    width: 40px; height: 40px; margin: -9px -9px 0 0; border: 0; border-radius: 8px;
+    background: transparent; color: var(--ink-faint); cursor: pointer; font: 20px/1 var(--sans);
+    transition-property: color, background-color, scale; transition-duration: 140ms; transition-timing-function: ease;
+  }
+  .feature-tour-close:hover { color: var(--ink); background: var(--hover); }
+  .feature-tour-close:active { scale: .96; }
+  .feature-tour-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .feature-tour-actions button { min-height: 40px; border-radius: 8px; cursor: pointer; font: 600 12px/1 var(--sans); }
+  .feature-tour-skip { border: 0; padding: 0 4px; background: transparent; color: var(--ink-faint); }
+  .feature-tour-next {
+    border: 0; padding: 0 14px; background: var(--ink); color: var(--bg);
+    box-shadow: 0 1px 2px rgba(0,0,0,.12);
+  }
+  .feature-tour-actions button:active { scale: .96; }
+  .tour-highlight { position: relative; z-index: 79; border-radius: 5px; box-shadow: 0 0 0 3px color-mix(in srgb, var(--link) 28%, transparent); }
+  @media (prefers-reduced-motion: reduce) {
+    .feature-tour, .feature-tour-close, .feature-tour-actions button, .brand .tour-replay, .footer .offline-action, .offline-progress-fill { transition: none; }
+    .offline-progress.indeterminate .offline-progress-fill { width: 38%; transform: none; animation: none; }
+  }
+
   .empty { font-size: 14px; color: var(--ink-dim); padding: 10px 14px; }
   .empty code { font-family: var(--mono); font-size: 12px; background: var(--hover); padding: 2px 6px; border-radius: 3px; color: var(--link); }
 
@@ -932,6 +1036,7 @@ const WEB_INDEX_HTML = `<!doctype html>
 </head>
 <body>
   <div id="app"></div>
+<script src="/web-offline.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@13.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
 <script>
@@ -940,6 +1045,33 @@ const WEB_INDEX_HTML = `<!doctype html>
   const STATE_KEY = "bashroom.state";
   const OPEN_KEY = "bashroom.opened";
   const ROOM_OPEN_KEY = "bashroom.rooms-opened";
+  const TOUR_KEY = "bashroom.feature-tour.offline-v1";
+  const TOUR_STEPS = [
+    {
+      id: "offline-sync",
+      target: "#offline-sync",
+      title: "Take your rooms on the plane",
+      body: "Offline downloads every room, readable linked page, and available PDF. Wait for Offline ready before disconnecting.",
+    },
+    {
+      id: "offline-search",
+      target: "#room-search",
+      title: "Search still works offline",
+      body: "This search scans the room text already stored on this device, even when Bashroom and the wider web are unreachable.",
+    },
+    {
+      id: "offline-install",
+      target: "#offline-install",
+      title: "Install Bashroom on this device",
+      body: "Add Bashroom to your home screen so it opens like a native reading app. Prepare Offline separately before each trip.",
+    },
+    {
+      id: "offline-export",
+      target: "#offline-export",
+      title: "Keep a portable text copy",
+      body: "Export creates one standalone HTML archive of your cached rooms and readable linked pages. It opens without Bashroom.",
+    },
+  ];
   const app = document.getElementById("app");
   const requestedReturn = new URLSearchParams(location.search).get("return") || "";
   // Only collaboration links on this origin may round-trip through login.
@@ -1038,6 +1170,315 @@ const WEB_INDEX_HTML = `<!doctype html>
     }
   }
 
+  // IndexedDB is the durable plane-mode copy; localStorage above remains a
+  // lightweight fast index. File bodies and pending edits are account-scoped
+  // by a one-way token fingerprint inside /web-offline.js.
+  const offline = window.BashroomOffline || null;
+  let offlineReceipt = null;
+  let offlineBusy = false;
+  let offlineProgress = null;
+  let installPromptEvent = null;
+  let activeTourStepId = "";
+  let tourFrame = 0;
+
+  function isStandaloneApp() {
+    return window.matchMedia("(display-mode: standalone)").matches || Boolean(navigator.standalone);
+  }
+
+  function installIsAvailable() {
+    return !isStandaloneApp() && (Boolean(installPromptEvent) || /iPad|iPhone|iPod|Android/i.test(navigator.userAgent));
+  }
+
+  async function installBashroom() {
+    if (installPromptEvent) {
+      const prompt = installPromptEvent;
+      installPromptEvent = null;
+      await prompt.prompt();
+      await prompt.userChoice.catch(() => null);
+      updateOfflineControls();
+      return;
+    }
+    if (/iPad|iPhone|iPod/i.test(navigator.userAgent)) {
+      showToast("In Safari: tap Share, then Add to Home Screen.");
+    } else {
+      showToast("Open the browser menu and choose Install app or Add to Home screen.");
+    }
+  }
+
+  function offlineButtonLabel() {
+    if (offlineBusy) return "Preparing…";
+    if (!navigator.onLine && offlineReceipt) return "Offline ready";
+    return offlineReceipt ? "Offline ready" : "Offline";
+  }
+
+  function offlineProgressView(progress) {
+    const phase = progress && String(progress.phase || "planning");
+    const done = Math.max(0, Number(progress && progress.done || 0));
+    const total = Math.max(0, Number(progress && progress.total || 0));
+    // Recursive pages can reveal more pages, so their denominator is not
+    // final. Only room and file phases receive a determinate progress bar.
+    const knownTotal = total > 0 && phase !== "planning" && phase !== "links";
+    const labels = {
+      planning: "Planning your offline library",
+      rooms: "Counting rooms and files",
+      files: "Saving room files",
+      links: "Reading linked pages",
+    };
+    const label = labels[phase] || "Preparing your offline library";
+    const count = phase === "links"
+      ? (done ? done + " checked" : "Discovering links")
+      : (knownTotal ? Math.min(done, total) + "/" + total : "Discovering…");
+    return {
+      label,
+      count,
+      determinate: knownTotal,
+      done: Math.min(done, total),
+      total,
+      value: knownTotal ? Math.min(1, done / total) : 0,
+      detail: progress && String(progress.detail || ""),
+    };
+  }
+
+  function updateOfflineControls() {
+    const sync = document.getElementById("offline-sync");
+    if (sync) {
+      sync.textContent = offlineButtonLabel();
+      sync.disabled = offlineBusy;
+      sync.setAttribute("aria-busy", offlineBusy ? "true" : "false");
+      if (offlineBusy) sync.setAttribute("aria-describedby", "offline-progress");
+      else sync.removeAttribute("aria-describedby");
+      sync.classList.toggle("ready", Boolean(offlineReceipt));
+      const fileErrors = offlineReceipt && Array.isArray(offlineReceipt.file_errors) ? offlineReceipt.file_errors.length : 0;
+      const linkErrors = offlineReceipt && Array.isArray(offlineReceipt.link_errors) ? offlineReceipt.link_errors.length : 0;
+      const pdfErrors = offlineReceipt && Array.isArray(offlineReceipt.pdf_errors) ? offlineReceipt.pdf_errors.length : 0;
+      const crawl = offlineReceipt && offlineReceipt.crawl;
+      sync.title = offlineReceipt
+        ? ("Prepared " + new Date(offlineReceipt.prepared_at).toLocaleString() + " · " + offlineReceipt.files + " files · " + offlineReceipt.links + " pages · " + Number(offlineReceipt.pdfs || 0) + " PDFs" + (crawl && crawl.truncated ? " · graph capped" : "") + ((fileErrors + linkErrors + pdfErrors) ? " · " + (fileErrors + linkErrors + pdfErrors) + " misses" : ""))
+        : (offlineBusy && offlineProgress && offlineProgress.detail
+          ? String(offlineProgress.detail)
+          : "Download every room, linked page, and PDF for offline use");
+    }
+    const progress = document.getElementById("offline-progress");
+    const progressLabel = document.getElementById("offline-progress-label");
+    const progressCount = document.getElementById("offline-progress-count");
+    const progressTrack = document.getElementById("offline-progress-track");
+    if (progress && progressLabel && progressCount && progressTrack) {
+      progress.hidden = !offlineBusy;
+      if (offlineBusy) {
+        const view = offlineProgressView(offlineProgress);
+        progress.classList.toggle("indeterminate", !view.determinate);
+        progress.style.setProperty("--offline-progress-value", String(view.value));
+        progress.title = view.detail || view.label;
+        progressLabel.textContent = view.label;
+        progressCount.textContent = view.count;
+        progressTrack.setAttribute("aria-valuetext", view.label + " · " + view.count);
+        if (view.determinate) {
+          progressTrack.setAttribute("aria-valuemin", "0");
+          progressTrack.setAttribute("aria-valuemax", String(view.total));
+          progressTrack.setAttribute("aria-valuenow", String(view.done));
+        } else {
+          progressTrack.removeAttribute("aria-valuemin");
+          progressTrack.removeAttribute("aria-valuemax");
+          progressTrack.removeAttribute("aria-valuenow");
+        }
+      }
+    }
+    const exportButton = document.getElementById("offline-export");
+    if (exportButton) exportButton.hidden = !offlineReceipt;
+    const installButton = document.getElementById("offline-install");
+    if (installButton) installButton.hidden = !installIsAvailable();
+    scheduleFeatureTour();
+  }
+
+  function readTourSeen() {
+    try {
+      const value = JSON.parse(localStorage.getItem(TOUR_KEY) || "{}");
+      return value && typeof value === "object" ? value : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function writeTourSeen(seen) {
+    try { localStorage.setItem(TOUR_KEY, JSON.stringify(seen)); }
+    catch (_) {} // Tutorial persistence is helpful, never a reader dependency.
+  }
+
+  function tourTarget(step) {
+    const target = document.querySelector(step.target);
+    if (!target || target.hidden || target.closest("[hidden]")) return null;
+    const style = getComputedStyle(target);
+    return style.display === "none" || style.visibility === "hidden" ? null : target;
+  }
+
+  function clearTourHighlight() {
+    document.querySelectorAll(".tour-highlight").forEach((target) => {
+      target.classList.remove("tour-highlight");
+      if (target.getAttribute("aria-describedby") === "feature-tour") target.removeAttribute("aria-describedby");
+    });
+  }
+
+  function hideFeatureTour() {
+    activeTourStepId = "";
+    clearTourHighlight();
+    const card = document.getElementById("feature-tour");
+    if (!card) return;
+    card.classList.remove("open");
+    window.setTimeout(() => {
+      if (!activeTourStepId && card.parentNode) card.remove();
+    }, 180);
+  }
+
+  function markFeatureTourStep(id, continueTour) {
+    const seen = readTourSeen();
+    seen[id] = true;
+    writeTourSeen(seen);
+    hideFeatureTour();
+    if (continueTour) window.setTimeout(scheduleFeatureTour, 190);
+  }
+
+  function dismissFeatureTour() {
+    const seen = readTourSeen();
+    TOUR_STEPS.forEach((step) => { seen[step.id] = true; });
+    writeTourSeen(seen);
+    hideFeatureTour();
+  }
+
+  function restartFeatureTour() {
+    try { localStorage.removeItem(TOUR_KEY); } catch (_) {}
+    hideFeatureTour();
+    window.setTimeout(scheduleFeatureTour, 190);
+  }
+
+  function positionFeatureTour(card, target) {
+    const margin = 12;
+    const gap = 12;
+    const targetBox = target.getBoundingClientRect();
+    const cardWidth = card.offsetWidth;
+    const cardHeight = card.offsetHeight;
+    const center = targetBox.left + targetBox.width / 2;
+    const left = Math.max(margin, Math.min(window.innerWidth - cardWidth - margin, center - cardWidth / 2));
+    let top = targetBox.top - cardHeight - gap;
+    let side = "top";
+    if (top < margin) {
+      top = Math.min(window.innerHeight - cardHeight - margin, targetBox.bottom + gap);
+      side = "bottom";
+    }
+    card.style.left = Math.round(left) + "px";
+    card.style.top = Math.round(Math.max(margin, top)) + "px";
+    card.style.setProperty("--tour-arrow-x", Math.round(Math.max(18, Math.min(cardWidth - 18, center - left))) + "px");
+    card.dataset.side = side;
+  }
+
+  function showFeatureTour(step, target) {
+    activeTourStepId = step.id;
+    clearTourHighlight();
+    target.classList.add("tour-highlight");
+    target.setAttribute("aria-describedby", "feature-tour");
+    let card = document.getElementById("feature-tour");
+    if (!card) {
+      card = document.createElement("section");
+      card.id = "feature-tour";
+      card.className = "feature-tour";
+      card.setAttribute("role", "dialog");
+      card.setAttribute("aria-live", "polite");
+      card.setAttribute("aria-label", "Bashroom feature guide");
+      document.body.appendChild(card);
+    }
+    card.innerHTML = '<div class="feature-tour-head"><div><div class="feature-tour-kicker">New in Bashroom</div>'
+      + '<h2></h2></div><button class="feature-tour-close" type="button" aria-label="Dismiss tutorial">×</button></div>'
+      + '<p></p><div class="feature-tour-actions"><button class="feature-tour-skip" type="button">Skip tour</button>'
+      + '<button class="feature-tour-next" type="button">Next</button></div>';
+    card.querySelector("h2").textContent = step.title;
+    card.querySelector("p").textContent = step.body;
+    card.querySelector(".feature-tour-close").onclick = dismissFeatureTour;
+    card.querySelector(".feature-tour-skip").onclick = dismissFeatureTour;
+    card.querySelector(".feature-tour-next").onclick = () => markFeatureTourStep(step.id, true);
+    positionFeatureTour(card, target);
+    requestAnimationFrame(() => card.classList.add("open"));
+  }
+
+  function scheduleFeatureTour() {
+    cancelAnimationFrame(tourFrame);
+    tourFrame = requestAnimationFrame(() => {
+      if (!state.token || share) { hideFeatureTour(); return; }
+      const seen = readTourSeen();
+      const step = TOUR_STEPS.find((candidate) => !seen[candidate.id] && tourTarget(candidate));
+      if (!step) { hideFeatureTour(); return; }
+      const target = tourTarget(step);
+      if (target) showFeatureTour(step, target);
+    });
+  }
+
+  async function hydrateOfflineSnapshot() {
+    if (!offline || !state.token || share) return null;
+    try {
+      const snapshot = await offline.readSnapshot(state.token);
+      if (!snapshot) return null;
+      offlineReceipt = snapshot.meta.receipt || null;
+      if (!state.rooms.length && Array.isArray(snapshot.meta.rooms)) state.rooms = snapshot.meta.rooms;
+      if (!state.handle) state.handle = snapshot.meta.handle || "";
+      if (snapshot.meta.trees && typeof snapshot.meta.trees === "object") {
+        for (const [room, metadata] of Object.entries(snapshot.meta.trees)) {
+          if (!trees.has(room) && Array.isArray(metadata)) trees.set(room, metadata);
+        }
+      }
+      for (const row of snapshot.files || []) {
+        if (!row || !row.file) continue;
+        const key = fileKey(row.room, row.path);
+        const current = files.get(key);
+        // A queued plane edit is newer than the last server snapshot and must
+        // win first paint. Otherwise a live in-memory response stays newer.
+        if (!current || row.file.pending_offline) files.set(key, row.file);
+      }
+      persistRoomsCache();
+      persistTreeCache();
+      return snapshot;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function prepareOffline() {
+    if (!offline || offlineBusy || !state.token) return;
+    offlineBusy = true;
+    offlineProgress = null;
+    updateOfflineControls();
+    try {
+      offlineReceipt = await offline.prepare(state.token, (progress) => {
+        offlineProgress = progress;
+        updateOfflineControls();
+      });
+      await hydrateOfflineSnapshot();
+    } catch (error) {
+      showToast("Offline preparation stopped: " + String((error && error.message) || error), "#c96f62");
+    } finally {
+      offlineBusy = false;
+      offlineProgress = null;
+      updateOfflineControls();
+    }
+  }
+
+  async function syncOfflineOutbox() {
+    if (!offline || !state.token || !navigator.onLine || share) return;
+    const result = await offline.syncOutbox(state.token).catch(() => null);
+    if (!result) return;
+    for (const item of result.synced || []) {
+      files.set(fileKey(item.row.room, item.row.path), item.file);
+    }
+    if ((result.conflicts || []).length) {
+      const first = result.conflicts[0];
+      if (first.row.room === state.activeRoom && first.row.path === state.activePath) {
+        conflictTheirs = first.file || null;
+        saveState = "conflict";
+      }
+      showToast("An offline edit conflicts with a newer server copy. Your draft is still local.", "#c96f62");
+    } else if ((result.synced || []).length) {
+      showToast((result.synced.length === 1 ? "1 offline edit" : result.synced.length + " offline edits") + " synced", "#6f9a78");
+    }
+    if ((result.synced || []).length || (result.conflicts || []).length) render();
+  }
+
   function persist() {
     if (share) return; // a capability visit must not hijack the app's boot state
     localStorage.setItem(STATE_KEY, JSON.stringify({ activeRoom: state.activeRoom, activePath: state.activePath }));
@@ -1074,6 +1515,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     // One request returns the rooms list + active room's metadata tree (if any).
     const params = state.activeRoom ? "?active=" + encodeURIComponent(state.activeRoom) : "";
     const data = await api("/web/api/rooms" + params);
+    if (!data || data.ok === false) throw new Error((data && data.error) || "rooms_failed");
     state.rooms = data.rooms || [];
     state.handle = data.handle || "";
     // If the URL named a room the user isn't a member of, drop the stale
@@ -1159,6 +1601,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     const key = fileKey(room, path);
     if (fileInflight.has(key)) return;
     fileInflight.add(key);
+    const before = files.get(key);
     let unchanged = false;
     try {
       const data = await api("/web/api/file?room=" + encodeURIComponent(room) + "&path=" + encodeURIComponent(path) + (share ? "&slug=" + encodeURIComponent(share.slug) : ""));
@@ -1168,8 +1611,15 @@ const WEB_INDEX_HTML = `<!doctype html>
       const prev = files.get(key);
       unchanged = Boolean(prev && !isErrorRecord(prev) && prev.etag === data.file.etag);
       files.set(key, data.file);
+      if (offline) void offline.putFile(state.token, room, path, data.file);
     } catch (e) {
-      files.set(key, { __error: String(e?.message || e) });
+      // A network miss must not replace a proven offline body with an error.
+      // IndexedDB is checked even when this tab has not hydrated it yet (for
+      // example, a deep link opened directly while already on the plane).
+      const cached = offline ? await offline.readFile(state.token, room, path).catch(() => null) : null;
+      if (cached) files.set(key, cached);
+      else if (before && !isErrorRecord(before)) files.set(key, before);
+      else files.set(key, { __error: String(e?.message || e) });
     } finally {
       fileInflight.delete(key);
       // Off-screen fetch: only caches + sidebar metadata changed — a full
@@ -1664,6 +2114,7 @@ const WEB_INDEX_HTML = `<!doctype html>
         s === "dirty" ? "edited…"
         : s === "saving" ? "saving…"
         : s === "saved" ? "saved"
+        : s === "offline" ? "saved offline · syncs when connected"
         : s === "conflict" ? "conflict"
         : s === "error" ? "save failed — ⌘S to retry"
         : "";
@@ -1709,6 +2160,18 @@ const WEB_INDEX_HTML = `<!doctype html>
       if (editDraft !== content) { setSaveState("dirty"); scheduleAutosave(); }
       else setSaveState("saved");
     } catch (e) {
+      // Network failure is not data loss: persist the draft with the exact
+      // version token it was based on. Reconnect replays that CAS; a moved
+      // server head becomes the existing visible conflict flow.
+      if (offline && (!navigator.onLine || e instanceof TypeError)) {
+        try {
+          const localFile = await offline.queueEdit(state.token, { room, path, content, base_etag: base });
+          files.set(fileKey(room, path), localFile);
+          lastSaved = content;
+          setSaveState("offline");
+          return;
+        } catch (_) { /* fall through to the explicit error state */ }
+      }
       setSaveState("error");
     }
   }
@@ -1756,6 +2219,17 @@ const WEB_INDEX_HTML = `<!doctype html>
       // Refresh sidebar metadata (size/updated) for the saved file.
       void fetchTree(room);
     } catch (e) {
+      if (offline && (!navigator.onLine || e instanceof TypeError)) {
+        try {
+          const localFile = await offline.queueEdit(state.token, { room, path, content: editDraft, base_etag: editBaseEtag });
+          files.set(fileKey(room, path), localFile);
+          editing = false;
+          editError = "";
+          destroyCm();
+          render();
+          return;
+        } catch (_) { /* show the ordinary save failure below */ }
+      }
       editError = "Couldn't save: " + String((e && e.message) || e);
     }
     render();
@@ -1825,6 +2299,15 @@ const WEB_INDEX_HTML = `<!doctype html>
           followInternalLink(raw);
         };
       } else {
+        // Same-origin reader route lets the service worker substitute the
+        // archived text on a plane. Without a cached copy (or without a
+        // service worker) the Worker redirects to the original URL.
+        try {
+          const external = new URL(raw, location.href);
+          if (external.protocol === "http:" || external.protocol === "https:") {
+            a.setAttribute("href", "/web/offline?url=" + encodeURIComponent(external.toString()));
+          }
+        } catch (_) {}
         a.setAttribute("target", "_blank");
         a.setAttribute("rel", "noreferrer");
       }
@@ -2151,6 +2634,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   }
 
   function logout() {
+    const tokenToPurge = state.token;
     disconnectPresence();
     [TOKEN_KEY, STATE_KEY, OPEN_KEY, ROOM_OPEN_KEY, TREES_KEY, ROOMS_KEY].forEach(k => localStorage.removeItem(k));
     state.token = ""; state.rooms = []; state.handle = "";
@@ -2158,6 +2642,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     state.opened = new Set(); state.roomsOpened = new Set();
     trees.clear(); files.clear(); treeInflight.clear(); fileInflight.clear();
     resetHistory();
+    offlineReceipt = null;
+    if (offline && tokenToPurge) void offline.purge(tokenToPurge);
     history.replaceState(null, "", "/web"); // drop the deep link on sign-out
     render();
   }
@@ -2212,10 +2698,38 @@ const WEB_INDEX_HTML = `<!doctype html>
       searchError = "";
     } catch (e) {
       if (seq !== searchSeq) return;
-      searchResults = [];
-      searchError = String((e && e.message) || e);
+      // Plane-mode search scans the already-downloaded file bodies. Keep the
+      // server's bounded result shape so the existing result UI and file
+      // navigation need no offline-specific branch.
+      if (offlineReceipt || !navigator.onLine) {
+        searchResults = searchOfflineFiles(q);
+        searchError = "";
+      } else {
+        searchResults = [];
+        searchError = String((e && e.message) || e);
+      }
     }
     renderSidebar();
+  }
+
+  function searchOfflineFiles(q) {
+    const needle = q.toLowerCase();
+    const matches = [];
+    for (const [key, file] of files) {
+      if (!file || isErrorRecord(file) || file.is_binary) continue;
+      const split = key.indexOf("\\0");
+      if (split === -1) continue;
+      const room = key.slice(0, split);
+      const path = key.slice(split + 1);
+      const lines = String(file.content || "").split("\\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        if (lines[index].toLowerCase().includes(needle)) {
+          matches.push({ room, path, line: index + 1, preview: lines[index].trim().slice(0, 240) });
+          if (matches.length >= 40) return matches;
+        }
+      }
+    }
+    return matches;
   }
 
   // Filename hits — instant, straight from the cached trees. The Cursor
@@ -3439,6 +3953,7 @@ const WEB_INDEX_HTML = `<!doctype html>
           <a class="brand-repo" href="https://github.com/sdan/bashroom" target="_blank" rel="noreferrer" aria-label="sdan/bashroom on GitHub" data-tip="sdan/bashroom on GitHub">
             <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.36c-2.22.48-2.69-1.07-2.69-1.07-.36-.93-.89-1.18-.89-1.18-.73-.5.06-.49.06-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.88 2.34.67.07-.52.28-.88.51-1.08-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.13 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.11.16 1.93.08 2.13.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.19c0 .21.15.46.55.38A8 8 0 0 0 8 0z"/></svg>
           </a>
+          <button class="tour-replay" id="tour-replay" data-tip="Show feature guide" aria-label="Show feature guide" type="button">?</button>
           <button class="theme-toggle" id="theme-toggle" data-tip="Toggle theme" aria-label="Toggle theme" type="button">
             <svg class="ic-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 9.5A5.5 5.5 0 1 1 6.5 3a4.5 4.5 0 0 0 6.5 6.5z"/></svg>
             <svg class="ic-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"/></svg>
@@ -3448,7 +3963,19 @@ const WEB_INDEX_HTML = `<!doctype html>
         <div id="sections">\${sidebarSectionsHtml()}</div>
         <div class="footer">
           <span class="handle">\${state.handle ? '@' + state.handle : ''}</span>
+          <span class="offline-actions">
+            <button class="offline-action\${offlineReceipt ? " ready" : ""}" id="offline-sync" type="button" title="Download every room, linked page, and PDF for offline use">\${offlineButtonLabel()}</button>
+            <button class="offline-action" id="offline-export" type="button" title="Export one printable HTML archive"\${offlineReceipt ? "" : " hidden"}>Export</button>
+            <button class="offline-action" id="offline-install" type="button" title="Install Bashroom on this device"\${installIsAvailable() ? "" : " hidden"}>Install</button>
+          </span>
           <span class="logout" id="logout">Sign out</span>
+          <div class="offline-progress" id="offline-progress" hidden>
+            <span class="offline-progress-label" id="offline-progress-label">Planning your offline library</span>
+            <span class="offline-progress-count" id="offline-progress-count">Discovering…</span>
+            <span class="offline-progress-track" id="offline-progress-track" role="progressbar" aria-label="Preparing Bashroom for offline use">
+              <span class="offline-progress-fill"></span>
+            </span>
+          </div>
         </div>
       </aside>
       \${documentHeader}
@@ -3497,12 +4024,35 @@ const WEB_INDEX_HTML = `<!doctype html>
       }
     }
     const lo = document.getElementById("logout"); if (lo) lo.onclick = logout;
+    const offlineSync = document.getElementById("offline-sync");
+    if (offlineSync) offlineSync.onclick = () => {
+      markFeatureTourStep("offline-sync", false);
+      void prepareOffline();
+    };
+    const offlineExport = document.getElementById("offline-export");
+    if (offlineExport) offlineExport.onclick = () => {
+      markFeatureTourStep("offline-export", false);
+      if (offline) void offline.exportHtml(state.token).catch(error => {
+        showToast("Export failed: " + String((error && error.message) || error), "#c96f62");
+      });
+    };
+    const offlineInstall = document.getElementById("offline-install");
+    if (offlineInstall) offlineInstall.onclick = () => {
+      markFeatureTourStep("offline-install", false);
+      void installBashroom();
+    };
+    const tourReplay = document.getElementById("tour-replay");
+    if (tourReplay) tourReplay.onclick = restartFeatureTour;
+    updateOfflineControls();
     // Search input: value lives in searchQuery (never baked into the HTML),
     // so background re-renders can't eat keystrokes. Esc clears and blurs.
     const si = document.getElementById("room-search");
     if (si) {
       si.value = searchQuery;
       si.oninput = () => setSearchQuery(si.value);
+      si.addEventListener("focus", () => {
+        if (activeTourStepId === "offline-search") markFeatureTourStep("offline-search", false);
+      });
       si.onkeydown = (e) => {
         if (e.key === "Escape") { e.preventDefault(); si.value = ""; setSearchQuery(""); si.blur(); }
       };
@@ -3863,36 +4413,50 @@ const WEB_INDEX_HTML = `<!doctype html>
     render();
   });
 
-  // Boot: paint the whole shell from cache immediately (rooms list + trees +
-  // the deep-linked file's fetch kicked off), then loadRooms revalidates.
-  // A revoked token still lands on login — api()'s 401 handler clears it.
-  if (share) {
-    // Capability boot: one document, no rooms list, no cache hydration.
-    // The worker inlines small documents into the grant — seed the file
-    // cache from it so first paint needs no API round-trip (background
-    // revalidation still runs). Editing needs a signed-in identity, so no
-    // token still lands on login.
-    if (share.file && share.file.path) files.set(fileKey(state.activeRoom, state.activePath), share.file);
-    if (state.token) { ensureActiveFile(); connectPresence(state.activeRoom); }
-    render();
-  } else if (state.token && RETURN_TO) {
-    location.replace(RETURN_TO);
-  } else if (state.token) {
-    hydrateFromCache();
-    if (state.rooms.length) { ensureActiveFile(); connectPresence(state.activeRoom); }
-    // Paint the shell unconditionally — a first visit (nothing cached) used
-    // to stare at a blank white #app for the whole rooms round-trip.
-    roomsLoading = !state.rooms.length;
-    render();
-    loadRooms().catch(() => { roomsLoading = false; render(); });
-  } else {
-    render();
+  // Boot from the durable IndexedDB snapshot before the first render. The
+  // async read is local and bounded; waiting for it prevents the misleading
+  // empty shell flash that would otherwise appear on a cold offline launch.
+  async function boot() {
+    if (share) {
+      // Capability boot: one document, no rooms list, no cache hydration.
+      if (share.file && share.file.path) files.set(fileKey(state.activeRoom, state.activePath), share.file);
+      if (state.token) { ensureActiveFile(); connectPresence(state.activeRoom); }
+      render();
+    } else if (state.token && RETURN_TO) {
+      location.replace(RETURN_TO);
+      return;
+    } else if (state.token) {
+      hydrateFromCache();
+      await hydrateOfflineSnapshot();
+      if (state.rooms.length) { ensureActiveFile(); connectPresence(state.activeRoom); }
+      roomsLoading = !state.rooms.length;
+      render();
+      loadRooms().catch(() => { roomsLoading = false; render(); });
+      if (navigator.onLine) setTimeout(() => { void syncOfflineOutbox(); }, 0);
+    } else {
+      render();
+    }
+    // Warm the editor graph while online. Prepare-for-flight separately walks
+    // and caches the complete ESM dependency graph for a cold offline boot.
+    if (state.token || share) setTimeout(() => { loadCm().catch(() => {}); }, 0);
   }
-  // Warm the editor graph at boot: modulepreload only fetches esm.sh's
-  // ~200-byte redirect shims, not the real React/CodeMirror payload — the
-  // heavy fetches otherwise start at first mount. Swallowed catch: a CDN
-  // blip here must not reject unhandled; mountCm handles its own failure.
-  if (state.token || share) setTimeout(() => { loadCm().catch(() => {}); }, 0);
+  void boot();
+  window.addEventListener("online", () => { updateOfflineControls(); void syncOfflineOutbox(); });
+  window.addEventListener("offline", updateOfflineControls);
+  window.addEventListener("resize", () => { if (activeTourStepId) scheduleFeatureTour(); });
+  window.addEventListener("scroll", () => { if (activeTourStepId) scheduleFeatureTour(); }, true);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && activeTourStepId) dismissFeatureTour();
+  });
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    installPromptEvent = event;
+    updateOfflineControls();
+  });
+  window.addEventListener("appinstalled", () => {
+    installPromptEvent = null;
+    updateOfflineControls();
+  });
   // Relative times in presence pills drift; refresh them on a slow tick.
   setInterval(renderPresence, 60000);
 })();

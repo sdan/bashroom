@@ -42,6 +42,12 @@
       "bucket_name": "bashroom-rooms"
     }
   ],
+  // Browser Run Quick Actions turn outbound reading-list URLs into searchable
+  // Markdown plus device-local PDFs during an explicit prepare-for-flight
+  // sync. No API token secret: the binding authenticates in-platform.
+  "browser": {
+    "binding": "BROWSER"
+  },
   "migrations": [
     {
       "tag": "v1",

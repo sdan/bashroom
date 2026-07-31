@@ -19,7 +19,9 @@ real Linux shell. The product stays deliberately narrow:
 
 Bashroom is not a git host or a general offline-first filesystem. Room
 activity `history` remains an audit feed; file recovery is the separate,
-page-scoped RoomText checkpoint contract below.
+page-scoped RoomText checkpoint contract below. The web app is offline-capable
+through an explicit, receipt-backed device snapshot; RoomHub remains the
+online write authority.
 
 ## End-to-end shape
 
@@ -223,6 +225,78 @@ preconditions.
 Outbound network is denied except for `bashroom.internal`, the identity-bound
 control channel used by the visible sandbox helper.
 
+## Plane mode
+
+Plane mode has three deliberately separate layers:
+
+```text
+public app shell + pinned CDN graph     -> Service Worker Cache Storage
+private rooms/files/links/edit outbox   -> account-scoped IndexedDB
+printable disaster-recovery copy        -> one downloaded standalone HTML file
+```
+
+The user starts a prepare-for-flight sync from the web sidebar. It:
+
+1. Requests persistent browser storage when the browser supports it.
+2. Caches `/web`, the manifest, the offline helper, and the complete imported
+   ESM dependency graph. Authenticated `/web/api/*` responses are never put in
+   Cache Storage.
+3. Lists every authorized room and downloads every file. Text bodies and
+   binary blobs are kept under a SHA-256-derived account scope in IndexedDB.
+4. Treats every external HTTP(S) document link as a depth-zero seed in a
+   provenance graph. File-to-page and page-to-page edges retain why each URL
+   exists in the archive.
+5. Walks two breadth-first, same-origin discovery levels with a 500-page
+   default budget and three page workers. Direct Bashroom links are never
+   dropped by that budget. Tracking parameters and obvious image/media/bundle
+   assets are excluded; graph truncation is explicit.
+6. Uses the `BROWSER` Browser Run binding to produce searchable Markdown and
+   an A4 PDF in parallel for each scheduled page. Rate limits and transient
+   failures receive bounded retry/backoff; each derivative can succeed alone.
+7. Writes a literal receipt: preparation time, storage-persistence result,
+   room/file/page/PDF counts, graph nodes/edges/depth/cap, approximate Browser
+   Run time, storage usage/quota, shell-cache errors, and individual misses.
+
+The preparation UI does not invent a total before discovery finishes. It begins
+with an indeterminate **Planning your offline library** track, becomes
+determinate while room and file totals are known, and returns to an
+indeterminate linked-page track because every rendered page can reveal more
+same-origin children. The action label remains stable as **Preparing…** while
+phase-specific counts live beside the progress track.
+
+External Markdown links are rewritten to `/web/offline?url=...`. Online, the
+Worker redirects to the original URL. Offline, the service worker serves the
+locally archived Markdown through pinned Marked + DOMPurify, rewrites child
+links back through the graph, and exposes `/web/offline/pdf?url=...` when the
+page has a PDF Blob. Publisher scripts, forms, media, and remote images never
+run inside this reader. This cannot bypass a publisher's bot controls; missed
+or rejected pages stay visible in the receipt.
+
+The PWA manifest, square mask-safe icons, Apple mobile metadata, and root-scope
+service worker make `/web` installable. Chrome/Android uses the native install
+prompt. Safari/iOS uses Share -> Add to Home Screen. Installation is only the
+shell; a receipt-backed preparation run is still required before flight.
+
+The first-run offline feature guide is a non-modal, progressively disclosed
+coachmark in the private web app. It targets only controls that currently
+exist, stores dismissed step ids in the versioned local-only
+`bashroom.feature-tour.offline-v1` key, and can be reset from the persistent
+`?` control. Tutorial state is presentation state: it never enters RoomText,
+R2, the offline snapshot, or account APIs.
+
+The browser editor continues to use whole-file CAS. A network failure queues
+`(room, path, content, base_etag)` locally. Reconnect replays that exact
+precondition through `/web/api/file`; a moved server head stays queued and
+enters the normal visible conflict flow. Plane mode never performs an implicit
+merge or last-write-wins overwrite.
+
+The standalone HTML export includes all cached text files and successfully
+archived linked-page Markdown. It opens without Bashroom and can be printed as
+one PDF. Individual publisher-layout PDFs remain device-local IndexedDB Blobs
+and are opened through the installed app.
+Signing out purges the current account's private IndexedDB snapshot and outbox;
+the public app-shell cache may remain.
+
 ## Component ownership
 
 | Component | Owns | Must not own |
@@ -258,6 +332,9 @@ Bashroom identity. All RoomHub socket output is filtered by the link prefix.
   silent winner.
 - Keep destructive room deletion outside model-facing MCP.
 - Treat Markdown, paths, WebSocket frames, and commands as untrusted.
+- Never cache bearer-authenticated API responses in the service-worker cache.
+- Never archive local/private-network or credential-bearing URLs with Browser Run.
+- Never replay an offline edit without its original authoritative version token.
 
 ## Build and verification
 
@@ -286,3 +363,16 @@ R2 divergence.
 - Ranged reads use byte offsets; page at UTF-8 boundaries.
 - Version history is bounded to the newest 100 checkpoints per response; the
   current UI has no deep pagination or named versions.
+- Activity history is not version restore.
+- Plane mode's binding-only crawler is intentionally bounded to depth two,
+  same-origin descendants, 500 discovered pages beyond any larger direct-seed
+  set, 5,000 graph nodes, and 20,000 graph edges. The receipt reports every
+  cap. Cloudflare's larger asynchronous `/crawl` product is REST-only and would
+  require a separate account API secret and durable job ingestion path.
+- Browser Run respects publisher blocks and may miss paywalled, authenticated,
+  bot-protected, or otherwise inaccessible pages; the receipt reports misses.
+- Storage persistence is browser-controlled. The exported standalone HTML file
+  is the durable fallback if the browser later evicts site data.
+- Binary files are downloaded into the offline snapshot but the current web UI
+  still directs ordinary binary inspection to the shell. Linked-page PDFs are
+  the one binary type exposed directly by the offline reader.

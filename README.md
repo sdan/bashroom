@@ -166,6 +166,45 @@ spacing. Use Preview in the private editor to render these richer blocks.
 
 Two panes, Notion-shape: sidebar plus content. Single inline HTML served from the worker — no build, no framework.
 
+### Offline / plane mode
+
+Click **Offline** in the web sidebar before departure. Bashroom downloads the
+app, every authorized room file, and every directly referenced external page.
+It then follows two same-site link levels breadth-first, up to 500 pages beyond
+any larger direct reading list. Each page is stored as searchable Markdown and,
+when Browser Run succeeds, an A4 PDF. The button becomes **Offline ready** only
+after the run produces a receipt; its tooltip shows files, pages, PDFs, misses,
+and whether the graph hit a cap. Offline search and reading use this snapshot.
+Preparation first shows an indeterminate planning track while Bashroom discovers
+the workload, then a determinate bar for known room/file totals. Linked-page
+capture returns to discovery motion because rendered pages can reveal more links.
+
+Install Bashroom on a phone with the **Install** action. Chrome/Android opens
+the native install prompt; on iPhone/iPad it explains Safari's Share -> Add to
+Home Screen flow. Launching the icon works offline after preparation. Links
+inside archived pages stay inside the local graph, and **Open PDF** serves the
+device-local PDF without a network request.
+
+On the first signed-in visit, a short feature guide points to **Offline**,
+offline search, **Install**, and **Export** as each control becomes available.
+Every tip can be dismissed. Use the **?** button beside the theme control to
+replay the guide at any time; its completion state stays only on that device.
+
+Edits made without a network are stored on the device with the file version
+they were based on. They sync after reconnect; if the server copy moved,
+Bashroom preserves the draft and shows a conflict instead of overwriting.
+
+Click **Export** for one standalone HTML archive of all cached text and linked
+page Markdown. It can be opened independently or printed as one PDF. Individual
+publisher-layout PDFs remain in the installed app because embedding hundreds
+of PDFs into one HTML file would duplicate storage. Browser storage can still
+be cleared by the browser or user, so the standalone export remains the durable
+text fallback.
+
+The recursive walk stays on each seed's origin, ignores obvious asset links,
+and has explicit depth/page/node/edge limits. It is a prepared reading library,
+not an unbounded mirror of the public web.
+
 `bashroom history` is an activity log for shell commands and direct web/MCP
 writes. It is not file version history and cannot restore deleted content.
 

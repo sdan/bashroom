@@ -12,6 +12,8 @@ import skillMarkdown from "../skills/bashroom/SKILL.md";
 // social card points at this PNG; /og.svg stays for in-app/landing use.
 // Re-render after editing ogSvg(): `npm run og` (rsvg-convert → assets/og.png).
 import ogPng from "../assets/og.png";
+import appIcon192Png from "../assets/app-icon-192.png";
+import appIcon512Png from "../assets/app-icon-512.png";
 import { ogSvg } from "./og";
 import { webIndexHtml } from "./web-ui";
 import { webLandingHtml } from "./web-landing";
@@ -19,6 +21,13 @@ import { webDeviceHtml, webDeviceResultHtml } from "./web-device";
 import { decodeWriteContent, isSafeOAuthRedirectUri, type WriteEncoding } from "./security";
 import { DocumentCollab, parseShareRole, type ShareRole } from "./document-collab";
 import { webCollaborativeShareHtml } from "./web-collab";
+import {
+  normalizeOfflineHttpUrl,
+  WEB_OFFLINE_CLIENT_JS,
+  WEB_OFFLINE_MANIFEST,
+  WEB_OFFLINE_READER_JS,
+  WEB_OFFLINE_SERVICE_WORKER_JS,
+} from "./web-offline";
 import {
   RoomHubText,
   ROOM_TEXT_INBOUND_FRAME_MAX_CHARS,
@@ -45,7 +54,13 @@ export { DocumentCollab };
 // Wrangler generates every binding from wrangler.jsonc. ROOM_TEXT_MODE is
 // widened because the same artifact intentionally deploys through
 // off -> freeze -> on during the authority handoff.
-type Env = Omit<CloudflareEnv, "ROOM_TEXT_MODE"> & { ROOM_TEXT_MODE?: string };
+type Env = Omit<CloudflareEnv, "ROOM_TEXT_MODE" | "BROWSER"> & {
+  ROOM_TEXT_MODE?: string;
+  // Browser Run's binding is used only by the authenticated offline-archive
+  // endpoint. Optional keeps unit-test env stubs honest: missing infrastructure
+  // returns an explicit capability error instead of an isolate exception.
+  BROWSER?: BrowserRun;
+};
 
 // Sandbox subclass — wrangler.jsonc declares class_name: "Sandbox" and
 // the container image. We only need to extend SandboxBase and set the
@@ -2403,6 +2418,56 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       return json({ ok: true, user_id: userId, message: "sandbox destroyed; next request boots fresh" });
     }
 
+    // Plane-mode resources are same-origin and deliberately separate from the
+    // authenticated API cache. The service worker stores only this public app
+    // shell; private room/file bodies live in account-scoped IndexedDB.
+    if (url.pathname === "/sw.js" && request.method === "GET") {
+      return new Response(WEB_OFFLINE_SERVICE_WORKER_JS, {
+        headers: {
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "no-cache",
+          "service-worker-allowed": "/",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    }
+    if (url.pathname === "/web-offline.js" && request.method === "GET") {
+      return new Response(WEB_OFFLINE_CLIENT_JS, {
+        headers: {
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "no-cache",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    }
+    if (url.pathname === "/web-offline-reader.js" && request.method === "GET") {
+      return new Response(WEB_OFFLINE_READER_JS, {
+        headers: {
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "no-cache",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    }
+    if (url.pathname === "/manifest.webmanifest" && request.method === "GET") {
+      return new Response(WEB_OFFLINE_MANIFEST, {
+        headers: { "content-type": "application/manifest+json; charset=utf-8", "cache-control": "public, max-age=3600" },
+      });
+    }
+    if ((url.pathname === "/app-icon-192.png" || url.pathname === "/app-icon-512.png") && request.method === "GET") {
+      return new Response(url.pathname === "/app-icon-192.png" ? appIcon192Png : appIcon512Png, {
+        headers: { "content-type": "image/png", "cache-control": "public, max-age=31536000, immutable" },
+      });
+    }
+    // Online fallback for rewritten outbound links. An active service worker
+    // serves the archived text from IndexedDB first; a browser without that
+    // archive lands on the original page normally.
+    if ((url.pathname === "/web/offline" || url.pathname === "/web/offline/pdf") && request.method === "GET") {
+      const target = normalizeOfflineHttpUrl(url.searchParams.get("url"));
+      if (!target) return text("Invalid offline link.", 400);
+      return new Response(null, { status: 302, headers: { location: target, "referrer-policy": "no-referrer" } });
+    }
+
     if (url.pathname === "/web" || url.pathname === "/web/") return html(webIndexHtml());
 
     // Presence WebSocket for the web reader. Auth happens HERE (token rides
@@ -2485,6 +2550,112 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       const rooms = Array.isArray(account.rooms) ? account.rooms as Array<{ room: string }> : [];
       if (!userId || !rooms.some((row) => row.room === room)) return json({ ok: false, error: "forbidden" }, 403);
       return json({ ok: true, files: await r2Tree(env, userId, room) });
+    }
+
+    // One direct linked-page archive. The browser's prepare-for-flight job
+    // extracts URLs from authoritative Markdown, calls this endpoint with a
+    // bounded concurrency, and persists the returned text locally. Browser
+    // Run is a rendering helper here, never a second Bashroom file authority.
+    if (url.pathname === "/web/api/offline/render" && request.method === "POST") {
+      const account = await authorizeAccount(env, bearerToken(request), clientIp(request), {
+        route: "web.offline.render",
+      });
+      if (!account.ok) return json({ ok: false, error: account.error || "unauthorized" }, 401);
+      if (!env.BROWSER) return json({ ok: false, error: "browser_run_not_configured" }, 503);
+      const input = await readJson(request);
+      const target = normalizeOfflineHttpUrl(input.url);
+      if (!target) return json({ ok: false, error: "invalid_url" }, 400);
+      if (new URL(target).origin === url.origin) return json({ ok: false, error: "same_origin_url" }, 400);
+      let rendered: Response;
+      try {
+        rendered = await env.BROWSER.quickAction("markdown", {
+          url: target,
+          gotoOptions: { waitUntil: "domcontentloaded", timeout: 30_000 },
+          actionTimeout: 30_000,
+          rejectResourceTypes: ["image", "media", "font"],
+        });
+      } catch (error) {
+        return json({ ok: false, error: "browser_run_failed", message: error instanceof Error ? error.message : String(error) }, 502);
+      }
+      const payload = await rendered.json().catch(() => null) as BrowserRunMarkdownSuccessResponse | BrowserRunErrorResponse | null;
+      if (!rendered.ok || !payload || payload.success !== true || typeof payload.result !== "string") {
+        const message = payload && payload.success === false
+          ? payload.errors.map((entry) => entry.message).filter(Boolean).join("; ").slice(0, 500)
+          : `Browser Run returned HTTP ${rendered.status}`;
+        const status = rendered.status === 429 ? 429 : 502;
+        const retryAfter = rendered.headers.get("retry-after");
+        return json(
+          { ok: false, error: rendered.status === 429 ? "browser_run_rate_limited" : "browser_run_failed", message },
+          status,
+          retryAfter ? { "retry-after": retryAfter } : undefined,
+        );
+      }
+      const maxChars = 2_000_000;
+      const markdown = payload.result.slice(0, maxChars);
+      const heading = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim().slice(0, 300) || new URL(target).hostname;
+      return json({
+        ok: true,
+        url: target,
+        title: heading,
+        markdown,
+        truncated: payload.result.length > maxChars,
+        browser_ms_used: Number(rendered.headers.get("x-browser-ms-used") || 0),
+      });
+    }
+
+    // PDF is a parallel derivative of the same validated public URL. It is
+    // streamed directly to the authenticated device and persisted as a Blob
+    // in IndexedDB; Bashroom's server does not retain publisher content.
+    if (url.pathname === "/web/api/offline/pdf" && request.method === "POST") {
+      const account = await authorizeAccount(env, bearerToken(request), clientIp(request), {
+        route: "web.offline.pdf",
+      });
+      if (!account.ok) return json({ ok: false, error: account.error || "unauthorized" }, 401);
+      if (!env.BROWSER) return json({ ok: false, error: "browser_run_not_configured" }, 503);
+      const input = await readJson(request);
+      const target = normalizeOfflineHttpUrl(input.url);
+      if (!target) return json({ ok: false, error: "invalid_url" }, 400);
+      if (new URL(target).origin === url.origin) return json({ ok: false, error: "same_origin_url" }, 400);
+      let rendered: Response;
+      try {
+        rendered = await env.BROWSER.quickAction("pdf", {
+          url: target,
+          gotoOptions: { waitUntil: "networkidle2", timeout: 45_000 },
+          actionTimeout: 45_000,
+          rejectResourceTypes: ["media", "font"],
+          pdfOptions: {
+            format: "a4",
+            printBackground: true,
+            tagged: true,
+            outline: true,
+            margin: { top: "16mm", right: "14mm", bottom: "18mm", left: "14mm" },
+          },
+        });
+      } catch (error) {
+        return json({ ok: false, error: "browser_run_failed", message: error instanceof Error ? error.message : String(error) }, 502);
+      }
+      if (!rendered.ok || !(rendered.headers.get("content-type") || "").includes("application/pdf")) {
+        const payload = await rendered.json().catch(() => null) as BrowserRunErrorResponse | null;
+        const message = payload && payload.success === false
+          ? payload.errors.map((entry) => entry.message).filter(Boolean).join("; ").slice(0, 500)
+          : `Browser Run returned HTTP ${rendered.status}`;
+        const status = rendered.status === 429 ? 429 : 502;
+        const retryAfter = rendered.headers.get("retry-after");
+        return json(
+          { ok: false, error: rendered.status === 429 ? "browser_run_rate_limited" : "browser_run_failed", message },
+          status,
+          retryAfter ? { "retry-after": retryAfter } : undefined,
+        );
+      }
+      const headers = new Headers({
+        "content-type": "application/pdf",
+        "cache-control": "private, no-store",
+        "x-content-type-options": "nosniff",
+        "x-browser-ms-used": rendered.headers.get("x-browser-ms-used") || "0",
+      });
+      const contentLength = rendered.headers.get("content-length");
+      if (contentLength) headers.set("content-length", contentLength);
+      return new Response(rendered.body, { status: 200, headers });
     }
 
     // Cross-room content search for the web reader. One account authorization,
