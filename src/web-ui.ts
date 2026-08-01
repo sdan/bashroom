@@ -23,7 +23,7 @@ const WEB_INDEX_HTML = `<!doctype html>
 <meta name="color-scheme" content="light dark" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Bashroom</title>
-<link rel="manifest" href="/manifest.webmanifest?v=2" />
+<link rel="manifest" href="/manifest.webmanifest?v=3" />
 <meta name="theme-color" content="#37352f" />
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -1247,7 +1247,7 @@ const WEB_INDEX_HTML = `<!doctype html>
 </head>
 <body>
   <div id="app"></div>
-<script src="/web-offline.js?v=2"></script>
+<script src="/web-offline.js?v=3"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@13.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
 <script>
@@ -1257,7 +1257,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   const OPEN_KEY = "bashroom.opened";
   const ROOM_OPEN_KEY = "bashroom.rooms-opened";
   const TOUR_KEY = "bashroom.feature-tour.offline-v1";
-  const OFFLINE_GENERATION = "2";
+  const OFFLINE_GENERATION = "3";
   const TOUR_STEPS = [
     {
       id: "offline-sync",
@@ -1502,6 +1502,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (code.includes("service_worker")) return "The offline worker did not start. Reload Bashroom and try again.";
     if (code.includes("preparation_already_running")) return "Another Bashroom window is preparing offline. Stop it there or close it, then retry.";
     if (code.includes("offline_db")) return "Offline storage is busy. Close other Bashroom windows and retry.";
+    if (code.includes("shell_cache_failed")) return "Bashroom couldn’t download all the app files needed offline. Check your connection and retry.";
     if (code.includes("timeout")) return "A download took too long. Check your connection and retry.";
     return "Bashroom could not finish saving this device. Retry in a moment.";
   }
@@ -1804,10 +1805,10 @@ const WEB_INDEX_HTML = `<!doctype html>
         showToast("Offline preparation stopped.");
       }
       else {
-        console.warn("Offline preparation stopped", error);
+        console.warn("Offline preparation failed", error);
         offlineFailureCode = String((error && (error.code || error.message)) || error || "offline_preparation_failed");
         offlineFailure = offlineFailureMessage(error);
-        showToast("Offline preparation stopped: " + offlineFailure, "#c96f62");
+        showToast("Offline preparation failed: " + offlineFailure, "#c96f62");
       }
     } finally {
       offlineBusy = false;

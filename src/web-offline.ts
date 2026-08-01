@@ -8,7 +8,7 @@ export const WEB_OFFLINE_DB_NAME = "bashroom-offline-v1";
 export const WEB_OFFLINE_CACHE_PREFIX = "bashroom-shell-";
 // Bump the cache generation whenever the shell/offline helper contract changes.
 // Installed PWAs may otherwise keep an old cache-first helper indefinitely.
-export const WEB_OFFLINE_GENERATION = "2";
+export const WEB_OFFLINE_GENERATION = "3";
 export const WEB_OFFLINE_CACHE_NAME = `${WEB_OFFLINE_CACHE_PREFIX}v${WEB_OFFLINE_GENERATION}`;
 export const WEB_OFFLINE_TIMEOUTS = Object.freeze({
   storageMs: 5_000,
@@ -116,9 +116,10 @@ export const WEB_OFFLINE_CLIENT_JS = String.raw`
   var CRAWL_POLICY = ${JSON.stringify(WEB_OFFLINE_CRAWL_POLICY)};
   var TIMEOUTS = ${JSON.stringify(WEB_OFFLINE_TIMEOUTS)};
 
-  function codedError(code) {
+  function codedError(code, diagnostics) {
     var error = new Error(code);
     error.code = code;
+    if (diagnostics && typeof diagnostics === "object") error.diagnostics = diagnostics;
     return error;
   }
 
@@ -535,7 +536,15 @@ export const WEB_OFFLINE_CLIENT_JS = String.raw`
     // instead of briefly claiming the whole operation is a misleading 0/1.
     report(onProgress, "planning", 0, 0, "Caching the app and finding your rooms");
     var shell = await shellPrepare(signal);
-    if (!shell || shell.ok !== true) throw codedError(String((shell && shell.error) || "shell_cache_failed"));
+    if (!shell || shell.ok !== true) {
+      throw codedError(String((shell && shell.error) || "shell_cache_failed"), {
+        phase: "shell",
+        cached: Number(shell && shell.cached || 0),
+        attempted: Number(shell && shell.attempted || 0),
+        failed: Number(shell && shell.failed || 0),
+        failures: shell && Array.isArray(shell.errors) ? shell.errors.slice(0, 8) : [],
+      });
+    }
 
     var roomsData = await jsonFetch("/web/api/rooms", token, undefined, signal);
     var rooms = Array.isArray(roomsData.rooms) ? roomsData.rooms : [];
@@ -1064,7 +1073,14 @@ function moduleSpecifiers(source, base) {
     var match;
     while ((match = pattern.exec(source))) {
       try {
-        var url = new URL(match[1], base);
+        var specifier = String(match[1] || "");
+        // These CDN bundles have no import map. Bare strings cannot resolve as
+        // browser modules, and accepting them makes words such as "@import"
+        // inside minified data look like dependencies.
+        var urlLike = specifier.startsWith("/") || specifier.startsWith("./") ||
+          specifier.startsWith("../") || specifier.startsWith("https://");
+        if (!urlLike) continue;
+        var url = new URL(specifier, base);
         if (url.protocol === "https:" && STATIC_HOSTS.has(url.hostname)) urls.push(url.toString());
       } catch (_) {}
     }
@@ -1077,6 +1093,7 @@ async function cacheGraph(seedUrls) {
   var queue = seedUrls.slice();
   var seen = new Set();
   var cached = 0;
+  var failed = 0;
   var errors = [];
   while (queue.length) {
     var raw = queue.shift();
@@ -1098,10 +1115,19 @@ async function cacheGraph(seedUrls) {
         }
       });
     } catch (error) {
-      errors.push({ url: absolute, error: String((error && error.message) || error) });
+      failed += 1;
+      if (errors.length < 8) errors.push({ url: absolute, error: String((error && error.message) || error) });
     }
   }
-  return { ok: errors.length === 0, cached: cached, errors: errors, cache_generation: CACHE_GENERATION };
+  return {
+    ok: failed === 0,
+    error: failed ? "shell_cache_failed" : "",
+    cached: cached,
+    attempted: seen.size,
+    failed: failed,
+    errors: errors,
+    cache_generation: CACHE_GENERATION
+  };
 }
 
 function prepareShellGraph() {
@@ -1157,7 +1183,15 @@ self.addEventListener("message", function (event) {
     if (receipt.ok) await deletePreviousShells();
     if (port) port.postMessage(receipt);
   }).catch(function (error) {
-    if (port) port.postMessage({ ok: false, error: String((error && error.message) || error) });
+    if (port) port.postMessage({
+      ok: false,
+      error: "shell_cache_failed",
+      cached: 0,
+      attempted: 0,
+      failed: 1,
+      errors: [{ url: "", error: String((error && error.message) || error) }],
+      cache_generation: CACHE_GENERATION
+    });
   }));
 });
 

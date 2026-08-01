@@ -106,9 +106,9 @@ describe("offline browser resources", () => {
   });
 
   it("refreshes installed-app helpers instead of pinning the first cached copy", () => {
-    expect(WEB_OFFLINE_GENERATION).toBe("2");
-    expect(WEB_OFFLINE_CACHE_NAME).toBe("bashroom-shell-v2");
-    expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('"/web-offline.js?v=2"');
+    expect(WEB_OFFLINE_GENERATION).toBe("3");
+    expect(WEB_OFFLINE_CACHE_NAME).toBe("bashroom-shell-v3");
+    expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('"/web-offline.js?v=3"');
     expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('var refreshable = url.origin === self.location.origin');
     expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('if (!fresh.ok) throw new Error("http_" + fresh.status)');
   });
@@ -127,6 +127,34 @@ describe("offline browser resources", () => {
     expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('var shellPreparation = null');
     expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('if (receipt.ok) await deletePreviousShells()');
     expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('matchPreviousShell(request)');
+  });
+
+  it("only follows URL-like module specifiers outside the CDN entry points", () => {
+    const start = WEB_OFFLINE_SERVICE_WORKER_JS.indexOf("function moduleSpecifiers");
+    const end = WEB_OFFLINE_SERVICE_WORKER_JS.indexOf("\n\nasync function cacheGraph", start);
+    const source = WEB_OFFLINE_SERVICE_WORKER_JS.slice(start, end);
+    const moduleSpecifiers = new Function(
+      "STATIC_HOSTS",
+      source + "; return moduleSpecifiers;",
+    )(new Set(["cdn.jsdelivr.net", "esm.sh"])) as (source: string, base: string) => string[];
+
+    const discovered = moduleSpecifiers(
+      'var words = "@import"; var template = \'import {${names}} from "${module}"\'; import "./real.mjs"; export * from "/shared.mjs";',
+      "https://cdn.jsdelivr.net/npm/example/dist/index.mjs",
+    );
+
+    expect(discovered).toEqual([
+      "https://cdn.jsdelivr.net/npm/example/dist/real.mjs",
+      "https://cdn.jsdelivr.net/shared.mjs",
+    ]);
+  });
+
+  it("returns a bounded, generation-stamped shell failure receipt", () => {
+    expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('error: failed ? "shell_cache_failed" : ""');
+    expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain("attempted: seen.size");
+    expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain("if (errors.length < 8)");
+    expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain('error: "shell_cache_failed"');
+    expect(WEB_OFFLINE_SERVICE_WORKER_JS).toContain("cache_generation: CACHE_GENERATION");
   });
 
   it("invalidates interrupted and legacy snapshots and serializes writers", () => {
@@ -181,6 +209,37 @@ describe("offline preparation failure lifecycle", () => {
     await expect(offline.prepare("br_user_test", undefined, { signal: controller.signal })).rejects.toMatchObject({
       name: "AbortError",
       code: "preparation_stopped",
+    });
+  });
+
+  it("preserves bounded shell diagnostics from the active worker", async () => {
+    const activeWorker = {
+      postMessage: (_message: unknown, ports: MessagePort[]) => ports[0].postMessage({
+        ok: false,
+        error: "shell_cache_failed",
+        cached: 187,
+        attempted: 195,
+        failed: 8,
+        errors: [{ url: "https://cdn.jsdelivr.net/bogus", error: "http_404" }],
+        cache_generation: WEB_OFFLINE_GENERATION,
+      }),
+    };
+    const offline = loadFastOfflineClient({
+      navigator: {
+        serviceWorker: { ready: Promise.resolve({ active: activeWorker }), register: async () => null, controller: null },
+        storage: {},
+      },
+    });
+
+    await expect(offline.prepare("br_user_test")).rejects.toMatchObject({
+      code: "shell_cache_failed",
+      diagnostics: {
+        phase: "shell",
+        cached: 187,
+        attempted: 195,
+        failed: 8,
+        failures: [{ url: "https://cdn.jsdelivr.net/bogus", error: "http_404" }],
+      },
     });
   });
 

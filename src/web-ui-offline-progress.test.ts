@@ -27,6 +27,8 @@ describe("offline preparation progress", () => {
     expect(html).toContain('if (offlineFailureRequiresReload()) return "Reload app"');
     expect(html).toContain('if (offlineFailureRequiresReload()) location.reload()');
     expect(html).toContain('if (offlineFailureCode === "service_worker_unsupported") return "Offline unavailable"');
+    expect(html).toContain("Bashroom couldn’t download all the app files needed offline. Check your connection and retry.");
+    expect(html).toContain('showToast("Offline preparation failed: " + offlineFailure');
   });
 
   it("only paints a ready receipt when the shell and every room file succeeded", () => {
