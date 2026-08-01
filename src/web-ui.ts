@@ -23,7 +23,7 @@ const WEB_INDEX_HTML = `<!doctype html>
 <meta name="color-scheme" content="light dark" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Bashroom</title>
-<link rel="manifest" href="/manifest.webmanifest" />
+<link rel="manifest" href="/manifest.webmanifest?v=2" />
 <meta name="theme-color" content="#37352f" />
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -145,8 +145,9 @@ const WEB_INDEX_HTML = `<!doctype html>
     min-height: 100vh;
   }
 
-  /* Sidebar: fixed to the left edge, its own scroll container. The whole
-     rail is navigation, so double-clicking a room head must toggle it, not
+  /* Sidebar: fixed to the left edge; only the room tree scrolls, so account
+     and recovery controls remain reachable at every tree length. The whole
+     tree is navigation, so double-clicking a room head must toggle it, not
      select the "Loading…" text beside it — user-select off for everything
      except the search input. */
   aside {
@@ -155,13 +156,14 @@ const WEB_INDEX_HTML = `<!doctype html>
     width: var(--side-w);
     background: var(--side);
     border-right: 1px solid var(--rule);
-    overflow-y: auto;
+    overflow: hidden;
     padding: 10px 0 0;
     display: flex;
     flex-direction: column;
     user-select: none;
     -webkit-user-select: none;
   }
+  #sections { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
   aside .search-box input { user-select: text; -webkit-user-select: text; }
 
   /* Capability mode — /s/<slug> edit links serve this same SPA with an
@@ -180,7 +182,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   /* Brand row */
   /* Brand matches the landing page (logo 22px, name 17px/500/-0.01em).
      Same visual identity across the product surface. */
-  .brand { color: var(--ink); padding: 6px 14px 14px; display: flex; align-items: center; gap: 10px; }
+  .brand { color: var(--ink); padding: 6px 14px 14px; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
   .brand .mark { height: 22px; width: auto; color: var(--ink); display: inline-flex; align-items: center; flex-shrink: 0; }
   .brand .brand-name { flex: 1; font-family: var(--sans); font-size: 17px; font-weight: 500; letter-spacing: -0.01em; }
   .brand .brand-repo { color: var(--ink-faint); display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 28px; height: 28px; border-radius: 6px; transition: color 140ms ease, background 140ms ease; position: relative; }
@@ -321,7 +323,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   .mobile-tree-toggle, .mobile-tree-close { display: none; }
 
   /* Footer — 10px vertical matches the brand row's top spacing for visual symmetry. */
-  .footer { margin-top: auto; padding: 10px 14px; font-size: 13px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; border-top: 1px solid var(--rule); }
+  .footer { flex-shrink: 0; margin-top: auto; padding: 10px 14px; font-size: 13px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; border-top: 1px solid var(--rule); }
   .footer .handle, .footer .logout {
     min-height: 40px; padding: 0; border: 0; background: transparent;
     display: inline-flex; align-items: center; font: inherit; cursor: pointer;
@@ -335,7 +337,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   .footer .handle:focus-visible, .footer .logout:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 4px; }
   .footer .offline-actions { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; }
   .footer .offline-action {
-    border: 0; min-height: 40px; padding: 0 3px; background: transparent; color: var(--ink-faint);
+    border: 0; min-width: 40px; min-height: 40px; padding: 0 3px; background: transparent; color: var(--ink-dim);
     font: inherit; cursor: pointer; white-space: nowrap;
     transition-property: color, scale; transition-duration: 140ms; transition-timing-function: ease;
   }
@@ -348,6 +350,11 @@ const WEB_INDEX_HTML = `<!doctype html>
     flex: 1 0 100%; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto;
     align-items: center; gap: 5px 10px; color: var(--ink-faint); font: 500 11px/1.2 var(--sans);
   }
+  .offline-notice {
+    flex: 1 0 100%; margin: 0; color: var(--ink-dim); font: 500 11px/1.35 var(--sans);
+    text-wrap: pretty;
+  }
+  .offline-notice[hidden] { display: none; }
   .offline-progress[hidden] { display: none; }
   .offline-progress-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .offline-progress-count { font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -1240,7 +1247,7 @@ const WEB_INDEX_HTML = `<!doctype html>
 </head>
 <body>
   <div id="app"></div>
-<script src="/web-offline.js"></script>
+<script src="/web-offline.js?v=2"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@13.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
 <script>
@@ -1250,6 +1257,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   const OPEN_KEY = "bashroom.opened";
   const ROOM_OPEN_KEY = "bashroom.rooms-opened";
   const TOUR_KEY = "bashroom.feature-tour.offline-v1";
+  const OFFLINE_GENERATION = "2";
   const TOUR_STEPS = [
     {
       id: "offline-sync",
@@ -1426,6 +1434,9 @@ const WEB_INDEX_HTML = `<!doctype html>
   let offlineReceipt = null;
   let offlineBusy = false;
   let offlineProgress = null;
+  let offlineFailure = "";
+  let offlineFailureCode = "";
+  let offlineController = null;
   let installPromptEvent = null;
   let activeTourStepId = "";
   let tourFrame = 0;
@@ -1455,9 +1466,44 @@ const WEB_INDEX_HTML = `<!doctype html>
   }
 
   function offlineButtonLabel() {
-    if (offlineBusy) return "Preparing…";
-    if (!navigator.onLine && offlineReceipt) return "Offline ready";
-    return offlineReceipt ? "Offline ready" : "Offline";
+    if (offlineBusy) return "Stop";
+    if (offlineFailureCode === "service_worker_unsupported") return "Offline unavailable";
+    if (offlineFailureRequiresReload()) return "Reload app";
+    if (offlineFailure) return offlineReceiptIsReady(offlineReceipt) ? "Retry refresh" : "Retry offline";
+    if (offlineReceipt) {
+      if (!offlineReceiptIsReady(offlineReceipt)) return "Retry offline";
+      return offlineReceiptIsComplete(offlineReceipt) ? "Offline ready" : "Rooms ready";
+    }
+    return "Offline";
+  }
+
+  function offlineFailureRequiresReload() {
+    return offlineFailureCode === "shell_generation_mismatch" ||
+      (offlineFailureCode.startsWith("service_worker_") && offlineFailureCode !== "service_worker_unsupported");
+  }
+
+  function offlineReceiptIsReady(receipt) {
+    if (!receipt || receipt.invalidated === true || receipt.cache_generation !== OFFLINE_GENERATION) return false;
+    if (!receipt.shell || receipt.shell.ok !== true || !Array.isArray(receipt.file_errors)) return false;
+    return receipt.file_errors.length === 0;
+  }
+
+  function offlineReceiptIsComplete(receipt) {
+    if (!offlineReceiptIsReady(receipt)) return false;
+    const links = Array.isArray(receipt.link_errors) ? receipt.link_errors : [];
+    const pdfs = Array.isArray(receipt.pdf_errors) ? receipt.pdf_errors : [];
+    return links.length === 0 && pdfs.length === 0 && !(receipt.crawl && receipt.crawl.truncated);
+  }
+
+  function offlineFailureMessage(error) {
+    const code = String((error && (error.code || error.message)) || error || "");
+    if (code.includes("service_worker_unsupported")) return "This browser does not support offline apps.";
+    if (code.includes("shell_generation_mismatch")) return "Bashroom is finishing an offline update. Close and reopen the app, then retry.";
+    if (code.includes("service_worker")) return "The offline worker did not start. Reload Bashroom and try again.";
+    if (code.includes("preparation_already_running")) return "Another Bashroom window is preparing offline. Stop it there or close it, then retry.";
+    if (code.includes("offline_db")) return "Offline storage is busy. Close other Bashroom windows and retry.";
+    if (code.includes("timeout")) return "A download took too long. Check your connection and retry.";
+    return "Bashroom could not finish saving this device. Retry in a moment.";
   }
 
   function offlineProgressView(progress) {
@@ -1491,21 +1537,39 @@ const WEB_INDEX_HTML = `<!doctype html>
   function updateOfflineControls() {
     const sync = document.getElementById("offline-sync");
     if (sync) {
-      sync.textContent = offlineButtonLabel();
-      sync.disabled = offlineBusy;
+      const buttonLabel = offlineButtonLabel();
+      sync.textContent = buttonLabel;
+      sync.disabled = offlineFailureCode === "service_worker_unsupported";
       sync.setAttribute("aria-busy", offlineBusy ? "true" : "false");
+      sync.setAttribute("aria-label", offlineBusy
+        ? "Stop offline preparation"
+        : buttonLabel === "Offline ready"
+        ? "Bashroom is ready offline"
+        : buttonLabel === "Rooms ready"
+        ? "Room files are ready offline; retry missed linked pages"
+        : buttonLabel === "Reload app"
+        ? "Reload Bashroom to finish the offline update"
+        : buttonLabel === "Offline unavailable"
+        ? "Offline apps are unavailable in this browser"
+        : buttonLabel === "Retry refresh"
+        ? "Retry the offline refresh; the last copy is still ready"
+        : buttonLabel === "Retry offline"
+        ? "Retry offline preparation"
+        : "Prepare Bashroom for offline use");
       if (offlineBusy) sync.setAttribute("aria-describedby", "offline-progress");
       else sync.removeAttribute("aria-describedby");
-      sync.classList.toggle("ready", Boolean(offlineReceipt));
+      sync.classList.toggle("ready", !offlineBusy && !offlineFailure && offlineReceiptIsReady(offlineReceipt));
       const fileErrors = offlineReceipt && Array.isArray(offlineReceipt.file_errors) ? offlineReceipt.file_errors.length : 0;
       const linkErrors = offlineReceipt && Array.isArray(offlineReceipt.link_errors) ? offlineReceipt.link_errors.length : 0;
       const pdfErrors = offlineReceipt && Array.isArray(offlineReceipt.pdf_errors) ? offlineReceipt.pdf_errors.length : 0;
       const crawl = offlineReceipt && offlineReceipt.crawl;
-      sync.title = offlineReceipt
+      sync.title = offlineBusy
+        ? ("Stop offline preparation" + (offlineProgress && offlineProgress.detail ? " · " + String(offlineProgress.detail) : ""))
+        : offlineFailure
+        ? (offlineFailure + (offlineFailureRequiresReload() ? " · Select to reload" : " · Select to retry"))
+        : offlineReceipt
         ? ("Prepared " + new Date(offlineReceipt.prepared_at).toLocaleString() + " · " + offlineReceipt.files + " files · " + offlineReceipt.links + " pages · " + Number(offlineReceipt.pdfs || 0) + " PDFs" + (crawl && crawl.truncated ? " · graph capped" : "") + ((fileErrors + linkErrors + pdfErrors) ? " · " + (fileErrors + linkErrors + pdfErrors) + " misses" : ""))
-        : (offlineBusy && offlineProgress && offlineProgress.detail
-          ? String(offlineProgress.detail)
-          : "Download every room, linked page, and PDF for offline use");
+        : "Download every room, linked page, and PDF for offline use";
     }
     const progress = document.getElementById("offline-progress");
     const progressLabel = document.getElementById("offline-progress-label");
@@ -1533,7 +1597,14 @@ const WEB_INDEX_HTML = `<!doctype html>
       }
     }
     const exportButton = document.getElementById("offline-export");
-    if (exportButton) exportButton.hidden = !offlineReceipt;
+    if (exportButton) exportButton.hidden = !offlineReceipt || offlineReceipt.invalidated === true;
+    const notice = document.getElementById("offline-notice");
+    if (notice) {
+      notice.hidden = !offlineFailure;
+      notice.textContent = offlineFailure
+        ? (offlineReceiptIsReady(offlineReceipt) ? "Last copy ready · " : "") + offlineFailure
+        : "";
+    }
     const installButton = document.getElementById("offline-install");
     if (installButton) installButton.hidden = !installIsAvailable();
     scheduleFeatureTour();
@@ -1659,12 +1730,24 @@ const WEB_INDEX_HTML = `<!doctype html>
     });
   }
 
-  async function hydrateOfflineSnapshot() {
-    if (!offline || !state.token || share) return null;
+  async function hydrateOfflineSnapshot(token = state.token, signal) {
+    const capturedToken = String(token || "");
+    if (!offline || !capturedToken || share) return null;
     try {
-      const snapshot = await offline.readSnapshot(state.token);
+      const snapshot = await offline.readSnapshot(capturedToken, { signal });
       if (!snapshot) return null;
+      if ((signal && signal.aborted) || state.token !== capturedToken) {
+        const stopped = new Error("preparation_stopped");
+        stopped.name = "AbortError";
+        stopped.code = "preparation_stopped";
+        throw stopped;
+      }
       offlineReceipt = snapshot.meta.receipt || null;
+      if (offlineReceipt && offlineReceipt.invalidated === true) {
+        const legacy = offlineReceipt.cache_generation !== OFFLINE_GENERATION;
+        offlineFailureCode = legacy ? "legacy_snapshot" : "previous_refresh_failed";
+        offlineFailure = legacy ? "Offline data needs a one-time refresh after this update." : "The last offline refresh did not finish.";
+      }
       if (!state.rooms.length && Array.isArray(snapshot.meta.rooms)) state.rooms = snapshot.meta.rooms;
       if (!state.handle) state.handle = snapshot.meta.handle || "";
       if (snapshot.meta.trees && typeof snapshot.meta.trees === "object") {
@@ -1683,33 +1766,63 @@ const WEB_INDEX_HTML = `<!doctype html>
       persistRoomsCache();
       persistTreeCache();
       return snapshot;
-    } catch (_) {
+    } catch (error) {
+      if ((signal && signal.aborted) || state.token !== capturedToken || (error && error.name === "AbortError")) throw error;
       return null;
     }
   }
 
   async function prepareOffline() {
     if (!offline || offlineBusy || !state.token) return;
+    const preparationToken = state.token;
+    const controller = new AbortController();
+    offlineController = controller;
     offlineBusy = true;
     offlineProgress = null;
-    updateOfflineControls();
+    offlineFailure = "";
+    offlineFailureCode = "";
     try {
-      offlineReceipt = await offline.prepare(state.token, (progress) => {
+      updateOfflineControls();
+      const receipt = await offline.prepare(preparationToken, (progress) => {
         offlineProgress = progress;
         updateOfflineControls();
-      });
-      await hydrateOfflineSnapshot();
+      }, { signal: controller.signal });
+      if (controller.signal.aborted || state.token !== preparationToken) {
+        const stopped = new Error("preparation_stopped");
+        stopped.name = "AbortError";
+        stopped.code = "preparation_stopped";
+        throw stopped;
+      }
+      offlineReceipt = receipt;
+      await hydrateOfflineSnapshot(preparationToken, controller.signal);
     } catch (error) {
-      showToast("Offline preparation stopped: " + String((error && error.message) || error), "#c96f62");
+      const stopped = Boolean(error && (error.name === "AbortError" || error.code === "preparation_stopped"));
+      if (error && error.snapshotInvalidated && offlineReceipt) offlineReceipt = Object.assign({}, offlineReceipt, { invalidated: true });
+      if (stopped) {
+        offlineFailureCode = "preparation_stopped";
+        offlineFailure = "Offline refresh stopped.";
+        showToast("Offline preparation stopped.");
+      }
+      else {
+        console.warn("Offline preparation stopped", error);
+        offlineFailureCode = String((error && (error.code || error.message)) || error || "offline_preparation_failed");
+        offlineFailure = offlineFailureMessage(error);
+        showToast("Offline preparation stopped: " + offlineFailure, "#c96f62");
+      }
     } finally {
       offlineBusy = false;
       offlineProgress = null;
+      if (offlineController === controller) offlineController = null;
       updateOfflineControls();
     }
   }
 
+  function stopOfflinePreparation() {
+    if (offlineController && !offlineController.signal.aborted) offlineController.abort();
+  }
+
   async function syncOfflineOutbox() {
-    if (!offline || !state.token || !navigator.onLine || share) return;
+    if (!offline || offlineBusy || !state.token || !navigator.onLine || share) return;
     const result = await offline.syncOutbox(state.token).catch(() => null);
     if (!result) return;
     for (const item of result.synced || []) {
@@ -3003,6 +3116,7 @@ const WEB_INDEX_HTML = `<!doctype html>
 
   function logout() {
     const tokenToPurge = state.token;
+    stopOfflinePreparation();
     disconnectPresence();
     [TOKEN_KEY, STATE_KEY, OPEN_KEY, ROOM_OPEN_KEY, TREES_KEY, ROOMS_KEY].forEach(k => localStorage.removeItem(k));
     state.token = ""; state.rooms = []; state.handle = "";
@@ -3018,6 +3132,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     profileData = null;
     profileLoadedAt = 0;
     offlineReceipt = null;
+    offlineFailure = "";
+    offlineFailureCode = "";
     if (offline && tokenToPurge) void offline.purge(tokenToPurge);
     history.replaceState(null, "", "/web"); // drop the deep link on sign-out
     render();
@@ -4578,8 +4694,8 @@ const WEB_INDEX_HTML = `<!doctype html>
         <div class="footer">
           <button class="handle" id="profile-open" type="button" aria-label="Open your profile"\${profileSurface ? ' aria-current="page"' : ''}>@\${escHtml(state.handle || "")}</button>
           <span class="offline-actions">
-            <button class="offline-action\${offlineReceipt ? " ready" : ""}" id="offline-sync" type="button" title="Download every room, linked page, and PDF for offline use">\${offlineButtonLabel()}</button>
-            <button class="offline-action" id="offline-export" type="button" title="Export one printable HTML archive"\${offlineReceipt ? "" : " hidden"}>Export</button>
+            <button class="offline-action\${!offlineBusy && !offlineFailure && offlineReceiptIsReady(offlineReceipt) ? " ready" : ""}" id="offline-sync" type="button" title="Download every room, linked page, and PDF for offline use">\${offlineButtonLabel()}</button>
+            <button class="offline-action" id="offline-export" type="button" title="Export one printable HTML archive"\${offlineReceipt && offlineReceipt.invalidated !== true ? "" : " hidden"}>Export</button>
             <button class="offline-action" id="offline-install" type="button" title="Install Bashroom on this device"\${installIsAvailable() ? "" : " hidden"}>Install</button>
           </span>
           <button class="logout" id="logout" type="button">Sign out</button>
@@ -4590,6 +4706,7 @@ const WEB_INDEX_HTML = `<!doctype html>
               <span class="offline-progress-fill"></span>
             </span>
           </div>
+          <p class="offline-notice" id="offline-notice" role="status" hidden></p>
         </div>
       </aside>
       \${documentHeader}
@@ -4664,7 +4781,10 @@ const WEB_INDEX_HTML = `<!doctype html>
     const offlineSync = document.getElementById("offline-sync");
     if (offlineSync) offlineSync.onclick = () => {
       markFeatureTourStep("offline-sync", false);
-      void prepareOffline();
+      if (offlineBusy) stopOfflinePreparation();
+      else if (offlineFailureRequiresReload()) location.reload();
+      else if (offlineFailureCode === "service_worker_unsupported") return;
+      else void prepareOffline();
     };
     const offlineExport = document.getElementById("offline-export");
     if (offlineExport) offlineExport.onclick = () => {
@@ -5113,6 +5233,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (profileSurface && (profileStatus === "offline" || profileStatus === "error")) void loadProfile(true);
   });
   window.addEventListener("offline", updateOfflineControls);
+  window.addEventListener("pagehide", stopOfflinePreparation);
   window.addEventListener("resize", () => {
     syncMobileTreeSurface(false);
     if (activeTourStepId) scheduleFeatureTour();

@@ -299,8 +299,22 @@ The preparation UI does not invent a total before discovery finishes. It begins
 with an indeterminate **Planning your offline library** track, becomes
 determinate while room and file totals are known, and returns to an
 indeterminate linked-page track because every rendered page can reveal more
-same-origin children. The action label remains stable as **Preparing…** while
-phase-specific counts live beside the progress track.
+same-origin children. While work is active the primary action becomes **Stop**;
+that cancellation reaches the fetch pools and IndexedDB work rather than merely
+hiding progress. Service-worker activation, shell caching, HTTP/body reads, and
+IndexedDB operations all have explicit deadlines. A timeout returns the UI to a
+retryable state, and shell or room-file misses cannot paint **Offline ready**.
+Receipts carry the cache generation and preparation run ID. A running or failed
+run invalidates the prior receipt before private file rows change, and Web Locks
+make preparation single-writer across tabs. Reads refuse to cross that writer
+boundary; queued offline edits remain a protected overlay over refreshed rows.
+
+Installed-app assets use a generation-stamped URL and Cache Storage namespace.
+The new worker activates from a four-resource core and retains the previous
+complete shell as fallback. Only a successful full-graph receipt removes that
+fallback. Current Bashroom helpers are network-first, while pinned third-party
+modules remain cache-first. This prevents a fresh HTML shell from being paired
+indefinitely with an older `/web-offline.js` contract.
 
 External Markdown links are rewritten to `/web/offline?url=...`. Online, the
 Worker redirects to the original URL. Offline, the service worker serves the

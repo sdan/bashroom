@@ -50,4 +50,11 @@ describe("Pierre-quality room tree", () => {
     expect(html).toContain('data-retry-room="');
     expect(html).toContain("label.scrollWidth > label.clientWidth");
   });
+
+  it("scrolls long room trees without pushing account controls off-screen", () => {
+    expect(html).toContain("#sections { flex: 1 1 auto; min-height: 0; overflow-y: auto");
+    expect(html).toContain(".footer { flex-shrink: 0;");
+    expect(html).toContain("aside {\n    position: fixed;");
+    expect(html).toContain("overflow: hidden;");
+  });
 });

@@ -177,9 +177,13 @@ Click **Offline** in the web sidebar before departure. Bashroom downloads the
 app, every authorized room file, and every directly referenced external page.
 It then follows two same-site link levels breadth-first, up to 500 pages beyond
 any larger direct reading list. Each page is stored as searchable Markdown and,
-when Browser Run succeeds, an A4 PDF. The button becomes **Offline ready** only
-after the run produces a receipt; its tooltip shows files, pages, PDFs, misses,
-and whether the graph hit a cap. Offline search and reading use this snapshot.
+when Browser Run succeeds, an A4 PDF. **Rooms ready** means the app shell and
+every room file are safely recorded; **Offline ready** additionally means the
+linked-page archive finished without misses or a graph cap. The tooltip shows
+files, pages, PDFs, misses, and whether the graph hit a cap. During a refresh the
+action becomes **Stop** and cancels the underlying work. A stalled browser,
+network, or storage operation times out into a visible retry state instead of
+leaving the app preparing forever.
 Preparation first shows an indeterminate planning track while Bashroom discovers
 the workload, then a determinate bar for known room/file totals. Linked-page
 capture returns to discovery motion because rendered pages can reveal more links.
