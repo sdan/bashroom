@@ -181,6 +181,11 @@ move through visible rows. On viewports at or below 720px the same sidebar DOM
 becomes a full-screen navigation surface and selecting a file returns to the
 full-width document. There is no separate mobile tree to synchronize.
 
+Bashroom owns this tree's visual skin and search contract; Pierre is a design
+reference, not a runtime dependency. Local path search ranks matching rooms
+first, treats implicit folders as first-class results, then shows files; the
+existing bounded server scan streams content matches underneath.
+
 ## Write contracts
 
 The Worker exposes ten MCP tools. The two mutation shapes are intentionally

@@ -163,7 +163,9 @@ const server = createServer(async (req, res) => {
     const results = [];
     for (const room of ROOMS) for (const f of treeFor(room)) {
       if (results.length >= 40) break;
-      if (f.path.toLowerCase().includes(q) || room.includes(q)) results.push({ room, path: f.path, line: 3, preview: "mock line mentioning " + q + " inside " + f.path });
+      // Production returns body matches only. The fixture body contains the
+      // path, so path text may match; room names are never synthesized here.
+      if (f.path.toLowerCase().includes(q)) results.push({ room, path: f.path, line: 3, preview: "mock line mentioning " + q + " inside " + f.path });
     }
     return setTimeout(() => json(res, { ok: true, query: q, results, truncated: false }), 150);
   }

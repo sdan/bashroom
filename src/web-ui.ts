@@ -81,7 +81,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     --rule: #ebeae6;
     --guide: #e3e2dd;
     --link: #4f3bd0;
-    --folder: #8a857a;
+    --folder: #d8a23a;
+    --md: #1ca1c7;
     --mono: ui-monospace, "SF Mono", "Menlo", "Consolas", monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
     --side-w: 260px;
@@ -105,7 +106,8 @@ const WEB_INDEX_HTML = `<!doctype html>
       --rule: #2a2a2a;
       --guide: #303030;
       --link: #c8a8ff;
-      --folder: #aaa59b;
+      --folder: #ffd452;
+      --md: #08c0ef;
       --actor-you: #8fc09a;
       --actor-claude: #e8a68f;
       --actor-codex: #9cc0e8;
@@ -123,7 +125,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     --rule: #2a2a2a;
     --guide: #303030;
     --link: #c8a8ff;
-    --folder: #aaa59b;
+    --folder: #ffd452;
+    --md: #08c0ef;
     --actor-you: #8fc09a;
     --actor-claude: #e8a68f;
     --actor-codex: #9cc0e8;
@@ -227,21 +230,20 @@ const WEB_INDEX_HTML = `<!doctype html>
   :root[data-theme="light"] .brand .theme-toggle .ic-moon { display: inline; }
   :root[data-theme="light"] .brand .theme-toggle .ic-sun { display: none; }
 
-  /* Room sections + tree — one compact row grammar. The state/cache model is
-     intentionally untouched; this layer only owns hierarchy and interaction. */
-  .section { padding: 1px 6px; }
-  .section.open { padding-bottom: 6px; }
+  /* Bashroom owns the visual skin: compact editor-like rows and familiar
+     file-type color. The newer semantic buttons and navigation stay intact. */
+  .section { padding: 2px 6px; }
+  .section.open { padding-bottom: 2px; }
   .room-line, .tree-line { position: relative; min-width: 0; }
-  .room-line { margin: 0 2px; }
-  .tree-line { margin: 0 4px; }
+  .room-line, .tree-line { margin: 0; }
   .room-head, .tree .row {
-    width: 100%; border: 0; border-radius: 5px; background: transparent;
+    border: 0; border-radius: 4px; background: transparent;
     color: var(--ink-dim); cursor: pointer; text-align: left;
     font-family: var(--sans); user-select: none; -webkit-appearance: none; appearance: none;
   }
   .room-head {
-    min-height: 32px; padding: 0 8px;
-    display: grid; grid-template-columns: 16px minmax(0,1fr); align-items: center; gap: 6px;
+    width: 100%; min-height: 26px; padding: 3px 6px;
+    display: grid; grid-template-columns: 16px minmax(0,1fr); align-items: center; gap: 2px;
   }
   .room-head:hover, .room-line:hover .room-head, .tree-line:hover .row { background: var(--hover); color: var(--ink); }
   .room-head[aria-expanded="true"] { color: var(--ink); }
@@ -255,34 +257,29 @@ const WEB_INDEX_HTML = `<!doctype html>
   .room-head .chev.open, .tree .chev.open { transform: rotate(90deg); }
   .room-head .name {
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    font-size: 14px; font-weight: 600; letter-spacing: -.005em;
+    font-size: 14px; font-weight: 500;
   }
 
   .tree { list-style: none; margin: 0; padding: 0 0 4px; }
   .tree li { position: relative; }
   .tree ul { list-style: none; margin: 0; padding-left: 18px; position: relative; }
-  .tree ul::before {
-    content: ""; position: absolute; left: 7px; top: 0; bottom: 15px;
-    border-left: 1px solid var(--guide);
-  }
+  .tree ul::before { content: ""; position: absolute; left: 7px; top: 0; bottom: 0; border-left: 1px solid var(--guide); }
   .tree .row {
-    min-height: 30px; padding: 0 8px;
-    display: grid; grid-template-columns: 16px 16px minmax(0,1fr); align-items: center; gap: 6px;
-    font-size: 13.5px;
+    width: calc(100% - 12px); min-height: 26px; padding: 3px 6px; margin: 0 6px;
+    display: grid; grid-template-columns: 16px 16px minmax(0,1fr); align-items: center; gap: 4px;
+    font-size: 14px;
   }
   .tree .row.file-row .icon { grid-column: 2; }
   .tree .row.file-row .label { grid-column: 3; }
-  .tree .row.folder-row .label { font-weight: 500; }
-  .tree .row.active { background: var(--active); color: var(--link); font-weight: 500; }
+  .tree .row.folder-row .label { font-weight: 400; }
+  .tree .row.active { background: var(--active); color: var(--link); }
   .tree .row.active .icon { color: var(--link); }
   .tree .icon {
     width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
     color: var(--ink-faint);
   }
   .tree .icon.folder { color: var(--folder); }
-  .tree .icon .folder-open { display: none; }
-  .tree .row[aria-expanded="true"] .folder-closed { display: none; }
-  .tree .row[aria-expanded="true"] .folder-open { display: block; }
+  .tree .icon.md { color: var(--md); }
   .tree .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* Context actions overlay the trailing edge instead of permanently stealing
@@ -304,7 +301,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     background: linear-gradient(90deg, transparent, var(--active) 14px);
   }
   .row-share {
-    width: 28px; height: 28px; padding: 0; border: 0; border-radius: 5px;
+    width: 26px; height: 26px; padding: 0; border: 0; border-radius: 5px;
     display: inline-flex; align-items: center; justify-content: center;
     color: var(--ink-faint); background: transparent; cursor: pointer;
     transition-property: color, background-color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
@@ -1072,12 +1069,15 @@ const WEB_INDEX_HTML = `<!doctype html>
   .result-preview { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
   .result-preview b { color: var(--link); font-weight: 600; }
   .result-folder {
-    display: block; width: calc(100% - 12px); border: 0; background: transparent; text-align: left;
-    font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
-    padding: 6px 8px 1px; margin: 0 6px; cursor: pointer; border-radius: 4px;
+    display: flex; align-items: center; gap: 6px; width: calc(100% - 12px); border: 0; background: transparent; text-align: left;
+    font-family: var(--sans); font-size: 12.5px; color: var(--ink);
+    padding: 5px 8px; margin: 0 6px; cursor: pointer; border-radius: 4px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .result-folder:hover { color: var(--link); background: var(--hover); }
+  .result-folder .icon { width: 14px; height: 14px; flex: 0 0 14px; color: var(--folder); }
+  .result-folder .icon svg { display: block; width: 14px; height: 14px; }
+  .result-folder .result-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .result.nested { width: calc(100% - 24px); margin-left: 18px; }
 
   /* ── Private self profile ───────────────────────────────────────────
@@ -1292,7 +1292,8 @@ const WEB_INDEX_HTML = `<!doctype html>
 
   const ICON = {
     chev: '<svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 2 8 6 4 10"/></svg>',
-    folder: '<svg class="folder-closed" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><path d="M1.75 4.25c0-.83.67-1.5 1.5-1.5h3l1.35 1.5h5.15c.83 0 1.5.67 1.5 1.5v6c0 .83-.67 1.5-1.5 1.5h-9.5c-.83 0-1.5-.67-1.5-1.5z"/></svg><svg class="folder-open" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><path d="M1.75 5V4.25c0-.83.67-1.5 1.5-1.5h3l1.35 1.5h5.15c.83 0 1.5.67 1.5 1.5V6"/><path d="M2.4 6.25h12.1l-1.45 5.8c-.17.7-.8 1.2-1.52 1.2H3.55c-.73 0-1.36-.5-1.53-1.21L.75 7.75c-.2-.76.38-1.5 1.17-1.5z"/></svg>',
+    folder: '<svg viewBox="0 0 14 14" width="14" height="14" fill="currentColor"><path d="M1.5 3.5a1 1 0 0 1 1-1h3l1.2 1.2h4.8a1 1 0 0 1 1 1V11a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"/></svg>',
+    md: '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.5 2.5h9v9h-9z"/><path d="M4.5 9V5l1.5 2L7.5 5v4M10 5v4M8.5 7.5 10 9l1.5-1.5"/></svg>',
     file: '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3 1.5h5l3 3V12a.5.5 0 0 1-.5.5h-7.5a.5.5 0 0 1-.5-.5V2a.5.5 0 0 1 .5-.5z"/><path d="M8 1.5v3h3"/></svg>',
     sidebar: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2" width="13" height="12" rx="2"/><path d="M5.25 2v12M7.75 5h4M7.75 8h4M7.75 11h2.5"/></svg>',
     close: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/></svg>',
@@ -3224,31 +3225,70 @@ const WEB_INDEX_HTML = `<!doctype html>
     return matches;
   }
 
-  // Filename hits — instant, straight from the cached trees. The Cursor
-  // pattern: files paint in milliseconds, content matches stream in after.
-  function searchFileMatches(q) {
+  // Path hits are instant and local. Treat implicit directory ancestors as
+  // first-class results, then rank exact basenames ahead of prefix and path
+  // matches. This is the useful part of Pierre's path-first search model.
+  function searchPathMatches(q) {
     const needle = q.toLowerCase();
-    const hits = [];
+    const roomsFound = [];
+    const folders = [];
+    const filesFound = [];
+    const seenFolders = new Set();
     for (const r of state.rooms) {
+      if (r.room.toLowerCase().includes(needle)) roomsFound.push({ room: r.room, path: r.room });
       const tree = trees.get(r.room);
       if (!Array.isArray(tree)) continue;
       for (const f of tree) {
-        if (f.path.toLowerCase().indexOf(needle) !== -1) {
-          hits.push({ room: r.room, path: f.path });
-          if (hits.length >= 12) return hits;
+        const rawPath = String(f.path || "");
+        const parts = rawPath.split("/").filter(Boolean);
+        const folderCount = rawPath.endsWith("/") ? parts.length : Math.max(0, parts.length - 1);
+        for (let i = 1; i <= folderCount; i += 1) {
+          const path = parts.slice(0, i).join("/");
+          if (!path.toLowerCase().includes(needle)) continue;
+          const key = r.room + "\\0" + path;
+          if (seenFolders.has(key)) continue;
+          seenFolders.add(key);
+          folders.push({ room: r.room, path });
         }
+        if (!rawPath.endsWith("/") && rawPath.toLowerCase().includes(needle)) filesFound.push({ room: r.room, path: rawPath });
       }
     }
-    return hits;
+    const rank = (hit) => {
+      const name = hit.path.slice(hit.path.lastIndexOf("/") + 1).toLowerCase();
+      return name === needle ? 0 : name.startsWith(needle) ? 1 : name.includes(needle) ? 2 : 3;
+    };
+    const compare = (a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path) || a.room.localeCompare(b.room);
+    roomsFound.sort(compare);
+    folders.sort(compare);
+    filesFound.sort(compare);
+    return { rooms: roomsFound.slice(0, 8), folders: folders.slice(0, 8), files: filesFound.slice(0, 12) };
   }
 
   function searchResultsHtml() {
     const q = searchQuery.trim();
     let html = "";
-    const fileHits = searchFileMatches(q);
-    if (fileHits.length) {
+    const pathHits = searchPathMatches(q);
+    if (pathHits.rooms.length) {
+      html += '<div class="search-room">rooms</div>';
+      for (const h of pathHits.rooms) {
+        html += '<button class="result-folder" type="button" data-room="' + escHtml(h.room) + '" data-reveal-dir="">'
+          + '<span class="icon" aria-hidden="true">' + ICON.folder + '</span>'
+          + '<span class="result-path">' + highlightMatch(h.room, q) + '</span>'
+          + '</button>';
+      }
+    }
+    if (pathHits.folders.length) {
+      html += '<div class="search-room">folders</div>';
+      for (const h of pathHits.folders) {
+        html += '<button class="result-folder" type="button" data-room="' + escHtml(h.room) + '" data-reveal-dir="' + escHtml(h.path) + '">'
+          + '<span class="icon" aria-hidden="true">' + ICON.folder + '</span>'
+          + '<span class="result-path">' + highlightMatch(h.path, q) + '<span class="result-line"> · ' + escHtml(h.room) + '</span></span>'
+          + '</button>';
+      }
+    }
+    if (pathHits.files.length) {
       html += '<div class="search-room">files</div>';
-      for (const h of fileHits) {
+      for (const h of pathHits.files) {
         html += '<button class="result" type="button" data-room="' + escHtml(h.room) + '" data-file="' + escHtml(h.path) + '">'
           + '<div class="result-path">' + highlightMatch(h.path, q) + '<span class="result-line"> · ' + escHtml(h.room) + '</span></div>'
           + '</button>';
@@ -3256,7 +3296,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     }
     if (searchError) return html + '<div class="empty">Search failed: ' + escHtml(searchError) + '</div>';
     if (searchResults === null) return html + '<div class="empty">Searching content…</div>';
-    if (!searchResults.length && !fileHits.length) return '<div class="empty">No matches for <code>' + escHtml(q) + '</code>.</div>';
+    if (!searchResults.length && !pathHits.rooms.length && !pathHits.folders.length && !pathHits.files.length) return '<div class="empty">No matches for <code>' + escHtml(q) + '</code>.</div>';
     // Content hits, nested: room header → folder line (click reveals the
     // folder in the sidebar) → file rows with basename:line + preview.
     let lastRoom = "", lastDir = null;
@@ -3267,7 +3307,7 @@ const WEB_INDEX_HTML = `<!doctype html>
       const base = slash === -1 ? r.path : r.path.slice(slash + 1);
       if (dir !== lastDir) {
         lastDir = dir;
-        if (dir) html += '<button class="result-folder" type="button" data-room="' + escHtml(r.room) + '" data-reveal-dir="' + escHtml(dir) + '">' + escHtml(dir) + '/</button>';
+        if (dir) html += '<button class="result-folder" type="button" data-room="' + escHtml(r.room) + '" data-reveal-dir="' + escHtml(dir) + '"><span class="icon" aria-hidden="true">' + ICON.folder + '</span><span class="result-path">' + escHtml(dir) + '/</span></button>';
       }
       html += '<button class="result' + (dir ? " nested" : "") + '" type="button" data-room="' + escHtml(r.room) + '" data-file="' + escHtml(r.path) + '">'
         + '<div class="result-path">' + escHtml(base) + '<span class="result-line">:' + r.line + '</span></div>'
@@ -4202,13 +4242,21 @@ const WEB_INDEX_HTML = `<!doctype html>
         clearSearchQuery();
         state.roomsOpened.add(room);
         let acc = "";
-        for (const seg of dir.split("/")) { acc = acc ? acc + "/" + seg : seg; state.opened.add(room + ":" + acc); }
+        if (dir) for (const seg of dir.split("/")) { acc = acc ? acc + "/" + seg : seg; state.opened.add(room + ":" + acc); }
         if (!treeInflight.has(room)) void fetchTree(room);
         persist();
         render();
-        const aside = app.querySelector("aside");
-        const row = aside && findAnchorRow(aside, ["dir", room, dir]);
-        if (row) row.scrollIntoView({ block: "center" });
+        // Let the originating result button's click finish before moving
+        // focus into the replacement tree; otherwise the detached button can
+        // hand focus back to <body> after this handler returns.
+        requestAnimationFrame(() => {
+          const aside = app.querySelector("aside");
+          const row = aside && findAnchorRow(aside, dir ? ["dir", room, dir] : ["room", room]);
+          if (row) {
+            row.focus({ preventScroll: true });
+            row.scrollIntoView({ block: "center" });
+          }
+        });
       };
     });
     // Hover share icons on directory rows + room heads. stopPropagation so
@@ -4250,7 +4298,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (focusedKey) findAnchorRow(aside, focusedKey)?.focus({ preventScroll: true });
   }
 
-  function fileIcon() {
+  function fileIcon(name) {
+    if (/\.md$/i.test(name)) return '<span class="icon md" aria-hidden="true">' + ICON.md + '</span>';
     return '<span class="icon" aria-hidden="true">' + ICON.file + '</span>';
   }
 
@@ -4422,7 +4471,7 @@ const WEB_INDEX_HTML = `<!doctype html>
       return \`<li>
         <div class="tree-line">
         <button class="row file-row \${active}" type="button" data-room="\${safeRoom}" data-file="\${safePath}" aria-label="\${safeName}"\${active ? ' aria-current="page"' : ''}>
-          \${fileIcon()}
+          \${fileIcon(n.name)}
           <span class="label">\${safeName}</span>
         </button>
         </div>

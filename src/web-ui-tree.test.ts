@@ -44,11 +44,24 @@ describe("Pierre-quality room tree", () => {
     expect(html).toContain(".result-folder, .tree-retry { min-height: 40px");
   });
 
-  it("keeps the tree quiet and exposes recoverable failures", () => {
-    expect(html).not.toContain("--md:");
-    expect(html).not.toContain("ICON.md");
+  it("restores Bashroom's compact editor-like file language without losing recovery", () => {
+    expect(html).toContain("--folder: #d8a23a");
+    expect(html).toContain("--md: #1ca1c7");
+    expect(html).toContain("min-height: 26px");
+    expect(html).toContain("width: 26px; height: 26px");
+    expect(html).toContain("ICON.md");
     expect(html).toContain('data-retry-room="');
     expect(html).toContain("label.scrollWidth > label.clientWidth");
+  });
+
+  it("surfaces matching rooms, then folders, before matching files", () => {
+    expect(html).toContain("function searchPathMatches(q)");
+    expect(html).toContain("const seenFolders = new Set()");
+    expect(html).toContain('class="search-room">rooms');
+    expect(html).toContain('class="search-room">folders');
+    expect(html.indexOf('class="search-room">rooms')).toBeLessThan(html.indexOf('class="search-room">folders'));
+    expect(html.indexOf('class="search-room">folders')).toBeLessThan(html.indexOf('class="search-room">files'));
+    expect(html).toContain('row.focus({ preventScroll: true })');
   });
 
   it("scrolls long room trees without pushing account controls off-screen", () => {
