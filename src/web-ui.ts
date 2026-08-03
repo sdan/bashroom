@@ -484,7 +484,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     min-height: 30px; border: 0; border-radius: 0; padding: 0 11px;
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     background: transparent; color: var(--ink-dim); cursor: pointer;
-    font: 500 12.5px/1 var(--sans); user-select: none; -webkit-appearance: none; appearance: none;
+    font: 500 12.5px/1 var(--sans); text-decoration: none; user-select: none; -webkit-appearance: none; appearance: none;
     transition-property: color, background-color;
     transition-duration: 150ms; transition-timing-function: ease-out;
     position: relative;
@@ -526,7 +526,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   .doc-action .share-lbl { min-width: 5ch; }
   /* Same reservation as Copy/Share: "Preview"⇄"Edit" must not change the
      segmented control's width under the cursor. */
-  #preview-btn > span { display: inline-block; min-width: 7ch; text-align: center; }
+  #preview-link > span { display: inline-block; min-width: 7ch; text-align: center; }
   .share-wrap { position: relative; }
   /* Version history is page provenance, not another editing mode. The quiet
      ellipsis keeps the document bar simple; the drawer overlays the canvas so
@@ -1266,8 +1266,8 @@ const WEB_INDEX_HTML = `<!doctype html>
     .doc-location .doc-room, .doc-location .doc-separator { display: none; }
     #copy-md, #share-btn { width: 40px; padding-inline: 0; }
     #copy-md .label-stack, #share-btn .share-lbl { display: none; }
-    #preview-btn { padding-inline: 9px; }
-    #preview-btn > span { min-width: 0; font-size: 11px; }
+    #preview-link { padding-inline: 9px; }
+    #preview-link > span { min-width: 0; font-size: 11px; }
     .mobile-tree-close { display: inline-flex; }
     .room-head, .tree .row { min-height: 40px; }
     .row-share { width: 40px; height: 40px; }
@@ -2960,10 +2960,13 @@ const WEB_INDEX_HTML = `<!doctype html>
     profileSurface = false;
     profileRouteHandle = "";
     pendingScrollY = -1; // navigations start at the top — drop any pending restore
-    if (historyKey && historyKey !== fileKey(room, path)) resetHistory();
+    const nextKey = fileKey(room, path);
+    const changingFile = room !== state.activeRoom || path !== state.activePath;
+    if (historyKey && historyKey !== nextKey) resetHistory();
     // Leaving a dirty inline doc: push the pending save before rebinding.
-    if (inlineKey && (room !== state.activeRoom || path !== state.activePath)) flushAutosave();
-    if (editing && (room !== state.activeRoom || path !== state.activePath)) { editing = false; editError = ""; void destroyCm(); }
+    if (inlineKey && changingFile) flushAutosave();
+    if (editing && changingFile) { editing = false; editError = ""; void destroyCm(); }
+    if (changingFile) previewKey = "";
     state.activeRoom = room; state.activePath = path;
     mobileTreeOpen = false;
     revealActiveFile(); // expand room + ancestor folders so the row is visible
@@ -3061,15 +3064,30 @@ const WEB_INDEX_HTML = `<!doctype html>
   // The Worker serves this same SPA for any non-reserved path (see index.ts
   // catch-all), then we hydrate state from location.pathname on boot.
 
-  // Build the canonical URL path for the current selection. encodeURI (not
-  // encodeURIComponent) so "/" segment separators survive but spaces/specials
-  // in names are escaped.
+  // Preview is a rendered view of this same document, not a second resource.
+  // A query parameter makes that view reloadable/copyable without stealing
+  // Markdown's hash namespace from heading links.
+  function previewModeFromUrl() {
+    return new URLSearchParams(location.search).get("view") === "preview";
+  }
+
+  function urlWithPreviewMode(preview) {
+    const url = new URL(location.href);
+    if (preview) url.searchParams.set("view", "preview");
+    else url.searchParams.delete("view");
+    return url.pathname + url.search + url.hash;
+  }
+
+  // Build the canonical URL for the current selection. Path segments are
+  // encoded independently so directory separators survive, while preview
+  // remains a view parameter on the selected document.
   function urlForState() {
     if (!state.activeRoom) return "/web";
     const room = encodeURIComponent(state.activeRoom);
     if (!state.activePath) return "/" + room;
     const path = state.activePath.split("/").map(encodeURIComponent).join("/");
-    return "/" + room + "/" + path;
+    const base = "/" + room + "/" + path;
+    return previewKey === fileKey(state.activeRoom, state.activePath) ? base + "?view=preview" : base;
   }
 
   // /@handle is an authenticated, private account surface. Parse it before
@@ -3099,7 +3117,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   function syncUrl(replace) {
     if (share) return; // capability URLs are /s/<slug> — never rewrite them
     const next = urlForState();
-    if (next === location.pathname) return;
+    if (next === location.pathname + location.search) return;
     if (replace) history.replaceState(null, "", next);
     else history.pushState(null, "", next);
   }
@@ -3212,6 +3230,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     state.activeRoom = ""; state.activePath = "";
     state.opened = new Set(); state.roomsOpened = new Set();
     trees.clear(); files.clear(); treeInflight.clear(); fileInflight.clear();
+    previewKey = "";
     resetHistory();
     profileSeq += 1;
     profileSurface = false;
@@ -4753,9 +4772,9 @@ const WEB_INDEX_HTML = `<!doctype html>
                   <span class="lb-failed">Failed</span>
                 </span>
               </button>\`}
-              \${inlineMode ? \`<button class="doc-action" id="preview-btn" data-tip="\${previewing ? "Return to editing" : "Render diagrams and Markdown"}" aria-label="\${previewing ? "Return to editing" : "Preview Markdown"}" type="button">
+              \${inlineMode ? \`<a class="doc-action" id="preview-link" href="\${escHtml(urlWithPreviewMode(!previewing))}" data-tip="\${previewing ? "Return to editing" : "Render diagrams and Markdown"}" aria-label="\${previewing ? "Return to editing" : "Preview Markdown"}">
                 <span>\${previewing ? "Edit" : "Preview"}</span>
-              </button>\` : ""}
+              </a>\` : ""}
               \${activeFile.is_binary || editing || inlineMode ? "" : \`<button class="doc-action" id="edit-btn" data-tip="Edit this file" type="button">
                 <span class="icon-stack">\${ICON.pencil}</span><span>Edit</span>
               </button>\`}
@@ -5188,19 +5207,31 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (eb && activeFile && !activeFileIsErr && !activeFile.is_binary) {
       eb.onclick = () => startEdit(activeFile);
     }
-    const previewBtn = document.getElementById("preview-btn");
-    if (previewBtn && activeKey) {
-      previewBtn.onclick = () => {
+    const previewLink = document.getElementById("preview-link");
+    if (previewLink && activeKey) {
+      previewLink.onclick = (event) => {
+        // A modified click stays native: the real href can be copied or
+        // opened in another tab. Flush first so that tab has the best chance
+        // of reading the latest durable draft.
+        flushAutosave();
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        const keyboardActivation = event.detail === 0;
         // Keep the reader's place and focus across the surface swap — the
         // wipe momentarily shortens the document and the browser clamps
         // scrollY; returning to Edit also refocuses the fresh editor.
         const y = window.scrollY;
-        flushAutosave();
         destroyCm();
-        previewKey = previewing ? "" : activeKey;
+        const nextPreviewing = !previewing;
+        previewKey = nextPreviewing ? activeKey : "";
+        const nextUrl = urlWithPreviewMode(nextPreviewing);
+        if (nextUrl !== location.pathname + location.search + location.hash) history.pushState(null, "", nextUrl);
         if (previewing) editFocusPending = true;
         render(); // same-doc render() sets pendingScrollY for the async mount
-        requestAnimationFrame(() => window.scrollTo(0, y));
+        requestAnimationFrame(() => {
+          window.scrollTo(0, y);
+          if (nextPreviewing && keyboardActivation) document.getElementById("preview-link")?.focus();
+        });
       };
     }
     const sb = document.getElementById("share-btn");
@@ -5288,6 +5319,9 @@ const WEB_INDEX_HTML = `<!doctype html>
     state.activePath = fromUrl.path;
     revealActiveFile(); // expand room + ancestor folders for the deep-linked file
   }
+  if ((fromUrl || share) && state.activeRoom && state.activePath && previewModeFromUrl()) {
+    previewKey = fileKey(state.activeRoom, state.activePath);
+  }
   mobileTreeOpen = !state.activePath;
 
   // Back/forward: re-hydrate from the URL and repaint. The target room's
@@ -5350,6 +5384,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     const nextProfileHandle = profileHandleFromUrl();
     if (nextProfileHandle) {
       resetHistory();
+      previewKey = "";
       profileSurface = true;
       profileRouteHandle = nextProfileHandle;
       disconnectPresence();
@@ -5365,6 +5400,9 @@ const WEB_INDEX_HTML = `<!doctype html>
     if (historyKey && historyKey !== nextHistoryKey) resetHistory();
     state.activeRoom = s ? s.room : "";
     state.activePath = s ? s.path : "";
+    previewKey = previewModeFromUrl() && state.activeRoom && state.activePath
+      ? fileKey(state.activeRoom, state.activePath)
+      : "";
     mobileTreeOpen = !state.activePath;
     if (state.activeRoom) {
       revealActiveFile(); // keep the tree in sync with back/forward navigation

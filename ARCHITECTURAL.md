@@ -186,6 +186,12 @@ reference, not a runtime dependency. Local path search ranks matching rooms
 first, treats implicit folders as first-class results, then shows files; the
 existing bounded server scan streams content matches underneath.
 
+The canonical document URL remains `/<room>/<path>`. `?view=preview` is
+presentation state only: it makes the rendered Markdown/Mermaid surface
+reloadable and linkable, while the clean URL opens the modeless editor. It
+never changes document authority or mints a share capability; `/s/<slug>`
+preview links remain scoped to that exact capability path.
+
 ## Write contracts
 
 The Worker exposes ten MCP tools. The two mutation shapes are intentionally
