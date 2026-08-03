@@ -848,29 +848,53 @@ const WEB_INDEX_HTML = `<!doctype html>
     white-space: nowrap; font-variant-numeric: tabular-nums;
   }
   .presence .p-pill:focus-visible, .presence .p-face:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
-  /* Anonymous share-link viewers (dealt an animal by the hub) read dimmer
-     than named handles — ambient audience, not actors. */
-  .presence .p-anon { color: var(--ink-faint); }
-  /* Live roster as a Notion-style avatar stack: signed-in handles are
-     GitHub logins, so github.com/<handle>.png is a real profile photo for
-     free; animals get a geometric face drawn on the actor color. Overlap +
-     a bg ring makes N viewers read as one object instead of a list. */
+  /* Live roster as a compact avatar stack: signed-in handles are GitHub
+     logins, so github.com/<handle>.png is a real profile photo for free.
+     Anonymous viewers are "Roomlings" — pastel paper stamps with a bold,
+     species-specific ink drawing. The squircle silhouette keeps anonymous
+     guests visibly distinct from real profile photos without adding chrome. */
   .presence .p-stack { display: inline-flex; align-items: center; }
   .presence .p-face, .actor-panel .p-face {
     position: relative; overflow: hidden; flex-shrink: 0;
-    width: 22px; height: 22px; border-radius: 50%;
+    width: 24px; height: 24px; border-radius: 50%;
     display: inline-flex; align-items: center; justify-content: center;
     border: 0; padding: 0; -webkit-appearance: none; appearance: none;
     font: 600 10px/1 var(--sans); color: #fff;
     box-shadow: 0 0 0 2px var(--bg);
+    transition-property: box-shadow, scale;
+    transition-duration: 140ms;
+    transition-timing-function: ease-out;
   }
   .presence .p-face { cursor: pointer; }
-  .presence .p-face svg, .actor-panel .p-face svg { width: 15px; height: 15px; display: block; }
+  .presence .p-face:active { scale: .96; }
+  .presence .p-face.p-anon, .actor-panel .p-face.p-anon {
+    border-radius: 7px;
+    background: var(--roomling-bg);
+    color: var(--roomling-ink);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.10), 0 0 0 2px var(--bg);
+  }
+  .presence .p-face svg, .actor-panel .p-face svg { width: 19px; height: 19px; display: block; }
+  .presence .p-face .roomling-wash, .actor-panel .p-face .roomling-wash {
+    fill: #fff7e8; stroke: none;
+  }
   .presence .p-face img, .actor-panel .p-face img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  :root[data-theme="dark"] .presence .p-face.p-anon,
+  :root[data-theme="dark"] .actor-panel .p-face.p-anon {
+    background: color-mix(in srgb, var(--roomling-bg) 62%, var(--bg));
+    color: var(--roomling-ink);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.12), 0 0 0 2px var(--bg);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .presence .p-face.p-anon,
+    :root:not([data-theme="light"]) .actor-panel .p-face.p-anon {
+      background: color-mix(in srgb, var(--roomling-bg) 62%, var(--bg));
+      color: var(--roomling-ink);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.12), 0 0 0 2px var(--bg);
+    }
+  }
   /* Hover-expand: the collapsed overlap fans out into spaced faces + name
      labels on hover (or keyboard focus in the stack). CSS-only — margin and
-     max-width transitions, each entry a ~30ms beat later — and the collapsed
-     metrics are exactly the old stack's, so nothing moves until intent. */
+     max-width transitions, each entry a ~30ms beat later. */
   .presence .p-entry { display: inline-flex; align-items: center; }
   .presence .p-entry + .p-entry { margin-left: -7px; transition: margin-left 160ms ease-out; }
   .presence .p-stack:hover .p-entry + .p-entry,
@@ -892,6 +916,9 @@ const WEB_INDEX_HTML = `<!doctype html>
   .presence .p-dot.live { animation: presence-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
   @keyframes presence-pulse { 50% { opacity: 0.35; } }
   .presence .p-viewers { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  @media (prefers-reduced-motion: reduce) {
+    .presence .p-face, .actor-panel .p-face { transition: none; }
+  }
 
   /* Live follow view — the document morphing under a collaborator's hands.
      A sticky name flag floats top-right in the writer's color; the block
@@ -3379,12 +3406,40 @@ const WEB_INDEX_HTML = `<!doctype html>
     return "var(--actor-guest)";
   }
 
-  // Animal FACES for anonymous viewers — one tiny geometric face per name in
-  // the hub's fixed ANON_ANIMALS deck (see index.ts). 2-3 strokes each, drawn
-  // in currentColor on the actor disc, sized to stay legible at 22px: each
-  // face is one strong species cue (ears/horns/beak/tusk/gills) plus eyes.
-  // A name outside the set falls back to the initial letter, same as before.
-  const FACE_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+  // Roomlings: one deliberately small paper-stamp identity per name in the
+  // hub's fixed ANON_ANIMALS deck (see index.ts). The protocol still sends a
+  // plain animal name; the client deterministically turns it into a pastel
+  // and a bold species mark. No image request, persistence, or asset pipeline.
+  const ROOMLING_PALETTES = {
+    otter: ["#a8d3d5", "#3f6268"],       // tide
+    heron: ["#afc3e8", "#44546e"],       // sky
+    lynx: ["#e3afa4", "#75483c"],        // clay
+    capybara: ["#e6c983", "#644b2e"],   // oat
+    ibex: ["#c8b9df", "#5d4f72"],        // lilac
+    puffin: ["#afc3e8", "#44546e"],      // sky
+    gecko: ["#bdd2a7", "#3f654b"],       // moss
+    marmot: ["#e6c983", "#644b2e"],      // oat
+    narwhal: ["#a8d3d5", "#3f6268"],     // tide
+    kestrel: ["#c8b9df", "#5d4f72"],     // lilac
+    axolotl: ["#e3afa4", "#75483c"],     // clay
+    wombat: ["#bdd2a7", "#3f654b"],      // moss
+    tapir: ["#c8b9df", "#5d4f72"],       // lilac
+    quokka: ["#e3afa4", "#75483c"],      // clay
+    raven: ["#afc3e8", "#44546e"],       // sky
+    seal: ["#a8d3d5", "#3f6268"],        // tide
+  };
+  const ROOMLING_FALLBACK = ["#e2ded4", "#55514a"];
+  function faceStyle(name, anon) {
+    if (!anon) return "background:" + actorColor(name);
+    const key = String(name || "").toLowerCase();
+    const palette = Object.hasOwn(ROOMLING_PALETTES, key) ? ROOMLING_PALETTES[key] : ROOMLING_FALLBACK;
+    return "--roomling-bg:" + palette[0] + ";--roomling-ink:" + palette[1];
+  }
+
+  // A shared warm-paper head gives the sparse line drawings the visual
+  // weight of an emoji while preserving each animal's 2-3 key cues.
+  const FACE_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+  const ROOMLING_WASH = '<path class="roomling-wash" d="M5.1 9.4C5.5 5.5 8.2 3.2 12 3.2s6.5 2.3 6.9 6.2c.4 3.8-1.2 8.6-6.9 10.3-5.7-1.7-7.3-6.5-6.9-10.3Z"/>';
   const ANIMAL_FACES = {
     otter: '<path d="M5 6.5a2 2 0 1 0 4 0a2 2 0 1 0-4 0M15 6.5a2 2 0 1 0 4 0a2 2 0 1 0-4 0"/><path d="M9 12h.01M15 12h.01" stroke-width="2.6"/><path d="M12 15h.01M7.5 16.5c1.4 1 2.9 1.5 4.5 1.5s3.1-.5 4.5-1.5"/>',
     heron: '<path d="M8 5.5c1.5-1.2 3.2-1.4 4.8-.8" /><path d="M8.5 9.5h.01" stroke-width="2.6"/><path d="M11.5 10.5l9 2.2-8.7 2.6"/>',
@@ -3404,8 +3459,9 @@ const WEB_INDEX_HTML = `<!doctype html>
     seal: '<path d="M9 11h.01M15 11h.01" stroke-width="2.6"/><path d="M5.5 14.5h2.5M16 14.5h2.5"/><path d="M12 13h.01M9.5 15.5c.8.7 1.6 1 2.5 1s1.7-.3 2.5-1"/>',
   };
   function animalFaceSvg(name) {
-    const paths = ANIMAL_FACES[String(name || "").toLowerCase()];
-    return paths ? '<svg ' + FACE_ATTRS + '>' + paths + '</svg>' : "";
+    const key = String(name || "").toLowerCase();
+    const paths = Object.hasOwn(ANIMAL_FACES, key) ? ANIMAL_FACES[key] : "";
+    return paths ? '<svg ' + FACE_ATTRS + '>' + ROOMLING_WASH + paths + '</svg>' : "";
   }
 
   // Inner content of a .p-face disc: animal face for anonymous viewers
@@ -3771,7 +3827,7 @@ const WEB_INDEX_HTML = `<!doctype html>
       let depth = 20; // earlier faces stack ON TOP (Notion order) — otherwise the next circle clips this one's face
       for (const v of roster) {
         stack += '<span class="p-entry">'
-          + '<button class="p-face' + (v.anon ? " p-anon" : "") + '" type="button" data-actor="' + escHtml(v.name) + '" title="' + escHtml(v.name) + '" aria-haspopup="dialog" aria-expanded="false" style="background:' + actorColor(v.name) + ';z-index:' + (depth -= 1) + '">'
+          + '<button class="p-face' + (v.anon ? " p-anon" : "") + '" type="button" data-actor="' + escHtml(v.name) + '" title="' + escHtml(v.name) + '" aria-label="' + escHtml(v.name + (v.anon ? ", anonymous viewer" : "")) + '" aria-haspopup="dialog" aria-expanded="false" style="' + faceStyle(v.name, v.anon) + ';z-index:' + (depth -= 1) + '">'
           + faceInnerHtml(v.name, v.anon)
           + '</button>'
           + '<span class="p-name">' + escHtml(v.name) + '</span>'
@@ -3832,7 +3888,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     const entry = presenceActors.get(actor);
     const log = (entry && entry.log) || [];
     let html = '<div class="actor-head">'
-      + '<span class="p-face' + (anon ? " p-anon" : "") + '" style="background:' + actorColor(actor) + '">' + faceInnerHtml(actor, anon) + '</span>'
+      + '<span class="p-face' + (anon ? " p-anon" : "") + '" style="' + faceStyle(actor, anon) + '" aria-hidden="true">' + faceInnerHtml(actor, anon) + '</span>'
       + '<strong>' + escHtml(actor) + '</strong>'
       + (anon ? '<small>anonymous viewer</small>' : '')
       + '</div>';

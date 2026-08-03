@@ -52,6 +52,7 @@ import {
 } from "./room-hub-text";
 import type { RoomTextClientFrame } from "./room-text-client";
 import { ROOM_TEXT_MAX_BYTES, type RoomTextAnchor } from "./room-text";
+import { ANON_ANIMALS } from "./presence-identities";
 
 export { ContainerProxy } from "@cloudflare/sandbox";
 export { DocumentCollab };
@@ -105,11 +106,6 @@ type HubEvent = {
 // its hibernation attachment so the identity survives DO sleep and stays
 // stable for the connection's whole life. Duplicates across viewers are
 // fine (Docs has them too) — the point is "someone is here", not identity.
-const ANON_ANIMALS = [
-  "otter", "heron", "lynx", "capybara", "ibex", "puffin", "gecko", "marmot",
-  "narwhal", "kestrel", "axolotl", "wombat", "tapir", "quokka", "raven", "seal",
-];
-
 export class RoomHub extends DurableObject<Env> {
   // RoomText engine host — DARK: created lazily on the first RoomText frame
   // or RPC, so presence-only rooms never pay for the engine's tables, and
