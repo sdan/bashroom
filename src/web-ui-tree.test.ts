@@ -32,16 +32,28 @@ describe("Pierre-quality room tree", () => {
 
   it("turns the rail into a full-width phone navigation surface", () => {
     expect(html).toContain("@media (max-width: 720px)");
-    expect(html).toContain('id="mobile-tree-toggle"');
+    expect(html).toContain('id="sidebar-toggle"');
     expect(html).toContain('id="mobile-tree-close"');
     expect(html).toContain('document.body.classList.toggle("tree-open"');
-    expect(html).toContain('aside.toggleAttribute("inert", mobile && !open)');
+    expect(html).toContain('aside.toggleAttribute("inert", sidebarHidden)');
     expect(html).toContain("!profileSurface && !share && (mobileTreeOpen || !state.activePath)");
     expect(html).toContain("mobileTreeShouldBeOpen() && state.activePath");
     expect(html).toContain("mobileTreeOpen = Boolean(mobileTreeMedia.matches)");
     expect(html).toContain("state.activePath || (activeFile && !activeFileIsErr)");
-    expect(html).toContain('share ? "" : `<button class="mobile-tree-toggle"');
+    expect(html).toContain('share ? "" : `<button class="sidebar-toggle"');
     expect(html).toContain(".result-folder, .tree-retry { min-height: 40px");
+  });
+
+  it("lets a document reclaim the full desktop canvas without stranding navigation", () => {
+    expect(html).toContain('const SIDEBAR_COLLAPSED_KEY = "bashroom.sidebar-collapsed"');
+    expect(html).toContain('body.sidebar-collapsed { --sidebar-gutter: 0px; }');
+    expect(html).toContain('body.sidebar-collapsed aside');
+    expect(html).toContain('inset: 52px 0 0 var(--sidebar-gutter)');
+    expect(html).toContain('!profileSurface && !share && state.activePath && desktopSidebarCollapsed');
+    expect(html).toContain('localStorage.setItem(SIDEBAR_COLLAPSED_KEY, desktopSidebarCollapsed ? "1" : "0")');
+    expect(html).toContain('trigger.setAttribute("aria-expanded", expanded ? "true" : "false")');
+    expect(html).toContain('if (!mobileTreeMedia.matches && desktopSidebarShouldBeCollapsed()) setDesktopSidebarCollapsed(false)');
+    expect(html).toContain('e.key === "\\\\" && !mobileTreeMedia.matches');
   });
 
   it("restores Bashroom's compact editor-like file language without losing recovery", () => {

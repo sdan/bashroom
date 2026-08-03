@@ -137,9 +137,10 @@ const WEB_INDEX_HTML = `<!doctype html>
   /* Body owns the scroll; sidebar is pulled out of flow. */
   html { height: 100%; }
   body {
+    --sidebar-gutter: var(--side-w);
     margin: 0;
     padding: 0;
-    padding-left: var(--side-w);
+    padding-left: var(--sidebar-gutter);
     background: var(--bg);
     color: var(--ink);
     font-family: var(--sans);
@@ -147,6 +148,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     -webkit-font-smoothing: antialiased;
     min-height: 100vh;
   }
+  body.sidebar-collapsed { --sidebar-gutter: 0px; }
 
   /* Sidebar: fixed to the left edge; only the room tree scrolls, so account
      and recovery controls remain reachable at every tree length. The whole
@@ -176,6 +178,28 @@ const WEB_INDEX_HTML = `<!doctype html>
   :root.share-mode body { padding-left: 0; }
   :root.share-mode aside { display: none; }
   :root.share-mode .share-wrap { display: none; }
+
+  /* Desktop navigation has one binary state: present or fully out of the
+     way. The document-header toggle never moves out of reach, so a narrow
+     icon rail would only add a third layout mode without adding capability. */
+  @media (min-width: 721px) {
+    body:not(.login-view) {
+      transition-property: padding-left;
+      transition-duration: 180ms;
+      transition-timing-function: cubic-bezier(.2,0,0,1);
+    }
+    aside {
+      transform: translateX(0); visibility: visible; pointer-events: auto;
+      transition-property: transform, visibility;
+      transition-duration: 180ms, 0s;
+      transition-timing-function: cubic-bezier(.2,0,0,1), linear;
+      transition-delay: 0s, 0s;
+    }
+    body.sidebar-collapsed aside {
+      transform: translateX(-100%); visibility: hidden; pointer-events: none;
+      transition-delay: 0s, 180ms;
+    }
+  }
 
   /* Main: lives in the normal flow next to the padded body. Top padding is
      breathing room under the sticky doc bar, not page chrome. */
@@ -317,7 +341,21 @@ const WEB_INDEX_HTML = `<!doctype html>
     color: var(--link); cursor: pointer; font: 500 12.5px/1 var(--sans);
   }
 
-  .mobile-tree-toggle, .mobile-tree-close { display: none; }
+  .sidebar-toggle, .mobile-tree-close {
+    width: 40px; height: 40px; padding: 0; border: 0; border-radius: 7px;
+    align-items: center; justify-content: center; flex-shrink: 0;
+    color: var(--ink-dim); background: transparent; cursor: pointer;
+    transition-property: color, background-color, scale;
+    transition-duration: 140ms;
+    transition-timing-function: ease-out;
+  }
+  .sidebar-toggle { display: inline-flex; }
+  .mobile-tree-close { display: none; }
+  .mobile-tree-close[hidden] { display: none; }
+  .sidebar-toggle:hover, .mobile-tree-close:hover { color: var(--ink); background: var(--hover); }
+  .sidebar-toggle:active, .mobile-tree-close:active { scale: .96; }
+  .sidebar-toggle:focus-visible, .mobile-tree-close:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+  .sidebar-toggle svg, .mobile-tree-close svg { width: 17px; height: 17px; }
 
   /* Footer — 10px vertical matches the brand row's top spacing for visual symmetry. */
   .footer { flex-shrink: 0; margin-top: auto; padding: 10px 14px; font-size: 13px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; border-top: 1px solid var(--rule); }
@@ -382,7 +420,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   .doc-header {
     position: sticky; top: 0; z-index: 30;
     display: flex; align-items: center; flex-wrap: nowrap; gap: 12px;
-    min-height: 52px; padding: 8px 20px;
+    min-height: 52px; padding: 5px 20px 6px;
     background: color-mix(in srgb, var(--bg) 88%, transparent);
     -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
     border-bottom: 1px solid var(--rule);
@@ -521,8 +559,11 @@ const WEB_INDEX_HTML = `<!doctype html>
      Desktop: a 360px overlay under the sticky document bar. Mobile: the
      same surface takes the viewport, preserving one interaction model. */
   .history-scrim {
-    position: fixed; inset: 52px 0 0 var(--side-w); z-index: 39;
+    position: fixed; inset: 52px 0 0 var(--sidebar-gutter); z-index: 39;
     background: rgba(0,0,0,.08); cursor: default;
+    transition-property: left;
+    transition-duration: 180ms;
+    transition-timing-function: cubic-bezier(.2,0,0,1);
   }
   .history-drawer {
     position: fixed; inset: 52px 0 0 auto; z-index: 40; width: 360px;
@@ -992,6 +1033,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     z-index: 10;
   }
   [data-tip]:hover::after, [data-tip]:focus-visible::after { opacity: 1; transform: translateY(0); }
+  .sidebar-toggle::after { left: 0; right: auto; }
   @media (prefers-reduced-motion: reduce) {
     [data-tip]::after { transition-duration: 0ms; }
   }
@@ -1218,7 +1260,7 @@ const WEB_INDEX_HTML = `<!doctype html>
       transition-delay: 0s;
     }
     main { padding: 24px 20px 96px; }
-    .doc-header { gap: 8px; padding: 6px 10px; }
+    .doc-header { gap: 8px; padding: 5px 10px 6px; }
     .doc-activity { display: none; }
     .doc-location { min-width: 48px; }
     .doc-location .doc-room, .doc-location .doc-separator { display: none; }
@@ -1226,17 +1268,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     #copy-md .label-stack, #share-btn .share-lbl { display: none; }
     #preview-btn { padding-inline: 9px; }
     #preview-btn > span { min-width: 0; font-size: 11px; }
-    .mobile-tree-toggle, .mobile-tree-close {
-      width: 40px; height: 40px; padding: 0; border: 0; border-radius: 7px;
-      display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
-      color: var(--ink-dim); background: transparent; cursor: pointer;
-      transition-property: color, background-color, scale; transition-duration: 140ms; transition-timing-function: ease-out;
-    }
-    .mobile-tree-close[hidden] { display: none; }
-    .mobile-tree-toggle:hover, .mobile-tree-close:hover { color: var(--ink); background: var(--hover); }
-    .mobile-tree-toggle:active, .mobile-tree-close:active { scale: .96; }
-    .mobile-tree-toggle:focus-visible, .mobile-tree-close:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
-    .mobile-tree-toggle svg, .mobile-tree-close svg { width: 17px; height: 17px; }
+    .mobile-tree-close { display: inline-flex; }
     .room-head, .tree .row { min-height: 40px; }
     .row-share { width: 40px; height: 40px; }
     .result { min-height: 40px; display: flex; flex-direction: column; justify-content: center; }
@@ -1245,7 +1277,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     .footer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
   }
   @media (prefers-reduced-motion: reduce) {
-    aside, .room-head .chev, .tree .chev, .row-share, .mobile-tree-toggle, .mobile-tree-close { transition: none; }
+    body, aside, .history-scrim, .room-head .chev, .tree .chev, .row-share, .sidebar-toggle, .mobile-tree-close { transition: none; }
   }
 
   /* Login */
@@ -1283,6 +1315,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   const STATE_KEY = "bashroom.state";
   const OPEN_KEY = "bashroom.opened";
   const ROOM_OPEN_KEY = "bashroom.rooms-opened";
+  const SIDEBAR_COLLAPSED_KEY = "bashroom.sidebar-collapsed";
   const TOUR_KEY = "bashroom.feature-tour.offline-v1";
   const OFFLINE_GENERATION = "3";
   const TOUR_STEPS = [
@@ -1351,6 +1384,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   // On a fresh phone launch the tree is the useful first surface. Deep links
   // and remembered documents open directly into the page instead.
   let mobileTreeOpen = !state.activePath;
+  let desktopSidebarCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
 
   function mobileTreeShouldBeOpen() {
     // A phone with no selected document has no header trigger to reopen the
@@ -1358,32 +1392,58 @@ const WEB_INDEX_HTML = `<!doctype html>
     return Boolean(mobileTreeMedia.matches && !profileSurface && !share && (mobileTreeOpen || !state.activePath));
   }
 
-  function syncMobileTreeSurface(returnFocus) {
+  function desktopSidebarShouldBeCollapsed() {
+    // Surfaces without a persistent header toggle must remain navigable. The
+    // stored preference survives them and is restored on the next document.
+    return Boolean(!mobileTreeMedia.matches && !profileSurface && !share && state.activePath && desktopSidebarCollapsed);
+  }
+
+  function syncSidebarSurface(returnFocus) {
     const mobile = Boolean(mobileTreeMedia.matches);
     // Profile and capability links deliberately have no sidebar. Keep the
     // drawer predicate centralized here so a rerender cannot make their only
     // visible surface inert (notably a fresh phone visit with no saved file).
     const open = mobileTreeShouldBeOpen();
+    const collapsed = desktopSidebarShouldBeCollapsed();
     document.body.classList.toggle("tree-open", open);
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
     const aside = app.querySelector("aside");
     const main = app.querySelector("main");
     const header = app.querySelector(".doc-header");
-    const trigger = document.getElementById("mobile-tree-toggle");
+    const trigger = document.getElementById("sidebar-toggle");
+    const sidebarHidden = Boolean(share || collapsed || (mobile && !open));
     if (aside) {
-      aside.toggleAttribute("inert", mobile && !open);
-      aside.setAttribute("aria-hidden", mobile && !open ? "true" : "false");
+      aside.toggleAttribute("inert", sidebarHidden);
+      aside.setAttribute("aria-hidden", sidebarHidden ? "true" : "false");
     }
     if (main) main.toggleAttribute("inert", open);
     if (header) header.toggleAttribute("inert", open);
-    if (trigger) trigger.setAttribute("aria-expanded", open ? "true" : "false");
-    if (returnFocus && !open) requestAnimationFrame(() => document.getElementById("mobile-tree-toggle")?.focus());
+    if (trigger) {
+      const expanded = mobile ? open : !collapsed;
+      const label = mobile ? "Open rooms" : collapsed ? "Show sidebar" : "Hide sidebar";
+      trigger.setAttribute("aria-expanded", expanded ? "true" : "false");
+      trigger.setAttribute("aria-label", label);
+      trigger.setAttribute("data-tip", mobile ? label : label + "  ⌘\\\\");
+    }
+    if (returnFocus && !open) requestAnimationFrame(() => document.getElementById("sidebar-toggle")?.focus());
   }
 
   function setMobileTreeOpen(open, returnFocus) {
     mobileTreeOpen = Boolean(open);
-    syncMobileTreeSurface(Boolean(returnFocus));
+    syncSidebarSurface(Boolean(returnFocus));
     if (mobileTreeShouldBeOpen() && state.activePath) {
       requestAnimationFrame(() => document.getElementById("mobile-tree-close")?.focus());
+    }
+  }
+
+  function setDesktopSidebarCollapsed(collapsed) {
+    if (mobileTreeMedia.matches || profileSurface || share || !state.activePath) return;
+    const focusWasInSidebar = app.querySelector("aside")?.contains(document.activeElement);
+    desktopSidebarCollapsed = Boolean(collapsed);
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, desktopSidebarCollapsed ? "1" : "0");
+    syncSidebarSurface(false);
+    if (desktopSidebarCollapsed && focusWasInSidebar) {
+      requestAnimationFrame(() => document.getElementById("sidebar-toggle")?.focus());
     }
   }
 
@@ -4538,7 +4598,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   function renderLogin() {
     mobileTreeOpen = false;
     document.body.classList.add("login-view");
-    document.body.classList.remove("profile-view", "tree-open");
+    document.body.classList.remove("profile-view", "tree-open", "sidebar-collapsed");
     app.innerHTML = \`
       <div class="login">
         <h1>Bashroom</h1>
@@ -4598,6 +4658,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     document.body.classList.remove("login-view");
     document.body.classList.toggle("profile-view", profileSurface);
     document.body.classList.toggle("tree-open", mobileTreeShouldBeOpen());
+    document.body.classList.toggle("sidebar-collapsed", desktopSidebarShouldBeCollapsed());
     // The innerHTML wipe below detaches the actor panel's trigger — an open
     // panel would float unanchored, so it closes with the DOM it points at.
     closeActorPanel(false);
@@ -4715,7 +4776,7 @@ const WEB_INDEX_HTML = `<!doctype html>
     // phone it owns the only control that can reopen the room tree.
     const documentHeader = !profileSurface && (state.activePath || (activeFile && !activeFileIsErr) || activeFileLoading || treeLoading)
       ? \`<header class="doc-header">
-          \${share ? "" : \`<button class="mobile-tree-toggle" id="mobile-tree-toggle" type="button" aria-label="Open rooms" aria-controls="room-sidebar" aria-expanded="false">\${ICON.sidebar}</button>\`}
+          \${share ? "" : \`<button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Open rooms" aria-controls="room-sidebar" aria-expanded="false">\${ICON.sidebar}</button>\`}
           <div class="doc-location" title="\${escHtml(state.activeRoom + (docPath ? "/" + docPath : ""))}">
             <span class="doc-room">\${escHtml(state.activeRoom)}</span>
             <span class="doc-separator" aria-hidden="true">/</span>
@@ -4835,9 +4896,14 @@ const WEB_INDEX_HTML = `<!doctype html>
       requestAnimationFrame(() => window.scrollTo(0, docScrollY));
     }
     wireSidebar();
-    syncMobileTreeSurface(false);
-    const mobileTreeToggle = document.getElementById("mobile-tree-toggle");
-    if (mobileTreeToggle) mobileTreeToggle.onclick = () => setMobileTreeOpen(true, false);
+    syncSidebarSurface(false);
+    const sidebarToggle = document.getElementById("sidebar-toggle");
+    if (sidebarToggle) {
+      sidebarToggle.onclick = () => {
+        if (mobileTreeMedia.matches) setMobileTreeOpen(true, false);
+        else setDesktopSidebarCollapsed(!desktopSidebarCollapsed);
+      };
+    }
     const mobileTreeClose = document.getElementById("mobile-tree-close");
     if (mobileTreeClose) mobileTreeClose.onclick = () => setMobileTreeOpen(false, true);
 
@@ -5265,10 +5331,16 @@ const WEB_INDEX_HTML = `<!doctype html>
       if (profileSurface) return;
       e.preventDefault();
       if (mobileTreeMedia.matches && !mobileTreeOpen) setMobileTreeOpen(true, false);
+      if (!mobileTreeMedia.matches && desktopSidebarShouldBeCollapsed()) setDesktopSidebarCollapsed(false);
       requestAnimationFrame(() => {
         const si = document.getElementById("room-search");
         if (si) { si.focus(); si.select(); }
       });
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === "\\\\" && !mobileTreeMedia.matches && !profileSurface && !share && state.activePath) {
+      e.preventDefault();
+      setDesktopSidebarCollapsed(!desktopSidebarCollapsed);
     }
   });
 
@@ -5341,7 +5413,7 @@ const WEB_INDEX_HTML = `<!doctype html>
   window.addEventListener("offline", updateOfflineControls);
   window.addEventListener("pagehide", stopOfflinePreparation);
   window.addEventListener("resize", () => {
-    syncMobileTreeSurface(false);
+    syncSidebarSurface(false);
     if (activeTourStepId) scheduleFeatureTour();
   });
   window.addEventListener("scroll", () => { if (activeTourStepId) scheduleFeatureTour(); }, true);
